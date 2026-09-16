@@ -11,13 +11,14 @@ type OverviewState =
   | { readonly kind: 'ready'; readonly status: RegistryRuntimeStatus }
 
 const STATUS_ROWS: readonly {
-  readonly field: Exclude<keyof RegistryRuntimeStatus, 'deploymentMode' | 'identityProvider'>
+  readonly field: Exclude<keyof RegistryRuntimeStatus, 'deploymentMode' | 'identityProvider' | 'billingProvider'>
   readonly icon: 'members' | 'disclosures' | 'branches' | 'nodes' | 'audit' | 'settings'
   readonly labelKey: 'overviewIdentity' | 'overviewRegistry' | 'overviewDisclosureOperations' | 'overviewDeviceBinding'
-    | 'overviewAudit' | 'overviewRateLimits' | 'overviewDisclosureCleanup' | 'overviewMailboxCleanup'
+    | 'overviewAudit' | 'overviewRateLimits' | 'overviewDisclosureCleanup' | 'overviewMailboxCleanup' | 'overviewBilling'
   readonly descriptionKey: 'overviewIdentityDescription' | 'overviewRegistryDescription'
     | 'overviewDisclosureOperationsDescription' | 'overviewDeviceBindingDescription' | 'overviewAuditDescription'
     | 'overviewRateLimitsDescription' | 'overviewDisclosureCleanupDescription' | 'overviewMailboxCleanupDescription'
+    | 'overviewBillingDescription'
 }[] = [
   { field: 'identity', icon: 'members', labelKey: 'overviewIdentity', descriptionKey: 'overviewIdentityDescription' },
   { field: 'registry', icon: 'disclosures', labelKey: 'overviewRegistry', descriptionKey: 'overviewRegistryDescription' },
@@ -28,6 +29,7 @@ const STATUS_ROWS: readonly {
   { field: 'rateLimits', icon: 'settings', labelKey: 'overviewRateLimits', descriptionKey: 'overviewRateLimitsDescription' },
   { field: 'disclosureCleanup', icon: 'disclosures', labelKey: 'overviewDisclosureCleanup', descriptionKey: 'overviewDisclosureCleanupDescription' },
   { field: 'mailboxCleanup', icon: 'branches', labelKey: 'overviewMailboxCleanup', descriptionKey: 'overviewMailboxCleanupDescription' },
+  { field: 'billing', icon: 'settings', labelKey: 'overviewBilling', descriptionKey: 'overviewBillingDescription' },
 ]
 
 const QUICK_LINKS = [

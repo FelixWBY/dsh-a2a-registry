@@ -6,11 +6,11 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { DisclosureHash, DisclosureId, DshInstanceId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { InstanceKeyId } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeRegistryChallenge, decodeRegistryProof } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import type { A2aRequestId, DisclosureSubject } from '@deepseek-ai/dsh-a2a-registry-domain'
+import type { A2aRequestId, DisclosureSubject, MemberId, TeamId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { RegistryIngestError, type FreshRegistryDirectoryAuthority,
   type FreshRegistryMetadataAuthority, type FreshProducerAuthority,
   type RegistryBindingId, type RegistryBindingRequest, type RegistryBindingReview,
-  type RegistryBindingScope, type RegistryDisclosureMetadata } from '@deepseek-ai/dsh-a2a-registry-ingest'
+  type RegistryBindingScope, type RegistryDirectoryChange, type RegistryDisclosureMetadata } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { RegistryAccountAuthenticator, RegistryAuthenticatedAccount } from './account-auth.ts'
 import type { RegistryEnrollment } from './enrollment.ts'
@@ -23,6 +23,7 @@ import type { RegistryDirectory } from './directory.ts'
 import { RegistryBrowserAdmission, type RegistryBrowserAdmissionConfig,
   type RegistryBrowserAdmissionDecision } from './browser-admission.ts'
 import type { RegistryOperationalRateLimitScope } from './operational-alerts.ts'
+import type { RegistryBillingCheckout, RegistryBillingPlan } from './billing.ts'
 
 const API_BASE = '/registry-api/v1'
 const DISCLOSURES_PATH = `${API_BASE}/disclosures`
@@ -32,6 +33,7 @@ const BINDINGS_PATH = `${API_BASE}/bindings`
 const DIRECTORY_PATH = `${API_BASE}/directory`
 const AUDIT_PATH = `${API_BASE}/audit`
 const STATUS_PATH = `${API_BASE}/status`
+const BILLING_PATH = `${API_BASE}/billing`
 const TEST_ONLY_REVOKE_PATH = `${API_BASE}/test-only/revoke-seed`
 const TEST_ONLY_CONFIRM_HEADER = 'x-dsh-local-mvp-confirm'
 const TEST_ONLY_CONFIRM_VALUE = 'revoke-seed'
@@ -98,7 +100,7 @@ export const Config: z<RegistryBrowserApiConfig> = z.object({
 })
 
 type ApiErrorCode = 'identity-not-configured' | 'registry-not-configured' | 'unauthenticated'
-  | 'not-found' | 'invalid-input' | 'unavailable' | 'operation-not-configured' | 'method-not-allowed' | 'rate-limited'
+  | 'not-found' | 'invalid-input' | 'conflict' | 'unavailable' | 'operation-not-configured' | 'method-not-allowed' | 'rate-limited'
 
 type ApiRoute =
   | { readonly kind: 'status' }
@@ -113,6 +115,8 @@ type ApiRoute =
     readonly action: 'review' | 'approve' | 'reject'
   }
   | { readonly kind: 'directory' }
+  | { readonly kind: 'billing-plans' }
+  | { readonly kind: 'billing-checkout' }
   | { readonly kind: 'audit'; readonly cursor?: string }
   | { readonly kind: 'branches'; readonly cursor?: string }
   | { readonly kind: 'list'; readonly cursor?: string }
@@ -136,6 +140,9 @@ type BindingInput =
   | { readonly action: 'confirm'; readonly proof: string }
   | { readonly action: 'review' | 'reject'; readonly code: string }
   | { readonly action: 'approve'; readonly code: string; readonly instanceName: string }
+
+type DirectoryInput = { readonly expectedRevision: number; readonly change: RegistryDirectoryChange }
+type BillingInput = { readonly planId: string; readonly idempotencyKey: string; readonly returnPath: string }
 
 class ApiFailure extends Error {
   constructor(readonly status: number, readonly code: ApiErrorCode, readonly allow?: string,
@@ -506,7 +513,7 @@ function updatedInstanceResult(value: unknown, expected: {
   return result
 }
 
-function directoryResult(value: unknown, maxValueBytes: number): Record<string, unknown> {
+function directoryResult(value: unknown, actorRole: DisclosureSubject['role'], maxValueBytes: number): Record<string, unknown> {
   const source = operationRecord(value)
   if (!Number.isSafeInteger(source.revision) || (source.revision as number) < 0
     || Object.is(source.revision, -0) || !Array.isArray(source.members) || !Array.isArray(source.teams)) {
@@ -543,7 +550,42 @@ function directoryResult(value: unknown, maxValueBytes: number): Record<string, 
     teamIds.add(item.teamId)
     return { teamId: item.teamId, displayName: item.displayName, memberIds: ids }
   })
-  const result = { revision: source.revision as number, members, teams }
+  const result = { revision: source.revision as number, actorRole, members, teams }
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
+  return result
+}
+
+function billingPlansResult(value: readonly RegistryBillingPlan[], maxValueBytes: number): Record<string, unknown> {
+  if (!Array.isArray(value) || value.length > 32) throw new ApiFailure(503, 'unavailable')
+  const planIds = new Set<string>()
+  const items = value.map((item) => {
+    if (typeof item.planId !== 'string' || !IDENTIFIER.test(item.planId) || planIds.has(item.planId)
+      || typeof item.displayName !== 'string' || item.displayName.length === 0 || item.displayName !== item.displayName.trim()
+      || !item.displayName.isWellFormed() || /[\u0000-\u001f\u007f]/u.test(item.displayName)
+      || typeof item.currency !== 'string' || !/^[A-Z]{3}$/u.test(item.currency)
+      || !Number.isSafeInteger(item.unitAmount) || item.unitAmount < 0 || Object.is(item.unitAmount, -0)
+      || (item.interval !== 'month' && item.interval !== 'year')) throw new ApiFailure(503, 'unavailable')
+    planIds.add(item.planId)
+    return { planId: item.planId, displayName: item.displayName, currency: item.currency,
+      unitAmount: item.unitAmount, interval: item.interval }
+  })
+  const result = { items }
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
+  return result
+}
+
+function billingCheckoutResult(value: RegistryBillingCheckout, maxValueBytes: number): Record<string, unknown> {
+  if (typeof value.checkoutId !== 'string' || !IDENTIFIER.test(value.checkoutId)
+    || typeof value.checkoutUrl !== 'string' || value.checkoutUrl.length > 2048
+    || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now() || Object.is(value.expiresAt, -0)) {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  let checkoutUrl: URL
+  try { checkoutUrl = new URL(value.checkoutUrl) } catch { throw new ApiFailure(503, 'unavailable') }
+  if (checkoutUrl.protocol !== 'https:' || checkoutUrl.username !== '' || checkoutUrl.password !== '') {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  const result = { checkoutId: value.checkoutId, checkoutUrl: checkoutUrl.href, expiresAt: value.expiresAt }
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
   return result
 }
@@ -769,6 +811,71 @@ async function bindingInput(request: IncomingMessage, action: BindingInput['acti
   return { action, code }
 }
 
+async function directoryInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<DirectoryInput> {
+  const value = exactRecord(await readJson(request, config.maxOperationInputBytes, signal), ['expectedRevision', 'change'])
+  if (!Number.isSafeInteger(value.expectedRevision) || (value.expectedRevision as number) < 0
+    || Object.is(value.expectedRevision, -0)) throw new ApiFailure(400, 'invalid-input')
+  if (value.change === null || typeof value.change !== 'object' || Array.isArray(value.change)) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  const kind = (value.change as Record<string, unknown>).kind
+  const raw = exactRecord(value.change, kind === 'put-member' ? ['kind', 'member']
+    : kind === 'put-team' ? ['kind', 'team'] : ['kind', 'teamId'])
+  if (raw.kind === 'put-member') {
+    const member = exactRecord(raw.member, ['memberId', 'displayName', 'role', 'state'])
+    if (typeof member.memberId !== 'string' || !IDENTIFIER.test(member.memberId)
+      || !validInstanceName(member.displayName)
+      || (member.role !== 'owner' && member.role !== 'admin' && member.role !== 'member')
+      || (member.state !== 'active' && member.state !== 'suspended' && member.state !== 'removed')) {
+      throw new ApiFailure(400, 'invalid-input')
+    }
+    return { expectedRevision: value.expectedRevision as number, change: { kind: 'put-member', member: {
+      memberId: brandString<MemberId>(member.memberId), displayName: member.displayName,
+      role: member.role, state: member.state,
+    } } }
+  }
+  if (raw.kind === 'put-team') {
+    const team = exactRecord(raw.team, ['teamId', 'displayName', 'memberIds'])
+    if (typeof team.teamId !== 'string' || !IDENTIFIER.test(team.teamId) || !validInstanceName(team.displayName)
+      || !Array.isArray(team.memberIds)) throw new ApiFailure(400, 'invalid-input')
+    const ids = team.memberIds.map((candidate) => {
+      if (typeof candidate !== 'string' || !IDENTIFIER.test(candidate)) throw new ApiFailure(400, 'invalid-input')
+      return brandString<MemberId>(candidate)
+    })
+    if (new Set(ids).size !== ids.length) throw new ApiFailure(400, 'invalid-input')
+    return { expectedRevision: value.expectedRevision as number, change: { kind: 'put-team', team: {
+      teamId: brandString<TeamId>(team.teamId), displayName: team.displayName, memberIds: ids,
+    } } }
+  }
+  if (raw.kind !== 'remove-team' || typeof raw.teamId !== 'string' || !IDENTIFIER.test(raw.teamId)) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  return { expectedRevision: value.expectedRevision as number,
+    change: { kind: 'remove-team', teamId: brandString<TeamId>(raw.teamId) } }
+}
+
+async function billingInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<BillingInput> {
+  const value = exactRecord(await readJson(request, config.maxOperationInputBytes, signal),
+    ['planId', 'idempotencyKey', 'returnPath'])
+  if (typeof value.planId !== 'string' || !IDENTIFIER.test(value.planId)
+    || typeof value.returnPath !== 'string' || value.returnPath.length === 0
+    || Buffer.byteLength(value.returnPath, 'utf8') > 1024 || !value.returnPath.startsWith('/')
+    || value.returnPath.startsWith('//') || value.returnPath.includes('\\')) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  let parsed: URL
+  try { parsed = new URL(value.returnPath, 'https://registry.invalid') } catch {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  if (parsed.origin !== 'https://registry.invalid' || parsed.username !== '' || parsed.password !== '') {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  return { planId: value.planId, idempotencyKey: idempotencyKey(value.idempotencyKey),
+    returnPath: `${parsed.pathname}${parsed.search}${parsed.hash}` }
+}
+
 function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig): ApiRoute {
   const url = new URL(request.url ?? '/', 'http://registry.invalid')
   if (url.pathname === TEST_ONLY_REVOKE_PATH) {
@@ -811,6 +918,14 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
   if (url.pathname === DIRECTORY_PATH) {
     noQuery(url)
     return { kind: 'directory' }
+  }
+  if (url.pathname === `${BILLING_PATH}/plans`) {
+    noQuery(url)
+    return { kind: 'billing-plans' }
+  }
+  if (url.pathname === `${BILLING_PATH}/checkout`) {
+    noQuery(url)
+    return { kind: 'billing-checkout' }
   }
   if (url.pathname === AUDIT_PATH) {
     const keys = [...url.searchParams.keys()]
@@ -884,6 +999,16 @@ function assertMethod(request: IncomingMessage, route: ApiRoute): void {
     if (request.method !== 'GET' && request.method !== 'DELETE') {
       throw new ApiFailure(405, 'method-not-allowed', allowed)
     }
+    return
+  }
+  if (route.kind === 'directory') {
+    const allowed = 'GET, POST'
+    if (request.method !== 'GET' && request.method !== 'POST') throw new ApiFailure(405, 'method-not-allowed', allowed)
+    return
+  }
+  if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
+    const allowed = route.kind === 'billing-plans' ? 'GET' : 'POST'
+    if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
     return
   }
   const allowed = route.kind === 'operation' || route.kind === 'instance-action'
@@ -1058,6 +1183,7 @@ async function enrollmentAuthority(ctx: Context, request: IncomingMessage, signa
 async function directoryAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<{
   readonly directory: RegistryDirectory
   readonly authority: FreshRegistryDirectoryAuthority
+  readonly authenticatedSubject: DisclosureSubject
 }> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
@@ -1083,7 +1209,21 @@ async function directoryAuthority(ctx: Context, request: IncomingMessage, signal
       authenticated: true,
     }, now: Date.now() }
   }
-  return { directory, authority }
+  return { directory, authority, authenticatedSubject }
+}
+
+async function billingOwner(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<DisclosureSubject> {
+  const authenticator = ctx.get('registryAccountAuthenticator')
+  if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
+  let account: RegistryAuthenticatedAccount | null
+  try { account = await authenticator.authenticate(request, signal) } catch {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  if (account === null || !account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  if (account.subject.membership !== 'active' || account.subject.role !== 'owner') {
+    throw new ApiFailure(404, 'not-found')
+  }
+  return structuredClone(account.subject)
 }
 
 async function auditAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<{
@@ -1114,6 +1254,7 @@ function mapFailure(error: unknown): ApiFailure {
   if (error instanceof ApiFailure) return error
   if (error instanceof RegistryIngestError) {
     if (error.code === 'not-found') return new ApiFailure(404, 'not-found')
+    if (error.code === 'version-conflict') return new ApiFailure(409, 'conflict')
     if (error.code === 'invalid-input' || error.code === 'limit') return new ApiFailure(400, 'invalid-input')
     return new ApiFailure(503, 'unavailable')
   }
@@ -1147,7 +1288,9 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
       }
       assertMethod(request, route)
       if ((route.kind === 'operation' || route.kind === 'instance-action' || route.kind === 'binding-start'
-        || route.kind === 'binding-confirm' || route.kind === 'binding-account-action') && admission !== undefined) {
+        || route.kind === 'binding-confirm' || route.kind === 'binding-account-action'
+        || route.kind === 'directory' && request.method === 'POST' || route.kind === 'billing-checkout')
+        && admission !== undefined) {
         const address = request.socket.remoteAddress
         if (address === undefined) throw new ApiFailure(503, 'unavailable')
         requireAdmission(ctx, admission.admitDirectPeer(address, request.headers['x-forwarded-for']), 'client-address')
@@ -1163,6 +1306,10 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           : route.kind === 'binding-account-action'
             ? await bindingInput(request, route.action, config, controller.signal)
             : undefined
+      const organizationInput = route.kind === 'directory' && request.method === 'POST'
+        ? await directoryInput(request, config, controller.signal) : undefined
+      const checkoutInput = route.kind === 'billing-checkout'
+        ? await billingInput(request, config, controller.signal) : undefined
       if (route.kind === 'status') {
         const operations = ctx.get('registryDisclosureOperations')
         const disclosureOperationsConfigured = operations !== undefined
@@ -1181,6 +1328,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           rateLimits: admission === undefined ? 'unconfigured' : 'configured',
           disclosureCleanup: disclosureCleanupConfigured ? 'configured' : 'unconfigured',
           mailboxCleanup: mailboxCleanupConfigured ? 'configured' : 'unconfigured',
+          billing: ctx.get('registryBillingProvider') === undefined ? 'unconfigured' : 'configured',
+          billingProvider: ctx.get('registryBillingProvider')?.provider ?? 'unconfigured',
         })
         return
       }
@@ -1266,9 +1415,36 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'directory') {
-        const { directory, authority } = await directoryAuthority(ctx, request, controller.signal)
+        const { directory, authority, authenticatedSubject } = await directoryAuthority(ctx, request, controller.signal)
+        if (request.method === 'POST') {
+          if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(authenticatedSubject.organizationId,
+            authenticatedSubject.memberId), 'account')
+          if (organizationInput === undefined) throw new ApiFailure(503, 'unavailable')
+          const receipt = await directory.change(authority, organizationInput.change, organizationInput.expectedRevision)
+          requireOperationActive(controller.signal)
+          succeed(response, { revision: receipt.revision, invalidatedDisclosures: receipt.invalidatedDisclosures })
+          return
+        }
         const value = await directory.read(authority, 'administration', config.maxValueBytes)
-        succeed(response, directoryResult(value, config.maxValueBytes))
+        succeed(response, directoryResult(value, authenticatedSubject.role, config.maxValueBytes))
+        return
+      }
+      if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
+        const provider = ctx.get('registryBillingProvider')
+        if (provider === undefined) throw new ApiFailure(501, 'operation-not-configured')
+        const subject = await billingOwner(ctx, request, controller.signal)
+        if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(subject.organizationId,
+          subject.memberId), 'account')
+        if (route.kind === 'billing-plans') {
+          const plans = await provider.listPlans(subject, controller.signal)
+          requireOperationActive(controller.signal)
+          succeed(response, billingPlansResult(plans, config.maxValueBytes))
+          return
+        }
+        if (checkoutInput === undefined) throw new ApiFailure(503, 'unavailable')
+        const checkout = await provider.createCheckout({ subject, ...checkoutInput }, controller.signal)
+        requireOperationActive(controller.signal)
+        succeed(response, billingCheckoutResult(checkout, config.maxValueBytes))
         return
       }
       if (route.kind === 'audit') {

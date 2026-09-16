@@ -2,6 +2,8 @@
 
 在本仓库执行 `npm ci && npm run build`，以 `npm start` 启动。无需安装或访问 Felix / Harness 源码。生产前置检查及业务协议验证仍依赖真实配置，不默认生成可公开使用的账户或密钥。
 
+本地 PostgreSQL 使用 Docker Desktop + WSL 2，配置、迁移与启停命令见 [PostgreSQL 部署说明](postgres/README.md)。支付默认关闭；商户适配器的安全边界见 [订单与支付说明](payments/README.md)。
+
 ## 本地 OIDC
 
 Windows 安装 Java 21 与 Keycloak，设置 `JAVA_HOME`，然后执行：

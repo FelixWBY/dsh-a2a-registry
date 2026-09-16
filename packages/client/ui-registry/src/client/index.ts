@@ -31,6 +31,8 @@ export function apply(ctx: Context, config: Config = Config({})): void {
   const api = createRegistryApi()
   const readStatus: RegistryPageInjected['readStatus'] = signal => api.readStatus(signal)
   const readDirectory: RegistryPageInjected['readDirectory'] = signal => api.readDirectory(signal)
+  const changeDirectory: RegistryPageInjected['changeDirectory'] = (expectedRevision, change, signal) =>
+    api.changeDirectory(expectedRevision, change, signal)
   const listInstances: RegistryPageInjected['listInstances'] = signal => api.listInstances(signal)
   const renameInstance: RegistryPageInjected['renameInstance'] = (bindingId, instanceName, signal) =>
     api.renameInstance(bindingId, instanceName, signal)
@@ -81,6 +83,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       localTestIdentityBanner: config.localTestIdentityBanner,
       readStatus,
       readDirectory,
+      changeDirectory,
       listInstances,
       renameInstance,
       revokeInstance,

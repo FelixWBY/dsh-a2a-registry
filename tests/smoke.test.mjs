@@ -32,6 +32,8 @@ test('standalone Registry boots, serves its UI, and denies unauthenticated opera
     const status = await (await fetch(`${base}/registry-api/v1/status`)).json()
     assert.equal(status.value.identity, 'unconfigured')
     assert.equal(status.value.identityProvider, 'unconfigured')
+    assert.equal(status.value.billing, 'unconfigured')
+    assert.equal(status.value.billingProvider, 'unconfigured')
     assert.equal((await fetch(`${base}/registry-api/v1/directory`)).status, 503)
     assert.equal((await fetch(`${base}/.env`)).status, 404)
     assert.equal((await fetch(`${base}/src/dsh.ts`)).status, 404)

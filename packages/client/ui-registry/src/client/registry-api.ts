@@ -6,6 +6,7 @@ export type RegistryApiErrorCode =
   | 'unauthenticated'
   | 'not-found'
   | 'invalid-input'
+  | 'conflict'
   | 'operation-not-configured'
   | 'method-not-allowed'
   | 'rate-limited'
@@ -133,13 +134,25 @@ export interface RegistryDirectoryTeam {
 /** Administrator-visible organization directory revision; it contains no account or login credentials. */
 export interface RegistryDirectoryPage {
   readonly revision: number
+  readonly actorRole: RegistryDirectoryRole
   readonly members: readonly RegistryDirectoryMember[]
   readonly teams: readonly RegistryDirectoryTeam[]
+}
+
+export type RegistryDirectoryChange =
+  | { readonly kind: 'put-member'; readonly member: RegistryDirectoryMember }
+  | { readonly kind: 'put-team'; readonly team: RegistryDirectoryTeam }
+  | { readonly kind: 'remove-team'; readonly teamId: string }
+
+export interface RegistryDirectoryChangeReceipt {
+  readonly revision: number
+  readonly invalidatedDisclosures: number
 }
 
 export type RegistryConfigurationState = 'configured' | 'unconfigured'
 export type RegistryDeploymentMode = 'standard' | 'test-only'
 export type RegistryIdentityProvider = 'oidc' | 'external' | 'local-test' | 'unconfigured'
+export type RegistryBillingProvider = 'stripe' | 'alipay' | 'unconfigured'
 
 /** Startup configuration facts; these labels do not claim ongoing worker health. */
 export interface RegistryRuntimeStatus {
@@ -154,6 +167,8 @@ export interface RegistryRuntimeStatus {
   readonly rateLimits: RegistryConfigurationState
   readonly disclosureCleanup: RegistryConfigurationState
   readonly mailboxCleanup: RegistryConfigurationState
+  readonly billing: RegistryConfigurationState
+  readonly billingProvider: RegistryBillingProvider
 }
 
 export interface RegistryListRequest {
@@ -252,6 +267,8 @@ export interface RegistryA2aRequestPage {
 export interface RegistryApi {
   readStatus(signal: AbortSignal): Promise<RegistryRuntimeStatus>
   readDirectory(signal: AbortSignal): Promise<RegistryDirectoryPage>
+  changeDirectory(expectedRevision: number, change: RegistryDirectoryChange,
+    signal: AbortSignal): Promise<RegistryDirectoryChangeReceipt>
   listInstances(signal: AbortSignal): Promise<RegistryInstancePage>
   renameInstance(bindingId: string, instanceName: string, signal: AbortSignal): Promise<RegistryInstance>
   revokeInstance(bindingId: string, signal: AbortSignal): Promise<RegistryInstance>
@@ -283,7 +300,7 @@ export class RegistryApiError extends Error {
 const API_BASE = '/registry-api/v1'
 const ERROR_CODES: readonly RegistryApiErrorCode[] = [
   'identity-not-configured', 'registry-not-configured', 'unauthenticated', 'not-found',
-  'invalid-input', 'operation-not-configured', 'method-not-allowed', 'rate-limited', 'unavailable',
+  'invalid-input', 'conflict', 'operation-not-configured', 'method-not-allowed', 'rate-limited', 'unavailable',
 ]
 const ACTIONS: readonly RegistryAuthorizedAction[] = ['read', 'import', 'ask']
 const INSTANCE_PHASES: readonly RegistryInstancePhase[] = ['confirmed', 'revoked']
@@ -601,7 +618,9 @@ function validDisplayName(value: unknown): value is string {
 function directory(value: unknown): RegistryDirectoryPage {
   const source = record(value)
   const revision = safeInteger(source?.revision, 0)
-  if (source === null || revision === null || !Array.isArray(source.members) || !Array.isArray(source.teams)) {
+  const actorRole = member(source?.actorRole, DIRECTORY_ROLES)
+  if (source === null || revision === null || actorRole === null
+    || !Array.isArray(source.members) || !Array.isArray(source.teams)) {
     throw new RegistryApiError('unavailable')
   }
   const memberIds = new Set<string>()
@@ -633,7 +652,15 @@ function directory(value: unknown): RegistryDirectoryPage {
     teamIds.add(item.teamId)
     return { teamId: item.teamId, displayName: item.displayName, memberIds: memberIdsForTeam }
   })
-  return { revision, members, teams }
+  return { revision, actorRole, members, teams }
+}
+
+function directoryReceipt(value: unknown): RegistryDirectoryChangeReceipt {
+  const source = record(value)
+  const revision = safeInteger(source?.revision, 0)
+  const invalidatedDisclosures = safeInteger(source?.invalidatedDisclosures, 0)
+  if (revision === null || invalidatedDisclosures === null) throw new RegistryApiError('unavailable')
+  return { revision, invalidatedDisclosures }
 }
 
 function runtimeStatus(value: unknown): RegistryRuntimeStatus {
@@ -648,14 +675,18 @@ function runtimeStatus(value: unknown): RegistryRuntimeStatus {
   const rateLimits = member(source?.rateLimits, CONFIGURATION_STATES)
   const disclosureCleanup = member(source?.disclosureCleanup, CONFIGURATION_STATES)
   const mailboxCleanup = member(source?.mailboxCleanup, CONFIGURATION_STATES)
+  const billing = member(source?.billing, CONFIGURATION_STATES)
+  const billingProvider = member(source?.billingProvider, ['stripe', 'alipay', 'unconfigured'] as const)
   if (source === null || deploymentMode === null || identity === null || identityProvider === null
     || (identity === 'unconfigured' && identityProvider !== 'unconfigured')
     || (identity === 'configured' && identityProvider === 'unconfigured')
     || registry === null || disclosureOperations === null
     || deviceBinding === null || audit === null || rateLimits === null
-    || disclosureCleanup === null || mailboxCleanup === null) throw new RegistryApiError('unavailable')
+    || disclosureCleanup === null || mailboxCleanup === null || billing === null || billingProvider === null
+    || (billing === 'unconfigured' && billingProvider !== 'unconfigured')
+    || (billing === 'configured' && billingProvider === 'unconfigured')) throw new RegistryApiError('unavailable')
   return { deploymentMode, identity, identityProvider, registry, disclosureOperations, deviceBinding, audit, rateLimits,
-    disclosureCleanup, mailboxCleanup }
+    disclosureCleanup, mailboxCleanup, billing, billingProvider }
 }
 
 function importResult(value: unknown): RegistryImportResult {
@@ -786,6 +817,12 @@ export function createRegistryApi(): RegistryApi {
   return {
     readStatus: signal => request(`${API_BASE}/status`, { method: 'GET', signal }, runtimeStatus),
     readDirectory: signal => request(`${API_BASE}/directory`, { method: 'GET', signal }, directory),
+    changeDirectory: (expectedRevision, change, signal) => request(
+      `${API_BASE}/directory`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedRevision, change }) },
+      directoryReceipt,
+    ),
     listInstances: signal => request(`${API_BASE}/instances`, { method: 'GET', signal }, instances),
     renameInstance: (bindingId, instanceName, signal) => request(
       `${API_BASE}/instances/${encodeURIComponent(bindingId)}/rename`,

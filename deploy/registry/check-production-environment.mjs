@@ -89,6 +89,20 @@ function registryOrigin(value, domain) {
   }
 }
 
+function postgresUrl(value) {
+  let parsed
+  try { parsed = new URL(value) } catch {
+    issue('DSH_REGISTRY_POSTGRES_URL must be an absolute PostgreSQL URL')
+    return
+  }
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    issue('DSH_REGISTRY_POSTGRES_URL must use postgresql://')
+  }
+  if (parsed.hostname.length === 0 || parsed.username.length === 0 || parsed.password.length === 0
+    || parsed.pathname.length <= 1) issue('DSH_REGISTRY_POSTGRES_URL must include host, user, password and database')
+  if (parsed.hash.length > 0) issue('DSH_REGISTRY_POSTGRES_URL must not contain a fragment')
+}
+
 function syncUrl(name, value, domain) {
   let parsed
   try {
@@ -148,6 +162,9 @@ if (checkRegistry) {
   if (audience.length > 0 && domain.length > 0) syncUrl('DSH_REGISTRY_SYNC_AUDIENCE', audience, domain)
 }
 
+const selectedPostgresUrl = checkRegistry ? process.env.DSH_REGISTRY_POSTGRES_URL?.trim() ?? '' : ''
+if (selectedPostgresUrl.length > 0) postgresUrl(selectedPostgresUrl)
+
 if (checkHarness) {
   const instanceId = required('DSH_INSTANCE_ID')
   if (instanceId.length > 0) identifier('DSH_INSTANCE_ID', instanceId)
@@ -168,7 +185,7 @@ if (checkHarness) {
 const pathNames = [
   ...((checkRegistry || checkHarness) ? ['DSH_HOME'] : []),
   ...(checkRegistry ? [
-    'DSH_REGISTRY_SQLITE_PATH',
+    ...(selectedPostgresUrl.length === 0 ? ['DSH_REGISTRY_SQLITE_PATH'] : []),
     'DSH_REGISTRY_ADMISSION_SQLITE_PATH',
     'DSH_REGISTRY_ALERT_OUTBOX_SQLITE_PATH',
   ] : []),
@@ -208,6 +225,7 @@ if (issues.length > 0) {
     `- public domain: ${domain.toLowerCase()}`,
     ...(checkEdge ? ['- ACME account email: valid'] : []),
     ...(checkRegistry ? ['- HTTPS alert endpoint and Registry WSS audience: valid'] : []),
+    ...(checkRegistry && selectedPostgresUrl.length > 0 ? ['- Registry domain storage: PostgreSQL URL present (value hidden)'] : []),
     ...(checkHarness ? ['- Harness Registry Sync WSS URL: valid'] : []),
     ...(pathNames.length > 0
       ? [`- ${pathNames.join(', ')}: absolute${pathNames.length > 1 ? ' and distinct' : ''}`]

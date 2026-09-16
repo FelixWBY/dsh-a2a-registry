@@ -18,6 +18,7 @@ const requirements = [
   { fields: ['rateLimits'], titleKey: 'overviewRateLimits', bodyKey: 'overviewRateLimitsDescription' },
   { fields: ['disclosureCleanup'], titleKey: 'overviewDisclosureCleanup', bodyKey: 'overviewDisclosureCleanupDescription' },
   { fields: ['mailboxCleanup'], titleKey: 'overviewMailboxCleanup', bodyKey: 'overviewMailboxCleanupDescription' },
+  { fields: ['billing'], titleKey: 'overviewBilling', bodyKey: 'overviewBillingDescription' },
 ] as const
 
 function statusKey(state: RegistryConfigurationState, localTest: boolean): 'statusConfigured' | 'statusLocalTest' | 'statusUnconfigured' {
@@ -44,7 +45,8 @@ export function SettingsPage({ t, useTheme, setTheme, localTestIdentityBanner, r
 
   const localTest = localTestIdentityBanner || (state.kind === 'ready' && state.status.deploymentMode === 'test-only')
   const ready = !localTest && state.kind === 'ready'
-    && requirements.every(({ fields }) => fields.every(field => state.status[field] === 'configured'))
+    && requirements.every(({ fields }) => fields[0] === 'billing'
+      || fields.every(field => state.status[field] === 'configured'))
   const statusTitle = localTest
     ? t('settingsLocalTest')
     : ready ? t('settingsReady') : t('settingsIncomplete')

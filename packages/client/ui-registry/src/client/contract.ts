@@ -15,6 +15,8 @@ import type {
   RegistryImportResult,
   RegistryImportTargetPage,
   RegistryDirectoryPage,
+  RegistryDirectoryChange,
+  RegistryDirectoryChangeReceipt,
   RegistryInstance,
   RegistryInstancePage,
   RegistryListRequest,
@@ -59,6 +61,9 @@ export interface RegistryPageInjected {
   readStatus: (signal: AbortSignal) => Promise<RegistryRuntimeStatus>
   /** Read the current administrator-visible organization member and team directory. */
   readDirectory: (signal: AbortSignal) => Promise<RegistryDirectoryPage>
+  /** Apply one optimistic owner/admin directory mutation. */
+  changeDirectory: (expectedRevision: number, change: RegistryDirectoryChange,
+    signal: AbortSignal) => Promise<RegistryDirectoryChangeReceipt>
   /** Read current account-owned instance bindings and ephemeral observations. */
   listInstances: (signal: AbortSignal) => Promise<RegistryInstancePage>
   /** Rename one currently confirmed binding owned by the authenticated account. */

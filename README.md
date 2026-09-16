@@ -57,6 +57,8 @@ npm test
 | `vendor` | 固定来源的 Cordis 基础组件 |
 | `deploy` | Caddy、systemd、备份恢复、OIDC 示例 |
 
+订单与支付只提供默认关闭的 provider 边界，不包含真实商户配置。正式接入要求托管结账、服务端价格白名单、幂等创建和验签 Webhook，见 `deploy/payments/README.md`。
+
 ## 来源与许可证
 
 本项目从 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 `76fda72979` 基线及本地 Registry 开发版本提取，是独立维护的衍生项目，不是 DeepSeek 官方发布的注册站。原始版权和 [MIT 许可证](LICENSE) 保留；第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。内部 `@deepseek-ai/*` 名称保留用于协议和模块兼容，包均为 private，不会发布到 npm。

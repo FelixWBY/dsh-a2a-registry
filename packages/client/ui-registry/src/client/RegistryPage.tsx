@@ -53,7 +53,8 @@ export function RegistryPage(props: RegistryPageProps) {
     localTestIdentityBanner={props.localTestIdentityBanner} readStatus={props.readStatus} />
   if (page === 'overview') return <OverviewPage t={t} localTestIdentityBanner={props.localTestIdentityBanner}
     readStatus={props.readStatus} />
-  if (page === 'members') return <MembersPage t={t} readDirectory={props.readDirectory} />
+  if (page === 'members') return <MembersPage t={t} readDirectory={props.readDirectory}
+    changeDirectory={props.changeDirectory} />
   if (page === 'nodes') return <NodesPage t={t} listInstances={props.listInstances}
     renameInstance={props.renameInstance} revokeInstance={props.revokeInstance} />
   if (page === 'binding') return <BindingPage t={t} listInstances={props.listInstances}
