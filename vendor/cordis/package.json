@@ -1,0 +1,16 @@
+{
+  "name": "@deepseek-ai/cordis",
+  "version": "4.0.2",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": "Shigma <shigma10826@gmail.com>",
+  "exports": {
+    ".": "./src/index.ts",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/cosmokit": "*"
+  }
+}

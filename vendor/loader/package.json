@@ -1,0 +1,18 @@
+{
+  "name": "@deepseek-ai/cordis-plugin-loader",
+  "version": "1.0.3",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": "Shigma <shigma10826@gmail.com>",
+  "exports": {
+    ".": "./src/index.ts",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/cosmokit": "*",
+    "node-addon-require-builtin": "^0.1.4"
+  }
+}

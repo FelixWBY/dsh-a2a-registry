@@ -1,0 +1,51 @@
+{
+  "realm": "dsh-local",
+  "enabled": true,
+  "displayName": "DSH Registry Local Identity",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "rememberMe": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "clients": [
+    {
+      "clientId": "dsh-registry",
+      "name": "DSH Registry",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${DSH_LOCAL_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "${DSH_LOCAL_REGISTRY_ORIGIN}/registry-auth/v1/callback"
+      ],
+      "webOrigins": [
+        "${DSH_LOCAL_REGISTRY_ORIGIN}"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "${DSH_LOCAL_REGISTRY_ORIGIN}/*",
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "registry-owner",
+      "enabled": true,
+      "email": "registry-owner@localhost.invalid",
+      "emailVerified": true,
+      "firstName": "Registry",
+      "lastName": "Owner",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${DSH_LOCAL_OIDC_USER_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

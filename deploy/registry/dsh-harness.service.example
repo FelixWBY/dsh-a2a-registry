@@ -1,0 +1,40 @@
+[Unit]
+Description=DeepSeek Harness A2A device
+Documentation=file:/opt/deepseek-harness/deploy/registry/README.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dsh-harness
+Group=dsh-harness
+Environment=NODE_ENV=production
+EnvironmentFile=/run/secrets/dsh-harness.env
+WorkingDirectory=/srv/dsh-harness-workspace
+ExecStartPre=/usr/bin/node /opt/deepseek-harness/deploy/registry/check-production-environment.mjs harness
+ExecStart=/usr/bin/node /opt/deepseek-harness/apps/cli/lib/bin.js --profile web --patch /etc/dsh/harness-production.patch.yml --no-open
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/dsh-harness/home /var/lib/dsh-harness/state /srv/dsh-harness-workspace
+
+[Install]
+WantedBy=multi-user.target

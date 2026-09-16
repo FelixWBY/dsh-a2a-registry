@@ -1,0 +1,23 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$REGISTRY_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:3081 {
+		health_uri /readyz
+		health_interval 30s
+		health_timeout 5s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

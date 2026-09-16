@@ -1,0 +1,40 @@
+[Unit]
+Description=DSH A2A Registry
+Documentation=file:/opt/dsh-a2a-registry/README.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dsh-registry
+Group=dsh-registry
+Environment=NODE_ENV=production
+EnvironmentFile=/run/secrets/dsh-registry.env
+WorkingDirectory=/opt/dsh-a2a-registry
+ExecStartPre=/usr/bin/node /opt/dsh-a2a-registry/deploy/registry/check-production-environment.mjs registry
+ExecStart=/usr/bin/node --import tsx/esm src/dsh.ts --profile registry --patch /etc/dsh/registry-production.patch.yml
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/dsh-registry/home /var/lib/dsh-registry/state
+
+[Install]
+WantedBy=multi-user.target

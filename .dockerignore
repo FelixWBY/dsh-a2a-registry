@@ -1,0 +1,9 @@
+.git
+node_modules
+**/lib
+apps/web/dist
+.registry
+.artifacts
+.env
+.env.*
+*.log

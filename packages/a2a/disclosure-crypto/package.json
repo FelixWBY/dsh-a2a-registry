@@ -1,0 +1,16 @@
+{
+  "name": "@deepseek-ai/dsh-a2a-disclosure-crypto",
+  "version": "0.1.2-rc.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-a2a-protocol": "*"
+  }
+}

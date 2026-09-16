@@ -1,0 +1,71 @@
+{
+  "name": "dsh-a2a-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "packages/*/*",
+    "vendor/*",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node --import tsx/esm src/dsh.ts --profile registry",
+    "test": "node --test tests/smoke.test.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-registry-app": "*",
+    "@deepseek-ai/dsh-app-boot": "*",
+    "@deepseek-ai/dsh-client-web": "*",
+    "@deepseek-ai/dsh-client-ui-registry": "*",
+    "@deepseek-ai/dsh-client-ui-renderer": "*",
+    "@deepseek-ai/dsh-client-ui-theme": "*",
+    "@deepseek-ai/dsh-client-locale": "*",
+    "@deepseek-ai/dsh-client-modules": "*",
+    "@deepseek-ai/dsh-credentials-local": "*",
+    "@deepseek-ai/dsh-storage": "*",
+    "@deepseek-ai/dsh-storage-domain": "*",
+    "@deepseek-ai/dsh-storage-json": "*",
+    "@deepseek-ai/dsh-storage-sqlite": "*",
+    "@deepseek-ai/dsh-host-webserver": "*",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-a2a-device-identity": "*",
+    "@deepseek-ai/dsh-a2a-registry-ingest": "*",
+    "@deepseek-ai/dsh-a2a-disclosure-crypto": "*",
+    "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-a2a-mailbox": "*",
+    "@deepseek-ai/dsh-host-frontend-static": "*",
+    "@deepseek-ai/dsh-a2a-registry-sync": "*",
+    "@deepseek-ai/dsh-util-values": "*",
+    "@deepseek-ai/dsh-a2a-registry-domain": "*",
+    "@deepseek-ai/dsh-a2a-protocol": "*",
+    "@deepseek-ai/cordis-plugin-loader": "*",
+    "@deepseek-ai/cordis-plugin-include": "*",
+    "@deepseek-ai/cordis-plugin-group": "*",
+    "@deepseek-ai/dsh-home-paths": "*",
+    "@deepseek-ai/dsh-launch-environment": "*",
+    "@deepseek-ai/dsh-atomic-write": "*",
+    "@deepseek-ai/dsh-client-store": "*",
+    "@deepseek-ai/dsh-client-ui-slots": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*",
+    "@deepseek-ai/cosmokit": "*",
+    "@deepseek-ai/dsh-web-frontend": "*",
+    "esbuild": "0.25.12",
+    "vite": "6.4.3",
+    "tsx": "4.22.4",
+    "typescript": "6.0.3",
+    "lightningcss": "1.32.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "js-yaml": "^4.2.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

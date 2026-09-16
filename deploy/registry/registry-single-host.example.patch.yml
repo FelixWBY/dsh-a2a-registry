@@ -1,0 +1,158 @@
+# Single-host production foundation. It deliberately declares external service
+# injections that this repository cannot invent. Loader readiness therefore
+# fails closed until the deployment adds real Credentials, producer
+# authentication, device-key/KMS, and disclosure-operation providers.
+# Never add localHarness or a test-only identity to this file.
+
+- insert:
+    - id: registry-storage
+      name: '@deepseek-ai/dsh-storage'
+
+    - id: registry-storage-sqlite
+      name: '@deepseek-ai/dsh-storage-sqlite'
+      config:
+        path: !!js process.env.DSH_REGISTRY_SQLITE_PATH
+        journalMode: wal
+
+    - id: registry-storage-domain
+      name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: sqlite
+
+- id: registry-webserver
+  config:
+    host: 127.0.0.1
+    port: 3081
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+
+- id: registry-runtime
+  inject:
+    - storageDomain
+    - credentials
+    - registryProducerAuthenticator
+    - registryDisclosureOperations
+  config:
+    printUrl: false
+    oidc:
+      mode: production
+      issuer: !!js process.env.DSH_REGISTRY_OIDC_ISSUER
+      clientId: !!js process.env.DSH_REGISTRY_OIDC_CLIENT_ID
+      clientSecretEnv: DSH_REGISTRY_OIDC_CLIENT_SECRET
+      sessionSecretEnv: DSH_REGISTRY_SESSION_SECRET
+      publicOrigin: !!js process.env.DSH_REGISTRY_PUBLIC_ORIGIN
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      memberIdClaim: dsh_member_id
+      scopes: openid profile email
+      sessionTtlMs: 3600000
+      transactionTtlMs: 300000
+      maxAuthenticationAgeSeconds: 3600
+      clockToleranceSeconds: 30
+      requestTimeoutMs: 10000
+      maxCookieBytes: 8192
+      maxDirectoryBytes: 10485760
+    sharedAdmission:
+      path: !!js process.env.DSH_REGISTRY_ADMISSION_SQLITE_PATH
+      namespace: registry-production-v1
+      keySecretEnv: DSH_REGISTRY_ADMISSION_HMAC
+      busyTimeoutMs: 2000
+      journalMode: wal
+      audit:
+        maxEntries: 100000
+        aggregationWindowMs: 60000
+    api:
+      pageSize: 50
+      maxValueBytes: 262144
+      maxCursorBytes: 4096
+      maxOperationInputBytes: 16384
+      admission:
+        directPeer:
+          capacity: 60
+          refillPerSecond: 10
+          maxEntries: 4096
+        account:
+          capacity: 30
+          refillPerSecond: 5
+          maxEntries: 16384
+        trustedProxy:
+          cidrs:
+            - 127.0.0.1/32
+          maxForwardedBytes: 1024
+          maxForwardedEntries: 8
+    ingest:
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      limits:
+        maxInputBytes: 65536
+        maxAggregateBytes: 4194304
+        maxEvents: 1000
+        maxCheckpoints: 100
+        maxDisclosures: 100000
+        maxAuditEntries: 1000000
+      audit:
+        failurePolicy: block-all
+        maxOperations: 1000000
+        maxRecordBytes: 4096
+      alerts:
+        endpoint: !!js process.env.DSH_REGISTRY_ALERT_ENDPOINT
+        bearerTokenEnv: DSH_REGISTRY_ALERT_BEARER_TOKEN
+        maxPendingAlerts: 10000
+        deliveryAttempts: 8
+        timeoutMs: 5000
+        retryDelayMs: 5000
+        outbox:
+          path: !!js process.env.DSH_REGISTRY_ALERT_OUTBOX_SQLITE_PATH
+          namespace: registry-production-alerts-v1
+          leaseMs: 15000
+          failedRetentionMs: 2592000000
+          busyTimeoutMs: 2000
+          journalMode: wal
+      maintenance:
+        intervalMs: 30000
+        maxItems: 100
+      directory:
+        maxMembers: 100000
+        maxTeams: 10000
+        maxTeamMembers: 100000
+        maxNameBytes: 256
+        maxBytes: 104857600
+        bootstrapOwner:
+          memberId: !!js process.env.DSH_REGISTRY_BOOTSTRAP_MEMBER_ID
+          displayName: !!js process.env.DSH_REGISTRY_BOOTSTRAP_MEMBER_NAME
+      bindings:
+        audience: !!js process.env.DSH_REGISTRY_SYNC_AUDIENCE
+        ttlMs: 600000
+        maxRecordBytes: 8192
+        maxBindings: 100000
+        maxNameBytes: 256
+      sync:
+        audience: !!js process.env.DSH_REGISTRY_SYNC_AUDIENCE
+        tlsTermination: loopback-proxy
+        maxConnections: 10000
+        maxFrameBytes: 1048576
+        maxSendBufferBytes: 2097152
+        handshakeTimeoutMs: 10000
+        idleTimeoutMs: 30000
+        admission:
+          upgrades: { capacity: 200, refillPerSecond: 50 }
+          frames:
+            requests: { capacity: 2000, refillPerSecond: 500 }
+            bytes: { capacity: 67108864, refillPerSecond: 16777216 }
+          handshakes: { capacity: 400, refillPerSecond: 100 }
+          organizations:
+            maxEntries: 16
+            requests: { capacity: 2000, refillPerSecond: 500 }
+            bytes: { capacity: 67108864, refillPerSecond: 16777216 }
+          instances:
+            maxEntries: 100000
+            requests: { capacity: 1000, refillPerSecond: 250 }
+            bytes: { capacity: 33554432, refillPerSecond: 8388608 }
+          disclosures:
+            maxEntries: 1000000
+            requests: { capacity: 500, refillPerSecond: 100 }
+            bytes: { capacity: 16777216, refillPerSecond: 4194304 }
+
+- id: ui-registry
+  config:
+    localTestIdentityBanner: false
+    defaultTheme: dark

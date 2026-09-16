@@ -1,0 +1,307 @@
+/** One opt-in storage lifecycle shared by Registry directory, enrollment, maintenance and synchronization. */
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
+import { RegistryIngestError, type RegistryAuditConfig, type RegistryBindingConfig,
+  type RegistryDirectoryConfig, type RegistryIngestLimits } from '@deepseek-ai/dsh-a2a-registry-ingest'
+import { decodeRegistryAudience } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
+import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
+import type {} from '@deepseek-ai/dsh-storage-domain'
+import { Config as MaintenanceSchema, runRegistryMaintenance, type MaintenanceConfig } from './maintenance.ts'
+import { Config as SyncConfig, type RegistrySyncConfig } from './sync-config.ts'
+import { installRegistrySync } from './sync.ts'
+import { RegistryRuntimeStore } from './runtime-store.ts'
+import type { RegistryDisclosureControl } from './control.ts'
+import type { RegistryDisclosureReader } from './reader.ts'
+import type { FreshRegistryAuditAuthority, RegistryAuditMetadata, RegistryAuditPage,
+  RegistryAuditReader } from './audit-reader.ts'
+import type { RegistryDirectory } from './directory.ts'
+import type { RegistryEnrollment } from './enrollment.ts'
+import { RegistryOperationalAlertExporter, RegistryOperationalAlertsConfigSchema,
+  type RegistryOperationalAlertsConfig, type RegistryOperationalRateLimitScope } from './operational-alerts.ts'
+
+function boundedObservation<T>(value: T, maximum: number): T {
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > maximum) throw new RegistryIngestError('limit')
+  return value
+}
+
+/** Private plugin name; profile composition remains owned by registry-app. */
+export const name = 'registry-ingest-runtime'
+/** Storage replacement disposes the shared owner before the next consumer can enter. */
+export const inject = ['storageDomain']
+
+/** Complete limits shared by every enabled consumer of the exclusive Registry domain. */
+export interface RegistryIngestRuntimeConfig {
+  /** Canonical organization permanently bound to this physical Registry domain. */
+  organizationId: OrganizationId
+  /** One set of complete storage bounds for every configured consumer. */
+  limits: RegistryIngestLimits
+  /** Explicit durable journal; block-all includes withdrawals and deletions. No policy is selected when absent. */
+  audit?: RegistryAuditConfig
+  /** Optional bounded HTTPS export of selected metadata-only journal failures. Requires audit. */
+  alerts?: RegistryOperationalAlertsConfig
+  /** Explicit bounded directory and first-open owner; this does not configure account authentication. */
+  directory?: RegistryDirectoryConfig
+  /** Explicit enrollment candidates; requires directory configuration and does not issue credentials. */
+  bindings?: RegistryBindingConfig
+  /** Trusted organization-scoped background deletion, absent by default. */
+  maintenance?: MaintenanceConfig
+  /** Authenticated producer endpoint, requiring an external identity provider. */
+  sync?: RegistrySyncConfig
+}
+
+const positive = () => z.natural().min(1).max(Number.MAX_SAFE_INTEGER).required()
+const schema: z<RegistryIngestRuntimeConfig> = z.object({
+  organizationId: z.transform(z.string().pattern(/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$(?![\s\S])/).required(),
+    value => brandString<OrganizationId>(value)).required(),
+  limits: z.object({ maxInputBytes: positive(), maxAggregateBytes: positive(), maxEvents: positive(),
+    maxCheckpoints: positive(), maxDisclosures: positive(), maxAuditEntries: positive() }).required(),
+  audit: z.union([z.object({ failurePolicy: z.const('block-all').required(), maxOperations: positive(), maxRecordBytes: positive() })]),
+  alerts: z.union([RegistryOperationalAlertsConfigSchema]),
+  directory: z.union([z.object({ maxMembers: positive(), maxTeams: positive(), maxTeamMembers: positive(),
+    maxNameBytes: positive(), maxBytes: positive(), bootstrapOwner: z.object({
+      memberId: z.transform(z.string().pattern(/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$(?![\s\S])/).required(),
+        value => brandString<MemberId>(value)).required(),
+      displayName: z.string().required(),
+    }).required() })]),
+  bindings: z.union([z.object({ audience: z.string().required(), ttlMs: positive(),
+    maxRecordBytes: positive(), maxBindings: positive(), maxNameBytes: positive() })]),
+  maintenance: z.union([MaintenanceSchema]), sync: z.union([SyncConfig]),
+})
+export const Config: z<RegistryIngestRuntimeConfig> = z.transform(schema, (value) => {
+  if (value.bindings !== undefined) {
+    if (value.directory === undefined) throw new z.ValidationError('Registry enrollment requires directory', {})
+    try { decodeRegistryAudience(value.bindings.audience) } catch {
+      throw new z.ValidationError('Registry enrollment requires a canonical WSS audience', {})
+    }
+    if (value.sync !== undefined && value.sync.audience !== value.bindings.audience) {
+      throw new z.ValidationError('Registry enrollment and sync require the same audience', {})
+    }
+  }
+  if (value.maintenance === undefined && value.sync === undefined && value.directory === undefined) {
+    throw new z.ValidationError('Registry ingest requires maintenance, sync or directory', {})
+  }
+  if (value.alerts !== undefined && value.audit === undefined) {
+    throw new z.ValidationError('Registry operational alerts require durable audit', {})
+  }
+  return value
+})
+
+function auditMetadata(record: ReturnType<import('@deepseek-ai/dsh-a2a-registry-ingest').RegistryIngest['inspectAudit']>[number]): RegistryAuditMetadata {
+  const completion = record.completion
+  const actor = completion?.actor
+  const actorId = actor?.kind === 'member' ? actor.memberId
+    : actor?.kind === 'producer' || actor?.kind === 'enrollment' ? actor.instanceId : null
+  return {
+    operationId: record.operationId,
+    occurredAt: completion?.completedAt ?? record.startedAt,
+    actorKind: actor?.kind ?? 'unattributed',
+    actorId,
+    instanceId: actor?.kind === 'producer' || actor?.kind === 'enrollment' ? actor.instanceId : null,
+    objectId: record.requestedDisclosureId,
+    action: record.action,
+    result: completion === null ? 'pending' : completion.outcome.kind === 'rejected' ? 'rejected' : 'succeeded',
+  }
+}
+
+function auditPage(records: ReturnType<import('@deepseek-ai/dsh-a2a-registry-ingest').RegistryIngest['inspectAudit']>,
+  options: import('./audit-reader.ts').RegistryAuditListOptions): RegistryAuditPage {
+  if (!Number.isSafeInteger(options.pageSize) || options.pageSize <= 0
+    || !Number.isSafeInteger(options.maxPageSize) || options.maxPageSize <= 0
+    || !Number.isSafeInteger(options.maxResponseBytes) || options.maxResponseBytes <= 0) {
+    throw new RegistryIngestError('invalid-input')
+  }
+  const pageSize = Math.min(options.pageSize, options.maxPageSize)
+  const ordered = [...records].reverse()
+  let start = 0
+  if (options.cursor !== undefined) {
+    const anchor = ordered.findIndex(record => record.operationId === options.cursor)
+    if (anchor < 0) throw new RegistryIngestError('invalid-input')
+    start = anchor + 1
+  }
+  const items: RegistryAuditMetadata[] = []
+  let index = start
+  while (index < ordered.length && items.length < pageSize) {
+    const record = ordered[index]
+    if (record === undefined) throw new RegistryIngestError('invalid-storage')
+    const item = auditMetadata(record)
+    const candidate = { items: [...items, item], nextCursor: null }
+    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > options.maxResponseBytes) {
+      if (items.length === 0) throw new RegistryIngestError('limit')
+      break
+    }
+    items.push(item)
+    index += 1
+  }
+  const last = items.at(-1)
+  const page = { items, nextCursor: index < ordered.length && last !== undefined ? last.operationId : null }
+  if (Buffer.byteLength(JSON.stringify(page), 'utf8') > options.maxResponseBytes) {
+    throw new RegistryIngestError('limit')
+  }
+  return structuredClone(page)
+}
+
+/** Mount the shared owner; identity is required only for explicitly enabled synchronization.
+ * @param ctx - Private lifecycle context with the configured storage facility.
+ * @param config - Validated explicit consumers and resource limits.
+ * @returns Startup after durable organization ownership is verified, before any consumer is published. */
+export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): Promise<void> {
+  const options = structuredClone(config)
+  const provider = ctx.get('registryProducerAuthenticator')
+  let sync: { config: RegistrySyncConfig; provider: NonNullable<typeof provider> } | undefined
+  if (options.sync !== undefined) {
+    if (provider === undefined) throw new Error('Registry sync requires registryProducerAuthenticator')
+    sync = { config: options.sync, provider }
+  }
+  const abort = new AbortController()
+  const alerts = options.alerts === undefined ? undefined : new RegistryOperationalAlertExporter(ctx, options.alerts)
+  const store = new RegistryRuntimeStore(ctx, ctx.storageDomain, options.organizationId, options.limits, abort,
+    options.audit, options.directory, options.bindings, alerts)
+  let stopSync: (() => Promise<void>) | undefined
+  let worker = Promise.resolve()
+  ctx.effect(() => {
+    return async () => {
+      abort.abort()
+      const outcomes = await Promise.allSettled([stopSync?.(), worker, store.close()])
+      const alertOutcomes = await Promise.allSettled([alerts?.close()])
+      if ([...outcomes, ...alertOutcomes].some(outcome => outcome.status === 'rejected')) {
+        ctx.logger.error('Registry ingest runtime cleanup failed')
+      }
+    }
+  }, 'registry-app: exclusive ingest lifecycle')
+  await store.run(async () => {})
+  if (!store.active()) throw new RegistryIngestError('closed')
+  if (alerts !== undefined) {
+    ctx.provide('registryOperationalAlertReporter', Object.freeze({
+      reportRateLimit: (scope: RegistryOperationalRateLimitScope) => {
+        alerts.reportRateLimit(options.organizationId, scope)
+      },
+    }))
+  }
+  const control: RegistryDisclosureControl = {
+    register(authority, registration) {
+      let captured: typeof registration
+      try { captured = structuredClone(registration) } catch {
+        return Promise.reject(new RegistryIngestError('invalid-input'))
+      }
+      return store.run(ingest => ingest.register(authority, captured))
+    },
+    getSyncStatus: (authority, id) => store.run(ingest => ingest.getSyncStatus(authority, id)),
+    updateAccess(authority, id, update, expectedVersion) {
+      let captured: typeof update
+      try { captured = structuredClone(update) } catch {
+        return store.rejectAccessInput(id)
+      }
+      return store.run(ingest => ingest.updateAccess(authority, id, captured, expectedVersion))
+    },
+    transitionControl: (authority, id, target, expectedVersion) =>
+      store.run(ingest => ingest.transitionControl(authority, id, target, expectedVersion)),
+    delete: (authority, id, expectedVersion) => store.run(ingest => ingest.delete(authority, id, expectedVersion)),
+  }
+  ctx.provide('registryDisclosureControl', Object.freeze(control))
+  const reader: RegistryDisclosureReader = {
+    list: (authority, options) => store.run(ingest => ingest.listMetadata(authority, options)),
+    readMetadata: (authority, disclosureId, action, options) =>
+      store.run(ingest => ingest.readMetadataWithResolver(authority, disclosureId, action, options)),
+    readPrefix: (authority, disclosureId, sourceInstanceId, action, checkpointHash) => store.run(ingest => ingest.read(
+      async () => {
+        const current = await authority()
+        const history = current.historyFor(sourceInstanceId)
+        if (history === null) throw new RegistryIngestError('not-found')
+        return { subject: current.subject, history, now: current.now }
+      }, disclosureId, action, checkpointHash)),
+    withAuthorizedPrefix: (authority, disclosureId, sourceInstanceId, action, checkpointHash,
+      maxMetadataBytes, receive, callback) => store.run(async (ingest) => {
+      let metadata: Awaited<ReturnType<typeof ingest.readMetadataWithResolver>>
+      let prefix: Awaited<ReturnType<typeof ingest.read>>
+      try {
+        if (receive !== undefined) {
+          const bindings = await ingest.listBindings(receive.authority, receive.maxResponseBytes)
+          const matches = bindings.filter(binding => binding.instanceId === receive.instanceId)
+          if (matches.length !== 1 || matches[0]?.phase !== 'confirmed'
+            || !matches[0].requestedScopes.includes('a2a.receive')) throw new RegistryIngestError('not-found')
+        }
+        metadata = await ingest.readMetadataWithResolver(authority, disclosureId, action,
+          { checkpointHash, maxResponseBytes: maxMetadataBytes })
+        prefix = await ingest.read(async () => {
+          const current = await authority()
+          const history = current.historyFor(sourceInstanceId)
+          if (history === null) throw new RegistryIngestError('not-found')
+          return { subject: current.subject, history, now: current.now }
+        }, disclosureId, action, checkpointHash)
+      } catch (error) {
+        if (error instanceof RegistryIngestError && error.code === 'not-found') return callback(null)
+        throw error
+      }
+      return callback({ metadata, prefix })
+    }),
+  }
+  ctx.provide('registryDisclosureReader', Object.freeze(reader))
+  if (options.audit !== undefined) {
+    const auditReader: RegistryAuditReader = {
+      list: (authority: FreshRegistryAuditAuthority, listOptions) => store.run(async (ingest) => {
+        let subject: Awaited<ReturnType<FreshRegistryAuditAuthority>>
+        try { subject = await authority() } catch { throw new RegistryIngestError('not-found') }
+        if (!subject.authenticated || subject.organizationId !== store.organizationId
+          || subject.membership !== 'active' || (subject.role !== 'owner' && subject.role !== 'admin')) {
+          throw new RegistryIngestError('not-found')
+        }
+        return auditPage(ingest.inspectAudit(), listOptions)
+      }),
+    }
+    ctx.provide('registryAuditReader', Object.freeze(auditReader))
+  }
+  if (options.directory !== undefined) {
+    const directory: RegistryDirectory = {
+      read: (authority, scope, maxResponseBytes) => store.run(ingest => ingest.readDirectory(authority, scope, maxResponseBytes)),
+      change(authority, command, expectedRevision) {
+        let captured: typeof command
+        try { captured = structuredClone(command) } catch {
+          return store.run(ingest => ingest.rejectDirectoryInput())
+        }
+        return store.run(ingest => ingest.changeDirectory(authority, captured, expectedRevision))
+      },
+    }
+    ctx.provide('registryDirectory', Object.freeze(directory))
+  }
+  if (options.bindings !== undefined) {
+    const enrollment: RegistryEnrollment = {
+      start(request) {
+        let captured: typeof request
+        try { captured = structuredClone(request) } catch {
+          return store.run(ingest => ingest.rejectBindingStartInput())
+        }
+        return store.run(ingest => ingest.startBinding(captured))
+      },
+      review: (authority, bindingId, code, maxResponseBytes) =>
+        store.run(ingest => ingest.reviewBinding(authority, bindingId, code, maxResponseBytes)),
+      reject: (authority, bindingId, code) => store.run(ingest => ingest.rejectBinding(authority, bindingId, code)),
+      revoke: (authority, bindingId) => store.run(ingest => ingest.revokeBinding(authority, bindingId)),
+      inspect: (authority, bindingId, maxResponseBytes) => store.run(async (ingest) => {
+        const binding = await ingest.inspectBinding(authority, bindingId, maxResponseBytes)
+        return boundedObservation({ ...binding, transport: store.transport.read(binding.instanceId) }, maxResponseBytes)
+      }),
+      list: (authority, maxResponseBytes) => store.run(async (ingest) => {
+        const bindings = await ingest.listBindings(authority, maxResponseBytes)
+        return boundedObservation(bindings.map(binding => ({ ...binding, transport: store.transport.read(binding.instanceId) })),
+          maxResponseBytes)
+      }),
+      rename: (authority, bindingId, instanceName) => store.run(ingest => ingest.renameBinding(authority, bindingId, instanceName)),
+      approve: (authority, bindingId, code, instanceName) =>
+        store.run(ingest => ingest.approveBinding(authority, bindingId, code, instanceName)),
+      confirm(bindingId, proof) {
+        let captured: unknown
+        try { captured = structuredClone(proof) } catch {
+          return store.run(ingest => ingest.rejectBindingProofInput())
+        }
+        return store.run(ingest => ingest.confirmBinding(bindingId, captured))
+      },
+    }
+    ctx.provide('registryEnrollment', Object.freeze(enrollment))
+  }
+  if (sync !== undefined) stopSync = installRegistrySync(ctx, sync.config, sync.provider, store, abort.signal)
+  if (options.maintenance !== undefined) {
+    worker = runRegistryMaintenance(ctx, options.organizationId, options.maintenance, store, abort.signal)
+  }
+}

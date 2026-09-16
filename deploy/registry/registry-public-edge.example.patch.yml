@@ -1,0 +1,34 @@
+# Public-edge starter for the standalone registry profile. Copy these values into
+# the deployment-owned patch that also mounts the chosen identity, storage, KMS,
+# alerting and producer providers. This file does not make those providers up.
+
+- id: registry-webserver
+  config:
+    host: 127.0.0.1
+    port: 3081
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+
+- id: registry-runtime
+  config:
+    printUrl: false
+    api:
+      pageSize: 50
+      maxValueBytes: 262144
+      maxCursorBytes: 4096
+      maxOperationInputBytes: 16384
+      admission:
+        directPeer:
+          capacity: 60
+          refillPerSecond: 10
+          maxEntries: 4096
+        account:
+          capacity: 30
+          refillPerSecond: 5
+          maxEntries: 16384
+        trustedProxy:
+          cidrs:
+            - 127.0.0.1/32
+          maxForwardedBytes: 1024
+          maxForwardedEntries: 8

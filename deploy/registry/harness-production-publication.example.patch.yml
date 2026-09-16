@@ -1,0 +1,102 @@
+# Production Harness-to-Registry A2A foundation. Copy into a deployment-owned
+# patch and add real providers for productionDisclosureAuthority,
+# registryDisclosureKeyPublisher and sessionDisclosureRefresh. This file
+# deliberately invents none of them.
+
+- id: web-runtime
+  inject:
+    - webStartup
+    - credentials
+    - productionDisclosureAuthority
+    - registryDisclosureKeyPublisher
+  config:
+    openBrowser: !!js ctx.webStartup.openBrowser
+    printUrl: true
+    surfaceContext: true
+    trustedHosts: !!js ctx.webStartup.trustedHosts
+    a2aDisclosureDecryption:
+      maxPlaintextBytes: 65536
+      maxCiphertextBytes: 262144
+      maxTrustedKeys: 4
+    productionRegistryConnection:
+      mode: production
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      instanceId: !!js process.env.DSH_INSTANCE_ID
+      tokenEnv: DSH_REGISTRY_DEVICE_TOKEN
+      privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY
+      transport:
+        url: !!js process.env.DSH_REGISTRY_SYNC_URL
+        handshakeTimeoutMs: 10000
+        requestTimeoutMs: 10000
+        heartbeatIntervalMs: 10000
+        pollIntervalMs: 1000
+        maxFrameBytes: 1048576
+        maxSendBufferBytes: 2097152
+        maxConnections: 110
+        maxPendingQuestionOperations: 100
+        retryBaseMs: 500
+        retryCapMs: 30000
+        retryJitterMin: 0.5
+        retryJitterMax: 1
+    productionDisclosurePublication:
+      mode: production
+      storageRoot: !!js process.env.DSH_DISCLOSURE_STATE_PATH
+      producer:
+        maxSnapshotBytes: 16777216
+        maxBatchEvents: 100
+        maxPublications: 100
+        maxMappingRecordBytes: 65536
+      crypto:
+        maxPlaintextBytes: 65536
+        maxCiphertextBytes: 262144
+        maxTrustedKeys: 4
+
+# The same pre-enrolled device consumes Registry-authorized imports and manual
+# questions. This also supplies the one real receiver report source carried by
+# the independent Presence connection above. No loopback transport is enabled.
+- id: session-controller
+  config:
+    disclosurePreview:
+      maxObservedEvents: 5000
+      maxObservedBytes: 16777216
+      maxResponseBytes: 4194304
+      maxExcludedSourceSeqs: 2000
+      policy:
+        maxTextCharacters: 32000
+        maxToolSummaryCharacters: 4000
+        maxEventBytes: 160000
+        blockedText: []
+    registryDisclosureImport:
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      targetInstanceId: !!js process.env.DSH_INSTANCE_ID
+      pollIntervalMs: 1000
+      limits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+    registryA2aConsumer:
+      handling: manual
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      sourceInstanceId: !!js process.env.DSH_INSTANCE_ID
+      pollIntervalMs: 1000
+      requestTimeoutMs: 10000
+      maxResponseBytes: 8388608
+      maxClaims: 100
+      mailboxLimits:
+        maxTextBytes: 65536
+        maxTextCharacters: 32000
+        maxCiphertextBytes: 262144
+        maxAggregateBytes: 1048576
+        maxRequests: 100
+        maxRetainedRequests: 10000
+        maxPendingOperations: 10
+        maxLifetimeMs: 604800000
+      contextLimits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+      maxQuestionBytes: 65536
+      maxQuestionCharacters: 32000
+      maxMessageBytes: 1048576

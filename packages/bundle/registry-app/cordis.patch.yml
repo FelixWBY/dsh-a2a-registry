@@ -1,0 +1,40 @@
+# The Registry is an independent application, not an overlay on dsh-base or Web.
+- insert:
+    - id: registry-webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        host: 127.0.0.1
+        port: 3081
+        compression: gzip
+        compressionLevel: 1
+        compressionThresholdBytes: 1024
+    - id: registry-runtime
+      name: '@deepseek-ai/dsh-registry-app'
+      config:
+        printUrl: true
+        api:
+          pageSize: 50
+          maxValueBytes: 262144
+          maxCursorBytes: 4096
+          maxOperationInputBytes: 16384
+          admission:
+            directPeer:
+              capacity: 20
+              refillPerSecond: 5
+              maxEntries: 256
+            account:
+              capacity: 10
+              refillPerSecond: 2
+              maxEntries: 4096
+    - id: modules
+      name: '@deepseek-ai/dsh-client-modules'
+    - id: ui-renderer
+      name: '@deepseek-ai/dsh-client-ui-renderer'
+    - id: locale
+      name: '@deepseek-ai/dsh-client-locale'
+    - id: ui-theme
+      name: '@deepseek-ai/dsh-client-ui-theme'
+    - id: ui-registry
+      name: '@deepseek-ai/dsh-client-ui-registry'
+      config:
+        defaultTheme: dark

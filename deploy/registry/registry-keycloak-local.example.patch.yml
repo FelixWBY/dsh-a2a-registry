@@ -1,0 +1,98 @@
+# Local OIDC acceptance profile. It uses a real Keycloak authorization-code
+# flow but remains non-production because both services use loopback HTTP.
+
+- id: registry-webserver
+  config:
+    host: 127.0.0.1
+    port: 3181
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+
+- insert:
+    - id: registry-local-oidc-storage
+      name: '@deepseek-ai/dsh-storage'
+
+    - id: registry-local-oidc-storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+      config:
+        root: !!js process.env.DSH_LOCAL_REGISTRY_STORAGE
+
+    - id: registry-local-oidc-storage-domain
+      name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: json
+
+    - id: registry-local-oidc-credentials
+      name: '@deepseek-ai/dsh-credentials-local'
+      config:
+        watch: false
+
+- id: registry-runtime
+  inject: [storageDomain, credentials]
+  config:
+    printUrl: true
+    oidc:
+      mode: loopback-development
+      issuer: http://127.0.0.1:3182/realms/dsh-local
+      clientId: dsh-registry
+      clientSecretEnv: DSH_LOCAL_OIDC_CLIENT_SECRET
+      sessionSecretEnv: DSH_LOCAL_REGISTRY_SESSION_SECRET
+      publicOrigin: http://127.0.0.1:3181
+      organizationId: local-oidc-org
+      memberIdClaim: preferred_username
+      scopes: openid profile email
+      sessionTtlMs: 3600000
+      transactionTtlMs: 300000
+      maxAuthenticationAgeSeconds: 3600
+      clockToleranceSeconds: 30
+      requestTimeoutMs: 10000
+      maxCookieBytes: 8192
+      maxDirectoryBytes: 1048576
+    api:
+      pageSize: 50
+      maxValueBytes: 262144
+      maxCursorBytes: 4096
+      maxOperationInputBytes: 16384
+      admission:
+        directPeer:
+          capacity: 20
+          refillPerSecond: 5
+          maxEntries: 256
+        account:
+          capacity: 10
+          refillPerSecond: 2
+          maxEntries: 4096
+    ingest:
+      organizationId: local-oidc-org
+      limits:
+        maxInputBytes: 65536
+        maxAggregateBytes: 1048576
+        maxEvents: 100
+        maxCheckpoints: 20
+        maxDisclosures: 20
+        maxAuditEntries: 1000
+      audit:
+        failurePolicy: block-all
+        maxOperations: 5000
+        maxRecordBytes: 4096
+      directory:
+        maxMembers: 20
+        maxTeams: 10
+        maxTeamMembers: 20
+        maxNameBytes: 128
+        maxBytes: 65536
+        bootstrapOwner:
+          memberId: registry-owner
+          displayName: Registry Owner
+      bindings:
+        audience: wss://registry.local.invalid/a2a/v1/sync
+        ttlMs: 600000
+        maxRecordBytes: 8192
+        maxBindings: 20
+        maxNameBytes: 128
+
+- id: ui-registry
+  config:
+    localTestIdentityBanner: true
+    defaultTheme: dark

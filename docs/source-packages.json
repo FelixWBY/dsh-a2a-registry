@@ -1,0 +1,224 @@
+[
+  {
+    "name": "@deepseek-ai/dsh-registry-app",
+    "path": "packages/bundle/registry-app",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-app-boot",
+    "path": "packages/boot/app-boot",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-web",
+    "path": "packages/client/web",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-ui-registry",
+    "path": "packages/client/ui-registry",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-ui-renderer",
+    "path": "packages/client/ui-renderer",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-ui-theme",
+    "path": "packages/client/ui-theme",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-locale",
+    "path": "packages/client/locale",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-modules",
+    "path": "packages/client/modules",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-credentials-local",
+    "path": "packages/credentials/credentials-local",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-storage",
+    "path": "packages/storage/storage",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-storage-domain",
+    "path": "packages/storage/storage-domain",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-storage-json",
+    "path": "packages/storage/storage-json",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-storage-sqlite",
+    "path": "packages/storage/storage-sqlite",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-host-webserver",
+    "path": "packages/host/webserver",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/cordis",
+    "path": "vendor/cordis",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/schemastery",
+    "path": "vendor/schemastery",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-brand",
+    "path": "packages/util/brand",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-device-identity",
+    "path": "packages/a2a/device-identity",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-registry-ingest",
+    "path": "packages/a2a/registry-ingest",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-disclosure-crypto",
+    "path": "packages/a2a/disclosure-crypto",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-credentials",
+    "path": "packages/credentials/credentials",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-mailbox",
+    "path": "packages/a2a/mailbox",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-host-frontend-static",
+    "path": "packages/host/frontend-static",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-registry-sync",
+    "path": "packages/a2a/registry-sync",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-util-values",
+    "path": "packages/util/values",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-registry-domain",
+    "path": "packages/a2a/registry-domain",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-a2a-protocol",
+    "path": "packages/a2a/protocol",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/cordis-plugin-loader",
+    "path": "vendor/loader",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/cordis-plugin-include",
+    "path": "vendor/include",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/cordis-plugin-group",
+    "path": "vendor/group",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-home-paths",
+    "path": "packages/util/home-paths",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-launch-environment",
+    "path": "packages/util/launch-environment",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-atomic-write",
+    "path": "packages/util/atomic-write",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-store",
+    "path": "packages/client/store",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-ui-slots",
+    "path": "packages/client/ui-slots",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/dsh-client-ui-primitives",
+    "path": "packages/client/ui-primitives",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  },
+  {
+    "name": "@deepseek-ai/cosmokit",
+    "path": "vendor/cosmokit",
+    "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "license": "MIT"
+  }
+]

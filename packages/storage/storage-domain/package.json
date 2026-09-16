@@ -1,0 +1,17 @@
+{
+  "name": "@deepseek-ai/dsh-storage-domain",
+  "version": "0.1.2-rc.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./invariant": "./src/invariant.ts",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-storage": "*"
+  }
+}
