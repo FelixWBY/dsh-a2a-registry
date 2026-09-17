@@ -20,7 +20,7 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 npm start -- --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。模板中依赖的设备认证、披露操作与 KMS 提供方需要按实际部署提供，缺少它们时启动会明确失败。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证由已确认的 v5 绑定内建提供；披露操作与 KMS 提供方仍须按实际部署提供，生产模板会在缺失时失败关闭。
 
 ## 公网入口
 
@@ -40,7 +40,7 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 
 Harness 仍是单独安装的外部程序。`registry/harness-production-publication.example.patch.yml`、`registry/harness.env.example` 与 `registry/dsh-harness.service.example` 属于外部 Harness 的配置参考；其中 `/opt/deepseek-harness` 是 Harness 自身的安装路径，不是 Registry 的构建依赖。
 
-生产发布、导入和提问需具备真实设备 scope 与数据密钥；网页 OIDC 账号会话不能替代设备凭据。
+设备在发起绑定前自行生成 Ed25519 私钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。人工配对码只用于成员审核，不能当设备 token。绑定确认后，Harness 使用由组织 ID、绑定 ID 和原始 secret 组成的 `dsh1` token 发起 WSS 连接，并对每次 Registry 随机挑战签名；Registry 在每个操作前重新检查绑定、成员、scope 和密钥。生产发布、导入和提问还需具备相应设备 scope 与数据密钥；网页 OIDC 账号会话不能替代设备凭据。
 
 ## 备份与恢复
 
@@ -53,7 +53,7 @@ Harness 仍是单独安装的外部程序。`registry/harness-production-publica
 | 类别 | 必需输入 | 当前缺少时的行为 |
 | --- | --- | --- |
 | 账号、组织与身份 | 正式 OIDC issuer、client ID、client secret、允许的回调地址，以及能稳定映射到成员 ID 的不可变 claim；旧单组织迁移时还需明确旧组织 ID、初始 Owner 主体和显示名称 | 保持身份未配置；本地 Keycloak 只能用于本机验收；不会自动认领旧组织 |
-| Harness | 每台实例的稳定 instance ID、独立设备私钥与短期 token；仅授予需要的 `disclosure.sync`／`a2a.receive` scope；公网 WSS 地址与设备公钥登记 | 不能连接生产 Registry；不会退化为网页账号或共享测试密钥 |
+| Harness | 每台实例的独立设备私钥、独立设备 secret、确认后的 `dsh1` token；仅授予需要的 `disclosure.sync`／`a2a.receive` scope；公网 WSS 地址与设备公钥登记 | 不能连接生产 Registry；不会退化为人工配对码、网页账号或共享测试密钥 |
 | 密钥管理 | 选定的生产 KMS／秘密管理服务、披露数据密钥的生成、作用域授权、轮换、恢复和销毁流程 | 不发布生产披露；不从仓库或普通 `.env` 读取披露私钥 |
 | 公网部署 | 正式域名、DNS 控制权、ACME 邮箱、HTTPS 告警接收地址、异机备份位置、Linux 服务账号和 PostgreSQL 生产连接信息 | 只允许回环本地运行；不宣称已公网可用 |
 | 支付（可选） | 是否首发收费；若收费，选择 Stripe／支付宝并提供商户账号、产品/Price、Webhook 验签资料、退款/税务/发票规则 | 支付 provider 保持关闭，方案和结账接口返回未配置，不产生交易 |

@@ -1,8 +1,10 @@
 /** One private Registry ingest lifecycle shared by all explicitly configured Host consumers. */
 import type { Context, FiberState } from '@deepseek-ai/cordis'
+import type { RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import type { DisclosureId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { openRegistryIngest, RegistryIngestError, type RegistryAuditConfig, type RegistryDisclosureInvalidation,
-  type RegistryBindingConfig, type RegistryBindingInvalidation, type RegistryDirectoryConfig, type RegistryIngest, type RegistryIngestLimits } from '@deepseek-ai/dsh-a2a-registry-ingest'
+  type RegistryBindingConfig, type RegistryBindingId, type RegistryBindingInvalidation, type RegistryDirectoryConfig,
+  type RegistryIngest, type RegistryIngestLimits, type RegistryProducerAuthority } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { RegistryIngestStorageScope } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import type { RegistryOperationalAlertExporter } from './operational-alerts.ts'
@@ -120,6 +122,12 @@ export class RegistryRuntimeStore {
     })
     this.chain = result.then(() => {}, () => { /* The operation's caller receives its failure; later work rechecks admission. */ })
     return result
+  }
+
+  /** Resolve one confirmed v5 binding credential without exposing its digest or retaining the ingest handle. */
+  authenticateBindingCredential(bindingId: RegistryBindingId,
+    presentedHash: RegistryDeviceSecretHash): Promise<RegistryProducerAuthority> {
+    return this.run(store => store.authenticateBindingCredential(bindingId, presentedHash))
   }
 
   /** Reject a Host access snapshot failure through this owner's admission and optional journal.

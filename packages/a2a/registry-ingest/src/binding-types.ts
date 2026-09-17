@@ -1,7 +1,7 @@
 /** Binding candidates are not connection credentials or account authentication. */
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { RegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import type { InstanceKeyId } from '@deepseek-ai/dsh-a2a-device-identity'
+import type { InstanceKeyId, RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import type { DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 
@@ -28,6 +28,8 @@ export type RegistryBindingScope = 'disclosure.sync' | 'a2a.receive'
 /** Device-supplied enrollment intent; the owner fixes identity, destination and challenge. */
 export interface RegistryBindingRequest {
   readonly publicKeySpki: string
+  /** Device-only secret commitment; the raw secret never crosses enrollment storage or browser review. */
+  readonly deviceSecretHash: RegistryDeviceSecretHash
   readonly instanceName: string
   readonly requestedScopes: readonly RegistryBindingScope[]
 }
@@ -77,9 +79,7 @@ export type RegistryBindingState =
     readonly revokedAt: number
   }
 
-/** Owner-private durable candidate; no raw enrollment code, private key or bearer token is retained. */
-export interface RegistryBindingRecord {
-  readonly version: 4
+interface RegistryBindingRecordBase {
   readonly bindingId: RegistryBindingId
   readonly createdAt: number
   readonly challenge: RegistryChallenge
@@ -90,8 +90,21 @@ export interface RegistryBindingRecord {
   readonly state: RegistryBindingState
 }
 
+/** Legacy enrollment records remain manageable but can never authenticate a built-in device credential. */
+export interface RegistryBindingRecordV4 extends RegistryBindingRecordBase {
+  readonly version: 4
+}
+
+/** Owner-private durable candidate; no raw code, device secret, private key or bearer token is retained. */
+export interface RegistryBindingRecordV5 extends RegistryBindingRecordBase {
+  readonly version: 5
+  readonly deviceSecretHash: RegistryDeviceSecretHash
+}
+
+export type RegistryBindingRecord = RegistryBindingRecordV4 | RegistryBindingRecordV5
+
 /** Return the code once to the initiating device; persist only the record. */
 export interface RegistryBindingStart {
   readonly code: string
-  readonly record: RegistryBindingRecord
+  readonly record: RegistryBindingRecordV5
 }

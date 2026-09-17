@@ -8,6 +8,16 @@ import type { InstanceKeyHistory, InstanceKeyId, InstanceVerificationContext } f
 import type { LocalRegistryConnection, RegistryChallenge, RegistryChallengeAttempt, RegistryConnectionIdentity } from './runtime-types.ts'
 
 export type * from './runtime-types.ts'
+export {
+  REGISTRY_DEVICE_TOKEN_MAX_BYTES,
+  RegistryDeviceTokenError,
+  decodeRegistryDeviceSecretHash,
+  decodeRegistryDeviceToken,
+  encodeRegistryDeviceToken,
+  generateRegistryDeviceSecret,
+  hashRegistryDeviceSecret,
+} from './device-token.ts'
+export type { RegistryDeviceSecretHash, RegistryDeviceTokenParts } from './device-token.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -34,7 +44,7 @@ export abstract class RegistryProducerAuthenticator extends Service {
   /** @param ctx - Provider-owned lifecycle context. */
   constructor(ctx: Context) { super(ctx, 'registryProducerAuthenticator') }
   /** Validate the token and create one bounded, one-shot device challenge.
-   * @param token - Untrusted short-lived bearer token from the bounded hello frame.
+   * @param token - Untrusted opaque device credential from the bounded hello frame; possession alone is insufficient.
    * @param audience - Trusted canonical WSS destination, never selected by request headers.
    * @param signal - Consumer cancellation; failure must release all partially acquired resources.
    * @returns An attempt owning its nonce and completion; no business authority before completion. */

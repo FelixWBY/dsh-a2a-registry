@@ -27,6 +27,16 @@ import type {
 } from './types.ts'
 
 export type { InstanceKeyHistory, InstanceKeyId, InstanceKeyPair, InstancePublicKey, InstanceVerificationContext } from './types.ts'
+export {
+  REGISTRY_DEVICE_TOKEN_MAX_BYTES,
+  RegistryDeviceTokenError,
+  decodeRegistryDeviceSecretHash,
+  decodeRegistryDeviceToken,
+  encodeRegistryDeviceToken,
+  generateRegistryDeviceSecret,
+  hashRegistryDeviceSecret,
+} from './device-token.ts'
+export type { RegistryDeviceSecretHash, RegistryDeviceTokenParts } from './device-token.ts'
 
 /** Invalid key history, expired/revoked authority, or failed instance authentication. */
 export class InstanceIdentityError extends Error {

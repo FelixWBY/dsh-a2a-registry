@@ -5,7 +5,8 @@ import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { DisclosureHash, DisclosureId, DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { InstanceKeyId } from '@deepseek-ai/dsh-a2a-device-identity'
-import { decodeRegistryChallenge, decodeRegistryProof } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
+import { decodeRegistryChallenge, decodeRegistryDeviceSecretHash,
+  decodeRegistryProof } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { A2aRequestId, DisclosureSubject, MemberId, TeamId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { RegistryIngestError, type FreshRegistryDirectoryAuthority,
   type FreshRegistryMetadataAuthority, type FreshProducerAuthority,
@@ -807,11 +808,15 @@ async function bindingInput(request: IncomingMessage, action: BindingInput['acti
   config: RegistryBrowserApiConfig, signal: AbortSignal): Promise<BindingInput> {
   const value = await readJson(request, config.maxOperationInputBytes, signal)
   if (action === 'start') {
-    const record = exactRecord(value, ['publicKeySpki', 'instanceName', 'requestedScopes'])
+    const record = exactRecord(value, ['publicKeySpki', 'deviceSecretHash', 'instanceName', 'requestedScopes'])
     if (typeof record.publicKeySpki !== 'string' || record.publicKeySpki.length === 0
       || !record.publicKeySpki.isWellFormed() || !validInstanceName(record.instanceName)
       || !Array.isArray(record.requestedScopes) || record.requestedScopes.length === 0
       || record.requestedScopes.length > 2) throw new ApiFailure(400, 'invalid-input')
+    let deviceSecretHash
+    try { deviceSecretHash = decodeRegistryDeviceSecretHash(record.deviceSecretHash) } catch {
+      throw new ApiFailure(400, 'invalid-input')
+    }
     const scopes: RegistryBindingScope[] = []
     for (const candidate of record.requestedScopes as readonly unknown[]) {
       if (candidate !== 'disclosure.sync' && candidate !== 'a2a.receive') {
@@ -823,6 +828,7 @@ async function bindingInput(request: IncomingMessage, action: BindingInput['acti
     }
     return { action, value: {
       publicKeySpki: record.publicKeySpki,
+      deviceSecretHash,
       instanceName: record.instanceName,
       requestedScopes: scopes,
     } }

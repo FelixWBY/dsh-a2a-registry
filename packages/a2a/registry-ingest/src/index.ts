@@ -3,14 +3,16 @@ import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { defineDomain, domainTable, type Domain, type DomainFacility, type DomainRecordWrite } from '@deepseek-ai/dsh-storage-domain'
 import { InstanceSignatureError, verifyDisclosureCheckpoint, verifyDisclosureEvent } from '@deepseek-ai/dsh-a2a-device-identity'
-import type { InstanceKeyHistory, InstanceVerificationContext } from '@deepseek-ai/dsh-a2a-device-identity'
+import type { InstanceKeyHistory, InstanceVerificationContext,
+  RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type DisclosureCheckpoint, type DisclosureConversationId,
   type DisclosureHash, type DisclosureId, type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { canUploadDisclosure, invalidateDisclosureAuthorization, transitionDisclosureControl, updateDisclosureAccess,
   type DisclosureAccessUpdate, type DisclosureAction, type DisclosureControlState } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type { DisclosureSubject } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { decodeRegistryAudience } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import { approveBinding, confirmBinding, inspectBinding, parseBinding, rejectBinding, renameBinding, reviewBinding, revokeBinding, startBinding } from './binding.ts'
+import { approveBinding, authenticateBindingCredential as resolveBindingCredential, confirmBinding, inspectBinding,
+  parseBinding, rejectBinding, renameBinding, reviewBinding, revokeBinding, startBinding } from './binding.ts'
 import type { RegistryBindingConfig, RegistryBindingId, RegistryBindingInvalidation, RegistryBindingReceipt, RegistryBindingRecord,
   RegistryBindingRequest, RegistryBindingReview, RegistryBindingScope, RegistryBindingTicket } from './binding-types.ts'
 import { changeDirectory, directorySubject, initialDirectory, parseDirectory, validateDirectoryConfig } from './directory.ts'
@@ -274,14 +276,18 @@ export class RegistryIngest {
   startBinding(request: RegistryBindingRequest): Promise<RegistryBindingTicket> {
     const admission = this.input(request)
     if (!admission.accepted) return this.rejectInput('binding-start', null, admission.code)
-    return this.enqueue(() => this.audited('binding-start', null, async () => {
-      requireIngest(this.bindingConfig !== undefined, 'not-found')
-      requireIngest(this.domain.table('bindings').size < this.bindingConfig.maxBindings, 'limit')
-      const { code, record } = startBinding(this.organizationId, this.bindingConfig.audience,
-        admission.value, Date.now(), this.bindingConfig)
-      await this.complete({ kind: 'binding', bindingId: record.bindingId, phase: 'pending' }, undefined, undefined, record)
-      return structuredClone({ bindingId: record.bindingId, code, challenge: record.challenge })
-    }))
+    return this.enqueue(async () => {
+      const bindingConfig = this.bindingConfig
+      requireIngest(bindingConfig !== undefined, 'not-found')
+      await this.pruneOneExpiredBinding(Date.now())
+      return this.audited('binding-start', null, async () => {
+        requireIngest(this.domain.table('bindings').size < bindingConfig.maxBindings, 'limit')
+        const { code, record } = startBinding(this.organizationId, bindingConfig.audience,
+          admission.value, Date.now(), bindingConfig)
+        await this.complete({ kind: 'binding', bindingId: record.bindingId, phase: 'pending' }, undefined, undefined, record)
+        return structuredClone({ bindingId: record.bindingId, code, challenge: record.challenge })
+      })
+    })
   }
 
   /** Commit account approval using the current persisted organization membership.
@@ -951,6 +957,24 @@ export class RegistryIngest {
     return this.enqueue(async () => { await this.authenticateConnection(authority, 'a2a.receive') })
   }
 
+  /** Resolve a device-only secret commitment to current confirmed authority inside the binding owner queue.
+   * This is transport-provider input, never a browser review or reusable authorization snapshot. */
+  authenticateBindingCredential(bindingId: RegistryBindingId,
+    presentedHash: RegistryDeviceSecretHash): Promise<RegistryProducerAuthority> {
+    return this.enqueue(async () => {
+      const bindingConfig = this.bindingConfig
+      requireIngest(bindingConfig !== undefined, 'not-found')
+      const record = this.binding(bindingId)
+      requireIngest(record.challenge.organizationId === this.organizationId, 'not-found')
+      const state = record.state
+      requireIngest(state.kind === 'confirmed', 'not-found')
+      const member = this.directory().members.find(candidate => candidate.memberId === state.memberId)
+      requireIngest(member !== undefined, 'not-found')
+      return structuredClone(resolveBindingCredential(record, member, presentedHash,
+        Date.now(), bindingConfig.audience))
+    })
+  }
+
   /** Observe confirmed journal completions for trusted server diagnostics; no history is replayed.
    * @param listener - Administrative consumer receiving immutable metadata only after durable completion.
    * Returned promises are not awaited, and failures cannot reverse the operation or skip other observers.
@@ -1036,6 +1060,21 @@ export class RegistryIngest {
       try { void Promise.resolve(subscription.listener(event)).catch(reportInvalidationListenerFailure) }
       catch { reportInvalidationListenerFailure() }
     }
+  }
+
+  /** Remove at most one expired, never-confirmed attempt before admitting a replacement.
+   * Each delete is durable and serialized; failure isolates the owner before a new attempt exists. */
+  private async pruneOneExpiredBinding(now: number): Promise<void> {
+    const table = this.domain.table('bindings')
+    const expired = [...table.entries()]
+      .filter(([, record]) => record.state.kind !== 'confirmed' && record.state.kind !== 'revoked'
+        && record.challenge.expiresAt <= now)
+      .sort((left, right) => left[1].challenge.expiresAt - right[1].challenge.expiresAt
+        || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))[0]
+    if (expired === undefined) return
+    await this.durable(async () => {
+      if (!await table.delete(expired[0])) throw new Error('expired Registry binding disappeared during serialized cleanup')
+    })
   }
 
   private publishInvalidation(record: IngestRecord): void {

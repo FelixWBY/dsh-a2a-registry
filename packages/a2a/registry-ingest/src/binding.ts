@@ -1,14 +1,16 @@
 /** Enrollment candidate validation and transitions; the shared ingest owner must serialize and persist them. */
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { decodeInstanceKeyHistory, type InstanceKeyHistory, type InstanceKeyId } from '@deepseek-ai/dsh-a2a-device-identity'
+import { decodeInstanceKeyHistory, decodeRegistryDeviceSecretHash,
+  type InstanceKeyHistory, type InstanceKeyId, type RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeRegistryAudience, decodeRegistryChallenge, verifyRegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { DisclosureSubject, MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type { RegistryDirectoryMember } from './directory-types.ts'
 import type { RegistryBindingId, RegistryBindingLimits, RegistryBindingRecord, RegistryBindingRequest,
-  RegistryBindingReview, RegistryBindingStart } from './binding-types.ts'
+  RegistryBindingReview, RegistryBindingStart, RegistryBindingRecordV5 } from './binding-types.ts'
+import type { RegistryProducerAuthority } from './types.ts'
 import { byteLength, RegistryIngestError, requireIngest } from './record.ts'
 
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -16,23 +18,37 @@ const memberId = z.string().max(128).regex(/^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za
   .transform(value => brandString<MemberId>(value))
 const intent = { instanceName: z.string(), requestedScopes: z.array(z.enum(['disclosure.sync', 'a2a.receive']))
   .min(1).max(2).refine(value => new Set(value).size === value.length).readonly() }
-const requestSchema = z.strictObject({ publicKeySpki: z.string(), ...intent })
-const schema = z.strictObject({ version: z.literal(4), bindingId: z.uuid().transform(value => brandString<RegistryBindingId>(value)),
-  ...intent,
-  createdAt: integer, challenge: z.unknown().transform(decodeRegistryChallenge), publicKeySpki: z.string(),
-  codeHash: z.string().regex(/^[0-9a-f]{64}$/u), state: z.discriminatedUnion('kind', [
+const deviceSecretHash = z.string().regex(/^sha256:[0-9a-f]{64}$/u).transform(decodeRegistryDeviceSecretHash)
+const requestSchema = z.strictObject({ publicKeySpki: z.string(), deviceSecretHash, ...intent })
+const state = z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('pending') }),
     z.strictObject({ kind: z.literal('approved'), memberId, approvedAt: integer }),
     z.strictObject({ kind: z.literal('confirmed'), memberId, approvedAt: integer, confirmedAt: integer }),
     z.strictObject({ kind: z.literal('rejected'), memberId, rejectedAt: integer }),
     z.strictObject({ kind: z.literal('revoked'), memberId, approvedAt: integer, confirmedAt: integer, revokedAt: integer }),
-  ]).readonly(),
-}).readonly()
+  ]).readonly()
+const recordFields = {
+  bindingId: z.uuid().transform(value => brandString<RegistryBindingId>(value)), ...intent,
+  createdAt: integer, challenge: z.unknown().transform(decodeRegistryChallenge), publicKeySpki: z.string(),
+  codeHash: z.string().regex(/^[0-9a-f]{64}$/u), state,
+}
+const schema = z.discriminatedUnion('version', [
+  z.strictObject({ version: z.literal(4), ...recordFields }).readonly(),
+  z.strictObject({ version: z.literal(5), ...recordFields, deviceSecretHash }).readonly(),
+])
 
 function history(record: RegistryBindingRecord): InstanceKeyHistory {
   const { organizationId, instanceId, keyId } = record.challenge
   return decodeInstanceKeyHistory({ organizationId, instanceId, status: 'active', keys: [{ keyId,
     publicKeySpki: record.publicKeySpki, validFrom: record.createdAt, validUntil: null, revokedAt: null }] })
+}
+
+function credentialHistory(record: RegistryBindingRecordV5 & {
+  readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
+}): InstanceKeyHistory {
+  const { organizationId, instanceId, keyId } = record.challenge
+  return decodeInstanceKeyHistory({ organizationId, instanceId, status: 'active', keys: [{ keyId,
+    publicKeySpki: record.publicKeySpki, validFrom: record.state.confirmedAt, validUntil: null, revokedAt: null }] })
 }
 
 function codeHash(code: string): string {
@@ -100,10 +116,10 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
   let parsedRequest: RegistryBindingRequest
   try { parsedRequest = requestSchema.parse(request) } catch { throw new RegistryIngestError('invalid-input') }
   name(parsedRequest.instanceName, limits)
-  const { publicKeySpki, instanceName, requestedScopes } = parsedRequest
+  const { publicKeySpki, deviceSecretHash: secretHash, instanceName, requestedScopes } = parsedRequest
   const code = randomBytes(32).toString('base64url')
-  const record: RegistryBindingRecord = { version: 4, bindingId: brandString<RegistryBindingId>(randomUUID()), createdAt: now,
-    instanceName, requestedScopes,
+  const record: RegistryBindingRecordV5 = { version: 5, bindingId: brandString<RegistryBindingId>(randomUUID()), createdAt: now,
+    instanceName, requestedScopes, deviceSecretHash: secretHash,
     challenge: { version: 1, audience: decodeRegistryAudience(audience), organizationId,
       instanceId: brandString<DshInstanceId>(randomUUID()),
       keyId: brandString<InstanceKeyId>(`sha256:${createHash('sha256').update(Buffer.from(publicKeySpki, 'base64url')).digest('hex')}`),
@@ -111,6 +127,7 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
     publicKeySpki, codeHash: codeHash(code), state: { kind: 'pending' } }
   try {
     const parsed = parseBinding(record, limits)
+    requireIngest(parsed.version === 5, 'invalid-input')
     const reserved = parseBinding({ ...parsed, state: { kind: 'revoked', memberId: 'x'.repeat(128),
       approvedAt: parsed.challenge.expiresAt - 1, confirmedAt: parsed.challenge.expiresAt - 1,
       revokedAt: Number.MAX_SAFE_INTEGER } }, limits)
@@ -119,6 +136,28 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
   } catch {
     throw new RegistryIngestError('invalid-input')
   }
+}
+
+/** Resolve one confirmed v5 binding into current device authority without exposing its stored digest.
+ * The serialized owner supplies the current approving member and configured audience. */
+export function authenticateBindingCredential(record: RegistryBindingRecord, member: RegistryDirectoryMember,
+  presentedHash: RegistryDeviceSecretHash, now: number, audience: string): RegistryProducerAuthority {
+  requireIngest(record.version === 5 && record.state.kind === 'confirmed'
+    && member.memberId === record.state.memberId && member.state === 'active'
+    && Number.isSafeInteger(now) && now >= record.state.confirmedAt
+    && record.challenge.audience === audience, 'not-found')
+  let selectedHash: RegistryDeviceSecretHash
+  try { selectedHash = decodeRegistryDeviceSecretHash(presentedHash) } catch { throw new RegistryIngestError('not-found') }
+  const retained = Buffer.from(record.deviceSecretHash.slice('sha256:'.length), 'hex')
+  const presented = Buffer.from(selectedHash.slice('sha256:'.length), 'hex')
+  requireIngest(retained.length === 32 && presented.length === 32 && timingSafeEqual(retained, presented), 'not-found')
+  const currentHistory = credentialHistory(record as RegistryBindingRecordV5 & {
+    readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
+  })
+  const { organizationId, instanceId, keyId } = record.challenge
+  requireIngest(currentHistory.organizationId === organizationId && currentHistory.instanceId === instanceId
+    && currentHistory.keys.length === 1 && currentHistory.keys[0]?.keyId === keyId, 'not-found')
+  return { connection: { organizationId, instanceId, keyId, now }, history: currentHistory }
 }
 
 /** Approve the candidate for the currently authenticated member; no device possession is inferred.

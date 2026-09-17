@@ -23,6 +23,7 @@ import { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema,
 import { PostgresRegistryTenancy, type PostgresRegistryTenancyConfig } from './tenancy-postgres.ts'
 import { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 import { installRegistrySync } from './sync.ts'
+import { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
@@ -45,6 +46,9 @@ export { PostgresRegistryTenancy } from './tenancy-postgres.ts'
 export type { PostgresRegistryTenancyConfig, PostgresRegistryTenancySchemaMode } from './tenancy-postgres.ts'
 export { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 export type { RegistryTenantRuntimeLease, RegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
+export { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
+export type { RegistryBindingProducerAuthenticatorConfig,
+  RegistryBindingProducerRuntimeResolver } from './binding-producer-auth.ts'
 export type { RegistryAuthorizedPrefixSnapshot, RegistryDisclosureReader,
   RegistryReceiveBindingRequirement } from './reader.ts'
 export type { FreshRegistryAuditAuthority, RegistryAuditActorKind, RegistryAuditListOptions,
@@ -110,7 +114,7 @@ export interface Config {
   saas?: RegistrySaasConfig
   /** Optional dedicated same-host SQLite owner shared by browser and producer-sync admission. */
   sharedAdmission?: RegistrySharedAdmissionConfig
-  /** Requires storageDomain; sync additionally requires registryProducerAuthenticator. Both remain opt-in. */
+  /** Requires storageDomain; SaaS binding sync is built in, while standalone sync requires an injected authenticator. */
   ingest?: RegistryIngestRuntimeConfig
   /** Requires storageDomain and opens only a Registry-side mailbox cleanup owner. */
   mailboxMaintenance?: RegistryMailboxMaintenanceConfig
@@ -211,8 +215,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   if (config.ingest !== undefined) {
-    const syncProvider = ctx.get('registryProducerAuthenticator')
-    if (config.ingest.sync !== undefined && syncProvider === undefined) {
+    const configuredSyncProvider = ctx.get('registryProducerAuthenticator')
+    const builtInSyncProvider = config.saas !== undefined && config.ingest.sync !== undefined
+      && config.ingest.bindings !== undefined
+    if (builtInSyncProvider && configuredSyncProvider !== undefined) {
+      throw new Error('Registry SaaS binding authentication cannot replace another producer authenticator')
+    }
+    if (config.ingest.sync !== undefined && !builtInSyncProvider && configuredSyncProvider === undefined) {
       throw new Error('Registry sync requires registry-runtime inject: [storageDomain, registryProducerAuthenticator]')
     }
     if (config.ingest.sync !== undefined && ctx.webServer.host !== '127.0.0.1') {
@@ -242,36 +251,60 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       })
       const syncAbort = new AbortController()
       let router: DefaultRegistryTenantRuntimeRouter | undefined
-      let withdraw: (() => void) | undefined
+      let withdrawRouter: (() => void) | undefined
+      let authenticator: RegistryBindingProducerAuthenticator | undefined
+      let withdrawAuthenticator: (() => void) | undefined
       let stopSync: (() => Promise<void>) | undefined
       try {
         await tenancy.ensureLegacyOrganization({ organizationId: config.ingest.organizationId,
           displayName: config.saas.legacyOrganizationName })
         router = new DefaultRegistryTenantRuntimeRouter(ctx, tenancy, structuredClone(config.ingest),
           config.ingest.organizationId, config.saas.maxActiveOrganizations)
-        withdraw = ctx.provide('registryTenantRouter', router)
+        const activeRouter = router
+        withdrawRouter = ctx.provide('registryTenantRouter', activeRouter)
+        const resolveRuntime = async (organizationId: Parameters<typeof activeRouter.acquireRuntime>[0]) => {
+          const lease = await activeRouter.acquireRuntime(organizationId)
+          return { store: lease.runtime.store, release: lease.release }
+        }
+        let syncProvider = configuredSyncProvider
+        if (builtInSyncProvider) {
+          const providerContext = ctx.isolate('registryProducerAuthenticator')
+          authenticator = new RegistryBindingProducerAuthenticator(providerContext, {
+            audience: config.ingest.sync!.audience,
+            handshakeTimeoutMs: config.ingest.sync!.handshakeTimeoutMs,
+            maxFrameBytes: config.ingest.sync!.maxFrameBytes,
+          }, resolveRuntime)
+          withdrawAuthenticator = ctx.provide('registryProducerAuthenticator', authenticator)
+          syncProvider = authenticator
+        }
         stopSync = config.ingest.sync === undefined ? undefined : installRegistrySync(ctx,
-          config.ingest.sync, syncProvider!,
-          async (organizationId) => {
-            const lease = await router!.acquireRuntime(organizationId)
-            return { store: lease.runtime.store, release: lease.release }
-          }, syncAbort.signal)
-        const ownedRouter = router
-        const ownedWithdraw = withdraw
+          config.ingest.sync, syncProvider!, resolveRuntime, syncAbort.signal)
+        const ownedRouter = activeRouter
+        const ownedWithdrawRouter = withdrawRouter
+        const ownedAuthenticator = authenticator
+        const ownedWithdrawAuthenticator = withdrawAuthenticator
         const ownedStopSync = stopSync
         ctx.effect(() => async () => {
           syncAbort.abort()
-          const syncOutcome = await Promise.allSettled([ownedStopSync?.()])
-          const outcomes = await Promise.allSettled([Promise.resolve().then(ownedWithdraw), ownedRouter.close()])
-          outcomes.push(...syncOutcome)
+          const outcomes = []
+          outcomes.push(...await Promise.allSettled([ownedStopSync?.()]))
+          outcomes.push(...await Promise.allSettled([
+            ownedWithdrawAuthenticator === undefined
+              ? undefined : Promise.resolve().then(ownedWithdrawAuthenticator),
+          ]))
+          outcomes.push(...await Promise.allSettled([ownedAuthenticator?.close()]))
+          outcomes.push(...await Promise.allSettled([Promise.resolve().then(ownedWithdrawRouter)]))
+          outcomes.push(...await Promise.allSettled([ownedRouter.close()]))
           if (outcomes.some(outcome => outcome.status === 'rejected')) ctx.logger.error('Registry SaaS cleanup failed')
         }, 'registry-app: SaaS tenant router lifetime')
       } catch (error) {
         syncAbort.abort()
         await Promise.allSettled([stopSync?.()])
-        await Promise.allSettled([
-          withdraw === undefined ? undefined : Promise.resolve().then(withdraw), router?.close() ?? tenancy.close(),
-        ])
+        await Promise.allSettled([withdrawAuthenticator === undefined
+          ? undefined : Promise.resolve().then(withdrawAuthenticator)])
+        await Promise.allSettled([authenticator?.close()])
+        await Promise.allSettled([withdrawRouter === undefined ? undefined : Promise.resolve().then(withdrawRouter)])
+        await Promise.allSettled([router?.close() ?? tenancy.close()])
         throw error
       }
     }
