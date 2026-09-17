@@ -15,8 +15,10 @@ import {
   generateRegistryDeviceSecret,
   hashRegistryDeviceSecret,
   signDisclosureCheckpoint,
+  signDisclosureEvent,
 } from '@deepseek-ai/dsh-a2a-device-identity'
 import { signRegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
+import { computeDisclosureCiphertextHash } from '@deepseek-ai/dsh-a2a-protocol'
 import {
   REGISTRY_SYNC_PATH,
   decodeRegistryServerFrame,
@@ -166,7 +168,7 @@ function accountAuthority(organizationId, memberId) {
   return () => ({ subject: { authenticated: true, organizationId, memberId }, now: Date.now() })
 }
 
-async function authenticate(url, token, keyPair, expectedIdentity) {
+async function openAuthenticatedSocket(url, token, keyPair, expectedIdentity) {
   const socket = new WebSocket(url)
   socket.on('error', () => {})
   await waitForOpen(socket)
@@ -188,8 +190,10 @@ async function authenticate(url, token, keyPair, expectedIdentity) {
     const heartbeat = await exchange(socket, 3, { type: 'heartbeat' })
     assert.equal(heartbeat.type, 'heartbeat-ack')
     assert.ok(Number.isSafeInteger(heartbeat.observedAt) && heartbeat.observedAt >= 0)
-  } finally {
+    return socket
+  } catch (error) {
     await closeSocket(socket)
+    throw error
   }
 }
 
@@ -257,8 +261,123 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       instanceId: ticket.challenge.instanceId,
       keyId: keyPair.keyId,
     }
-    await authenticate(url, token, keyPair, expectedIdentity)
-    await authenticate(url, token, keyPair, expectedIdentity)
+
+    const disclosureId = 'tenant-a-disclosure'
+    const conversationId = 'tenant-a-conversation'
+    const sourceCursor = 17
+    const expiresAt = Date.now() + 60_000
+    const ciphertext = Buffer.from('tenant-a-event-ciphertext', 'utf8').toString('base64url')
+    const event = signDisclosureEvent({
+      protocolVersion: 1,
+      organizationId: organizationA,
+      instanceId: ticket.challenge.instanceId,
+      conversationId,
+      disclosureId,
+      eventId: 'tenant-a-event-1',
+      disclosureSeq: 0,
+      sourceCursor,
+      eventType: 'conversation.user-message',
+      policyVersion: 1,
+      occurredAt: confirmed.state.confirmedAt,
+      previousEventHash: null,
+      ciphertext,
+      ciphertextHash: computeDisclosureCiphertextHash(ciphertext),
+    }, keyPair.privateKey)
+    const checkpoint = signDisclosureCheckpoint({
+      protocolVersion: 1,
+      organizationId: organizationA,
+      instanceId: ticket.challenge.instanceId,
+      disclosureId,
+      policyVersion: 1,
+      sourceCursor,
+      eventCount: 1,
+      lastDisclosureSeq: 0,
+      lastEventHash: event.eventHash,
+    }, keyPair.privateKey)
+
+    const producerSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    let publishedReceipt
+    try {
+      const registered = await exchange(producerSocket, 4, {
+        type: 'producer-register',
+        disclosureId,
+        registration: {
+          conversationId,
+          policyVersion: 1,
+          targets: [{ kind: 'member', memberId: memberA }],
+          expiresAt,
+        },
+      })
+      assert.equal(registered.type, 'producer-register-ack')
+      assert.equal(registered.status.kind, 'live')
+      assert.deepEqual(registered.status.receipt, {
+        disclosureId,
+        lastDisclosureSeq: -1,
+        lastEventHash: null,
+        checkpointHash: null,
+        authorizationVersion: 0,
+        control: 'active',
+        ingest: 'pending',
+      })
+
+      const acceptedEvent = await exchange(producerSocket, 5,
+        { type: 'event', disclosureId, envelope: event })
+      assert.equal(acceptedEvent.type, 'event-ack')
+      assert.deepEqual(acceptedEvent.receipt, {
+        disclosureId,
+        lastDisclosureSeq: 0,
+        lastEventHash: event.eventHash,
+        checkpointHash: null,
+        authorizationVersion: 0,
+        control: 'active',
+        ingest: 'pending',
+      })
+
+      const acceptedCheckpoint = await exchange(producerSocket, 6,
+        { type: 'checkpoint', disclosureId, checkpoint })
+      assert.equal(acceptedCheckpoint.type, 'checkpoint-ack')
+      publishedReceipt = acceptedCheckpoint.receipt
+      assert.deepEqual(publishedReceipt, {
+        disclosureId,
+        lastDisclosureSeq: 0,
+        lastEventHash: event.eventHash,
+        checkpointHash: checkpoint.checkpointHash,
+        authorizationVersion: 0,
+        control: 'active',
+        ingest: 'ready',
+        acceptedCheckpointHash: checkpoint.checkpointHash,
+      })
+    } finally {
+      await closeSocket(producerSocket)
+    }
+
+    const resumedSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    try {
+      const resumed = await exchange(resumedSocket, 4, { type: 'status', disclosureId })
+      assert.equal(resumed.type, 'status')
+      assert.equal(resumed.status.kind, 'live')
+      assert.deepEqual(resumed.status.receipt, {
+        disclosureId,
+        lastDisclosureSeq: 0,
+        lastEventHash: event.eventHash,
+        checkpointHash: checkpoint.checkpointHash,
+        authorizationVersion: 0,
+        control: 'active',
+        ingest: 'ready',
+      })
+
+      const replayedEvent = await exchange(resumedSocket, 5,
+        { type: 'event', disclosureId, envelope: event })
+      assert.equal(replayedEvent.type, 'event-ack')
+      assert.deepEqual(replayedEvent.receipt, resumed.status.receipt)
+
+      const replayedCheckpoint = await exchange(resumedSocket, 6,
+        { type: 'checkpoint', disclosureId, checkpoint })
+      assert.equal(replayedCheckpoint.type, 'checkpoint-ack')
+      assert.deepEqual(replayedCheckpoint.receipt, publishedReceipt)
+    } finally {
+      await closeSocket(resumedSocket)
+    }
 
     const wrongTenantToken = encodeRegistryDeviceToken({
       organizationId: organizationB,
@@ -276,8 +395,6 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       await closeSocket(socket)
     }
 
-    const now = Date.now()
-    const disclosureId = 'tenant-a-disclosure'
     const history = {
       organizationId: organizationA,
       instanceId: ticket.challenge.instanceId,
@@ -290,49 +407,6 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         revokedAt: null,
       }],
     }
-    const producerAuthority = () => ({
-      connection: {
-        organizationId: organizationA,
-        instanceId: ticket.challenge.instanceId,
-        keyId: keyPair.keyId,
-        now: Date.now(),
-      },
-      history,
-    })
-    await runtimeA.control.register(producerAuthority, {
-      conversationId: 'tenant-a-conversation',
-      policyVersion: 1,
-      access: {
-        organizationId: organizationA,
-        instanceId: ticket.challenge.instanceId,
-        disclosureId,
-        control: 'active',
-        producer: 'idle',
-        ingest: 'pending',
-        expiresAt: now + 60_000,
-        authorizationVersion: 0,
-        capabilities: ['conversation.read'],
-        checkpointHash: null,
-        grants: [{
-          target: { kind: 'member', memberId: memberA },
-          state: 'active',
-          capabilities: ['conversation.read'],
-          expiresAt: now + 60_000,
-        }],
-      },
-    })
-    const checkpoint = signDisclosureCheckpoint({
-      protocolVersion: 1,
-      organizationId: organizationA,
-      instanceId: ticket.challenge.instanceId,
-      disclosureId,
-      policyVersion: 1,
-      sourceCursor: 0,
-      eventCount: 0,
-      lastDisclosureSeq: -1,
-      lastEventHash: null,
-    }, keyPair.privateKey)
-    await runtimeA.store.run(ingest => ingest.ingestCheckpoint(producerAuthority, disclosureId, checkpoint))
 
     let externalHistoryCalls = 0
     const readerAuthority = () => ({
@@ -359,7 +433,8 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     const prefix = await runtimeA.reader.readPrefix(readerAuthority, disclosureId,
       ticket.challenge.instanceId, 'read', checkpoint.checkpointHash)
     assert.equal(prefix.checkpoint.checkpointHash, checkpoint.checkpointHash)
-    assert.deepEqual(prefix.events, [])
+    assert.equal(prefix.checkpoint.sourceCursor, sourceCursor)
+    assert.deepEqual(prefix.events, [event])
     assert.equal(externalHistoryCalls, 0)
     await assert.rejects(runtimeA.reader.readPrefix(readerAuthority, disclosureId,
       'different-source-instance', 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
