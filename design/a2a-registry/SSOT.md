@@ -77,9 +77,8 @@
 
 | 优先级 | P | 剩余工作 | 完成标准 |
 | --- | --- | --- | --- |
-| P0 | P-DB | Docker Linux 引擎和 PostgreSQL 18 已在本机启动，数据库只监听 `127.0.0.1`；应用账号、后端重启持久化、`pg_dump`、隔离恢复及 SQLite→PostgreSQL 空目标迁移演练均已通过。当前没有历史 SQLite 数据源；待正式身份和 Harness provider 就绪后执行一次真实 Registry 业务切换并保留切换前介质。 | 注册站以正式配置从 PostgreSQL 重启恢复同一成员、节点、披露和请求；容器重建不丢数据；原介质和异机备份可用于恢复。 |
 | P0 | P-ID | 选择正式 IdP，建立公网 OIDC 应用、回调地址和稳定成员 claim；确定成员预配、停用和初始 Owner 流程。 | 正式域名登录／退出成功；成员映射唯一；停用后下一请求失效；本地 Keycloak 和测试身份不进入生产。 |
-| P0 | P-HARNESS | 给真实 DeepSeek Harness 签发独立设备身份，配置 `disclosure.sync`／`a2a.receive` 最小 scope、Registry WSS、公钥登记和可靠进程托管。 | 真实 Harness 完成绑定、发布、导入、文本提问、离线排队、重连恢复和幂等重试全流程。 |
+| P0 | P-HARNESS | 本机真实 Harness 已与独立 Registry + PostgreSQL 完成设备认证、披露发布、正文读取、幂等导入、文本请求投递、离线排队和重连恢复；剩余工作是签发生产设备身份，配置 `disclosure.sync`／`a2a.receive` 最小 scope、公网 WSS、公钥登记和可靠进程托管。 | 生产 Harness 使用非测试身份重复完成同一流程；重启后实例身份、请求和回复不变；不开放远程工具执行。 |
 | P0 | P-KMS | 选择生产密钥管理方案，提供披露数据密钥的生成、按作用域分发、轮换、恢复与销毁。 | Registry/Harness 不依赖仓库或普通 `.env` 中的明文私钥；失败或不确定时不推进披露。 |
 | P0 | P-PUBLIC | 准备域名、DNS、受信任证书、Caddy、systemd、告警接收端和异机备份位置，执行公网探针与恢复演练。 | 仅 443 对外；HTTP→HTTPS；WSS 可重连；秘密权限正确；告警可达；隔离恢复与业务语义比对通过。 |
 | P0 | P-PAY | 若首发需要收费，选择 Stripe／支付宝商户并实现 `RegistryBillingProvider` 适配器、订单表、验签 Webhook、防重放、退款／争议状态和审计。当前仅有默认关闭的安全接口边界。 | 客户端不能改金额；同一幂等键只有一个结账；只有验签 Webhook 能标记付款；未配置时接口保持关闭；不提交任何商户私钥。 |
