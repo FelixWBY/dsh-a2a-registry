@@ -210,6 +210,7 @@ export function MembersPage({ t, readDirectory, changeDirectory, listInvitations
                   <td data-label={t('directoryMemberState')}><span className={status === 'pending' ? css.invitationPending : css.invitationClosed}>{t(INVITATION_STATUS_KEYS[status])}</span></td>
                   <td data-label={t('expiry')}><time dateTime={new Date(invitation.expiresAt).toISOString()}>{new Date(invitation.expiresAt).toLocaleString()}</time></td>
                   <td data-label={t('actions')}><div className={css.directoryRowActions}>{status === 'pending'
+                    && !(state.directory.actorRole === 'admin' && invitation.role === 'admin')
                     ? <button type="button" disabled={revokingInvitationId !== null} onClick={() => { revoke(invitation.invitationId) }}>{t(revokingInvitationId === invitation.invitationId ? 'invitationRevoking' : 'invitationRevoke')}</button>
                     : '—'}</div></td>
                 </tr>
