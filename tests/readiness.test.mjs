@@ -66,7 +66,8 @@ test('PostgreSQL tenancy readiness requires both authoritative schema markers', 
   const store = Object.create(PostgresRegistryTenancy.prototype)
   store.closed = false
   store.schema = '"registry"'
-  let rows = [{ storage_version: 2, tenancy_version: 2 }]
+  store.policyFingerprint = '0'.repeat(64)
+  let rows = [{ storage_version: 2, tenancy_version: 3, policy_fingerprint: '0'.repeat(64) }]
   let queries = 0
   store.pool = { query: async (query) => {
     queries += 1
@@ -77,13 +78,15 @@ test('PostgreSQL tenancy readiness requires both authoritative schema markers', 
   } }
 
   assert.equal(await store.checkReadiness(), true)
-  rows = [{ storage_version: 1, tenancy_version: 2 }]
+  rows = [{ storage_version: 1, tenancy_version: 3, policy_fingerprint: '0'.repeat(64) }]
+  assert.equal(await store.checkReadiness(), false)
+  rows = [{ storage_version: 2, tenancy_version: 3, policy_fingerprint: '1'.repeat(64) }]
   assert.equal(await store.checkReadiness(), false)
   store.pool.query = async () => { throw new Error('database unavailable') }
   assert.equal(await store.checkReadiness(), false)
   store.closed = true
   assert.equal(await store.checkReadiness(), false)
-  assert.equal(queries, 2)
+  assert.equal(queries, 3)
 })
 
 test('SaaS domain readiness probes the selected PostgreSQL storage pool', async () => {

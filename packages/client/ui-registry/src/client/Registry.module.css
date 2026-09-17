@@ -1244,6 +1244,86 @@
   font-size: 12px;
   line-height: 18px;
 }
+.billing {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.billingHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+.billingHeading h2, .billingOrdersHeading h3 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 24px;
+}
+.billingHeading p, .billingOrdersHeading p, .billingPlan p, .billingNotice p, .billingEmpty {
+  margin: 6px 0 0;
+  color: var(--dsw-alias-label-secondary);
+}
+.billingNotice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+.billingNotice > svg {
+  flex: none;
+  color: var(--dsw-alias-button-info-fill);
+}
+.billingPlans {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.billingPlan {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+.billingPlan h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 22px;
+}
+.billingPlan p strong {
+  color: var(--dsw-alias-label-primary);
+  font-size: 18px;
+}
+.billingOrdersHeading {
+  margin: 28px 0 14px;
+}
+.billingError {
+  margin: 12px 0 0;
+  color: var(--dsw-alias-label-danger, #d44333);
+}
+.billingState {
+  display: inline-flex;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+.billingState[data-state='paid'] {
+  color: var(--dsw-alias-label-success, #16855b);
+}
+.billingState[data-state='failed'], .billingState[data-state='disputed'] {
+  color: var(--dsw-alias-label-danger, #d44333);
+}
 .preference {
   margin-top: 32px;
 }
@@ -1369,6 +1449,13 @@
   }
 }
 @media (max-width: 720px) {
+  .billingHeading, .billingPlan {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .billingPlans {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .sidebar {
     display: none;
   }

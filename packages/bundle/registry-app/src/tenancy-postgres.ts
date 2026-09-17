@@ -4,6 +4,15 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { Pool, type PoolClient } from 'pg'
+import type {
+  RegistryBillingCheckoutAttachment,
+  RegistryBillingEvent,
+  RegistryBillingEventType,
+  RegistryBillingOrder,
+  RegistryBillingOrderReservation,
+  RegistryBillingOrderState,
+  RegistryBillingProviderName,
+} from './billing.ts'
 import {
   RegistryTenancyError,
   type RegistryAccount,
@@ -26,7 +35,7 @@ import {
 } from './tenancy.ts'
 import { STORAGE_POSTGRES_SCHEMA_VERSION } from '@deepseek-ai/dsh-storage-postgres'
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const READINESS_QUERY_TIMEOUT_MS = 1_500
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
@@ -39,6 +48,9 @@ const DEFAULT_INVITATION_TTL_SECONDS = 3 * 24 * 60 * 60
 const MIN_INVITATION_TTL_SECONDS = 5 * 60
 const MAX_INVITATION_TTL_SECONDS = 7 * 24 * 60 * 60
 const MAX_PENDING_INVITATIONS = 100
+const MAX_BILLING_ORDERS = 100
+const SHA256 = /^[0-9a-f]{64}$/u
+const CURRENCY = /^[A-Z]{3}$/u
 const TENANCY_TABLES = [
   'tenancy_meta',
   'accounts',
@@ -47,18 +59,22 @@ const TENANCY_TABLES = [
   'organization_memberships',
   'organization_creations',
   'organization_invitations',
+  'billing_orders',
+  'billing_provider_events',
 ] as const
 const REGISTRY_META_TABLES = ['storage_meta', 'tenancy_meta'] as const
 const REGISTRY_BUSINESS_TABLES = [
   'units', 'unit_globals', 'unit_records',
   'accounts', 'account_identities', 'organizations', 'organization_memberships',
-  'organization_creations', 'organization_invitations',
+  'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events',
 ] as const
 const TENANT_SCOPED_TABLES = [
   'organizations',
   'organization_memberships',
   'organization_creations',
   'organization_invitations',
+  'billing_orders',
+  'billing_provider_events',
 ] as const
 const TENANCY_POLICIES = [
   { table: 'organizations', name: 'organizations_select', command: 'r', using: true, check: false },
@@ -80,6 +96,13 @@ const TENANCY_POLICIES = [
     using: false, check: true },
   { table: 'organization_invitations', name: 'organization_invitations_update', command: 'w',
     using: true, check: true },
+  { table: 'billing_orders', name: 'billing_orders_select', command: 'r', using: true, check: false },
+  { table: 'billing_orders', name: 'billing_orders_insert', command: 'a', using: false, check: true },
+  { table: 'billing_orders', name: 'billing_orders_update', command: 'w', using: true, check: true },
+  { table: 'billing_provider_events', name: 'billing_provider_events_select', command: 'r',
+    using: true, check: false },
+  { table: 'billing_provider_events', name: 'billing_provider_events_insert', command: 'a',
+    using: false, check: true },
 ] as const
 
 export type PostgresRegistryTenancySchemaMode = 'migrate' | 'validate'
@@ -158,6 +181,35 @@ interface InvitationRow {
   readonly created_by_member_id: string
   readonly claimed_by_account_id: string | null
   readonly claimed_by_member_id?: string | null
+}
+
+interface BillingOrderRow {
+  readonly order_id: string
+  readonly organization_id: string
+  readonly provider: RegistryBillingProviderName
+  readonly plan_id: string
+  readonly currency: string
+  readonly unit_amount: string
+  readonly interval: RegistryBillingOrder['interval']
+  readonly state: RegistryBillingOrderState
+  readonly provider_checkout_id: string | null
+  readonly checkout_expires_at: Date | null
+  readonly paid_at: Date | null
+  readonly refunded_at: Date | null
+  readonly disputed_at: Date | null
+  readonly last_event_at: Date | null
+  readonly created_at: Date
+  readonly updated_at: Date
+}
+
+interface BillingEventRow {
+  readonly organization_id: string
+  readonly order_id: string
+  readonly provider: RegistryBillingProviderName
+  readonly event_id: string
+  readonly event_type: RegistryBillingEventType
+  readonly payload_hash: string
+  readonly occurred_at: Date
 }
 
 interface TenancyTableRow {
@@ -319,6 +371,67 @@ function invitationPreviewOf(row: InvitationRow): RegistryInvitationPreview {
   }
 }
 
+function billingRequestHash(input: RegistryBillingOrderReservation): string {
+  return createHash('sha256').update('registry-billing-order-v1\0', 'utf8').update(JSON.stringify([
+    input.provider, input.planId, input.currency, input.unitAmount, input.interval,
+  ]), 'utf8').digest('hex')
+}
+
+function billingOrderOf(row: BillingOrderRow): RegistryBillingOrder {
+  if (!UUID.test(row.order_id)) throw new RegistryTenancyError('unavailable')
+  const unitAmount = Number(row.unit_amount)
+  if (!Number.isSafeInteger(unitAmount) || unitAmount < 0) throw new RegistryTenancyError('unavailable')
+  return {
+    orderId: row.order_id,
+    organizationId: organizationId(row.organization_id),
+    provider: row.provider,
+    planId: row.plan_id,
+    currency: row.currency,
+    unitAmount,
+    interval: row.interval,
+    state: row.state,
+    providerCheckoutId: row.provider_checkout_id,
+    checkoutExpiresAt: row.checkout_expires_at === null ? null : milliseconds(row.checkout_expires_at),
+    paidAt: row.paid_at === null ? null : milliseconds(row.paid_at),
+    refundedAt: row.refunded_at === null ? null : milliseconds(row.refunded_at),
+    disputedAt: row.disputed_at === null ? null : milliseconds(row.disputed_at),
+    lastEventAt: row.last_event_at === null ? null : milliseconds(row.last_event_at),
+    createdAt: milliseconds(row.created_at),
+    updatedAt: milliseconds(row.updated_at),
+  }
+}
+
+function billingEventState(eventType: RegistryBillingEventType): RegistryBillingOrderState {
+  if (eventType === 'checkout-paid') return 'paid'
+  if (eventType === 'checkout-expired') return 'expired'
+  if (eventType === 'checkout-failed') return 'failed'
+  if (eventType === 'refunded') return 'refunded'
+  if (eventType === 'disputed') return 'disputed'
+  throw new RegistryTenancyError('invalid-input')
+}
+
+function sameBillingEvent(row: BillingEventRow, input: RegistryBillingEvent,
+  selectedOrganizationId: OrganizationId): boolean {
+  return row.organization_id === selectedOrganizationId && row.order_id === input.orderId
+    && row.provider === input.provider && row.event_type === input.eventType
+    && row.payload_hash === input.payloadHash && milliseconds(row.occurred_at) === input.occurredAt
+}
+
+const BILLING_STATE_PRIORITY: Readonly<Record<RegistryBillingOrderState, number>> = {
+  creating: 0,
+  'checkout-pending': 1,
+  failed: 2,
+  expired: 3,
+  paid: 4,
+  disputed: 5,
+  refunded: 6,
+}
+
+function advancesBillingState(current: RegistryBillingOrderState,
+  target: RegistryBillingOrderState): boolean {
+  return BILLING_STATE_PRIORITY[target] > BILLING_STATE_PRIORITY[current]
+}
+
 function postgresCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null) return undefined
   const value = Reflect.get(error, 'code')
@@ -343,7 +456,7 @@ export function fingerprintTenancyPolicies(rows: readonly TenancyPolicyRow[]): s
     row.using_definition,
     row.check_definition,
   ])).join('\n')
-  return createHash('sha256').update('registry-tenancy-policy-v2\0', 'utf8').update(definitions, 'utf8').digest('hex')
+  return createHash('sha256').update('registry-tenancy-policy-v3\0', 'utf8').update(definitions, 'utf8').digest('hex')
 }
 
 export const TENANCY_POLICY_DEPARSE_SEARCH_PATH = 'pg_catalog'
@@ -699,6 +812,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
   private readonly schemaMode: PostgresRegistryTenancySchemaMode
   private readonly allowUnsafeSharedDatabase: boolean
   private readonly maxOrganizationsPerAccount: number
+  private policyFingerprint: string | undefined
   private closed = false
   private closing: Promise<void> | undefined
 
@@ -772,11 +886,12 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
     if (this.closed) return false
     try {
       const result = await this.pool.query<{
+        readonly policy_fingerprint: string | null
         readonly storage_version: number
         readonly tenancy_version: number
       }>({
         text: `select storage.schema_version as storage_version,
-            tenancy.schema_version as tenancy_version
+            tenancy.schema_version as tenancy_version, tenancy.policy_fingerprint
           from ${this.schema}.storage_meta as storage
           cross join ${this.schema}.tenancy_meta as tenancy
           where storage.singleton = true and tenancy.singleton = true`,
@@ -785,6 +900,8 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       return result.rows.length === 1
         && result.rows[0]?.storage_version === STORAGE_POSTGRES_SCHEMA_VERSION
         && result.rows[0]?.tenancy_version === SCHEMA_VERSION
+        && this.policyFingerprint !== undefined
+        && result.rows[0]?.policy_fingerprint === this.policyFingerprint
     } catch {
       return false
     }
@@ -1320,6 +1437,188 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
     })
   }
 
+  async reserveBillingOrder(valueAccountId: RegistryAccountId, valueMemberId: MemberId,
+    input: RegistryBillingOrderReservation): Promise<RegistryBillingOrder> {
+    const selectedAccountId = accountId(valueAccountId)
+    const selectedMemberId = memberId(valueMemberId)
+    const selectedOrganizationId = organizationId(input.organizationId)
+    if ((input.provider !== 'stripe' && input.provider !== 'alipay') || !IDENTIFIER.test(input.planId)
+      || !IDEMPOTENCY_KEY.test(input.idempotencyKey) || !CURRENCY.test(input.currency)
+      || !Number.isSafeInteger(input.unitAmount) || input.unitAmount < 0
+      || (input.interval !== 'month' && input.interval !== 'year')) {
+      throw new RegistryTenancyError('invalid-input')
+    }
+    const requestHash = billingRequestHash(input)
+    const nextOrderId = randomUUID()
+    return this.transaction(selectedAccountId, selectedOrganizationId, async (client) => {
+      const membership = await this.requireActiveMembership(client, selectedAccountId, selectedMemberId,
+        selectedOrganizationId)
+      if (membership.role !== 'owner') throw new RegistryTenancyError('not-found')
+      await this.advisoryLock(client,
+        `billing-order\0${selectedOrganizationId}\0${input.idempotencyKey}`)
+      const previous = await client.query<BillingOrderRow & { readonly request_hash: string }>(
+        this.billingOrderQuery('organization_id = $1 and idempotency_key = $2', '', ', request_hash'),
+        [selectedOrganizationId, input.idempotencyKey],
+      )
+      const existing = previous.rows[0]
+      if (existing !== undefined) {
+        if (existing.request_hash !== requestHash) throw new RegistryTenancyError('conflict')
+        return billingOrderOf(existing)
+      }
+      const inserted = await client.query<BillingOrderRow>(
+        `insert into ${this.schema}.billing_orders
+          (order_id, organization_id, idempotency_key, request_hash, provider, plan_id,
+           currency, unit_amount, interval, state)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'creating')
+         returning ${this.billingOrderColumns()}`,
+        [nextOrderId, selectedOrganizationId, input.idempotencyKey, requestHash, input.provider,
+          input.planId, input.currency, input.unitAmount, input.interval],
+      )
+      const row = inserted.rows[0]
+      if (row === undefined) throw new RegistryTenancyError('unavailable')
+      return billingOrderOf(row)
+    })
+  }
+
+  async attachBillingCheckout(input: RegistryBillingCheckoutAttachment): Promise<RegistryBillingOrder> {
+    const selectedOrganizationId = organizationId(input.organizationId)
+    if (!UUID.test(input.orderId) || (input.provider !== 'stripe' && input.provider !== 'alipay')
+      || !nonEmptyBounded(input.providerCheckoutId, 512) || !Number.isSafeInteger(input.expiresAt)
+      || input.expiresAt < 0) throw new RegistryTenancyError('invalid-input')
+    const expiresAt = new Date(input.expiresAt)
+    if (!Number.isFinite(expiresAt.getTime())) throw new RegistryTenancyError('invalid-input')
+    return this.transaction(CONTROL_ACCOUNT_CONTEXT, selectedOrganizationId, async (client) => {
+      const selected = await client.query<BillingOrderRow>(
+        this.billingOrderQuery('organization_id = $1 and order_id = $2', ' for update'),
+        [selectedOrganizationId, input.orderId],
+      )
+      const current = selected.rows[0]
+      if (current === undefined) throw new RegistryTenancyError('not-found')
+      if (current.provider !== input.provider
+        || (current.provider_checkout_id !== null && current.provider_checkout_id !== input.providerCheckoutId)
+        || (current.checkout_expires_at !== null
+          && milliseconds(current.checkout_expires_at) !== input.expiresAt)) {
+        throw new RegistryTenancyError('conflict')
+      }
+      if (current.provider_checkout_id !== null) return billingOrderOf(current)
+      let updated: BillingOrderRow
+      try {
+        const result = await client.query<BillingOrderRow>(
+          `update ${this.schema}.billing_orders
+           set provider_checkout_id = $3, checkout_expires_at = $4,
+             state = case when state = 'creating' then 'checkout-pending' else state end,
+             updated_at = now()
+           where organization_id = $1 and order_id = $2
+           returning ${this.billingOrderColumns()}`,
+          [selectedOrganizationId, input.orderId, input.providerCheckoutId, expiresAt],
+        )
+        const row = result.rows[0]
+        if (row === undefined) throw new RegistryTenancyError('unavailable')
+        updated = row
+      } catch (error) {
+        if (postgresCode(error) === '23505') throw new RegistryTenancyError('conflict')
+        throw error
+      }
+      return billingOrderOf(updated)
+    })
+  }
+
+  async listBillingOrders(valueAccountId: RegistryAccountId, valueMemberId: MemberId,
+    valueOrganizationId: OrganizationId): Promise<readonly RegistryBillingOrder[]> {
+    const selectedAccountId = accountId(valueAccountId)
+    const selectedMemberId = memberId(valueMemberId)
+    const selectedOrganizationId = organizationId(valueOrganizationId)
+    return this.transaction(selectedAccountId, selectedOrganizationId, async (client) => {
+      const membership = await this.requireActiveMembership(client, selectedAccountId, selectedMemberId,
+        selectedOrganizationId)
+      if (membership.role !== 'owner') throw new RegistryTenancyError('not-found')
+      const result = await client.query<BillingOrderRow>(
+        this.billingOrderQuery('organization_id = $1',
+          ' order by created_at desc, order_id desc limit $2'),
+        [selectedOrganizationId, MAX_BILLING_ORDERS],
+      )
+      return result.rows.map(billingOrderOf)
+    })
+  }
+
+  async applyVerifiedBillingEvent(input: RegistryBillingEvent): Promise<RegistryBillingOrder> {
+    const selectedOrganizationId = organizationId(input.organizationId)
+    if (!UUID.test(input.orderId) || (input.provider !== 'stripe' && input.provider !== 'alipay')
+      || !nonEmptyBounded(input.eventId, 512) || !nonEmptyBounded(input.eventType, 64)
+      || !SHA256.test(input.payloadHash) || !Number.isSafeInteger(input.occurredAt) || input.occurredAt < 0) {
+      throw new RegistryTenancyError('invalid-input')
+    }
+    const targetState = billingEventState(input.eventType)
+    const occurredAt = new Date(input.occurredAt)
+    if (!Number.isFinite(occurredAt.getTime())) throw new RegistryTenancyError('invalid-input')
+    return this.transaction(CONTROL_ACCOUNT_CONTEXT, selectedOrganizationId, async (client) => {
+      const retained = await client.query<BillingEventRow>(
+        `select organization_id, order_id, provider, event_id, event_type, payload_hash, occurred_at
+         from ${this.schema}.billing_provider_events where provider = $1 and event_id = $2`,
+        [input.provider, input.eventId],
+      )
+      const duplicate = retained.rows[0]
+      if (duplicate !== undefined) {
+        if (!sameBillingEvent(duplicate, input, selectedOrganizationId)) throw new RegistryTenancyError('conflict')
+        const order = await client.query<BillingOrderRow>(
+          this.billingOrderQuery('organization_id = $1 and order_id = $2'),
+          [selectedOrganizationId, input.orderId],
+        )
+        const row = order.rows[0]
+        if (row === undefined || row.provider !== input.provider) throw new RegistryTenancyError('unavailable')
+        return billingOrderOf(row)
+      }
+      const selected = await client.query<BillingOrderRow>(
+        this.billingOrderQuery('organization_id = $1 and order_id = $2', ' for update'),
+        [selectedOrganizationId, input.orderId],
+      )
+      const current = selected.rows[0]
+      if (current === undefined) throw new RegistryTenancyError('not-found')
+      if (current.provider !== input.provider) throw new RegistryTenancyError('conflict')
+      const recorded = await client.query<{ readonly provider: string }>(
+          `insert into ${this.schema}.billing_provider_events
+            (provider, event_id, organization_id, order_id, event_type, payload_hash, occurred_at)
+           values ($1, $2, $3, $4, $5, $6, $7)
+           on conflict (provider, event_id) do nothing returning provider`,
+          [input.provider, input.eventId, selectedOrganizationId, input.orderId, input.eventType,
+            input.payloadHash, occurredAt],
+        )
+      if (recorded.rows.length === 0) {
+        const raced = await client.query<BillingEventRow>(
+          `select organization_id, order_id, provider, event_id, event_type, payload_hash, occurred_at
+           from ${this.schema}.billing_provider_events where provider = $1 and event_id = $2`,
+          [input.provider, input.eventId],
+        )
+        const row = raced.rows[0]
+        if (row === undefined || !sameBillingEvent(row, input, selectedOrganizationId)) {
+          throw new RegistryTenancyError('conflict')
+        }
+        return billingOrderOf(current)
+      }
+      // Persist the verified event before projecting it. The materialized order state is monotonic by financial
+      // severity, so delivery order and provider timestamp ties cannot regress it.
+      const projectedState = advancesBillingState(current.state, targetState) ? targetState : current.state
+      const result = await client.query<BillingOrderRow>(
+        `update ${this.schema}.billing_orders set state = $3,
+           paid_at = case
+             when $5 = 'checkout-paid' then least(coalesce(paid_at, $4), $4)
+             when $3 in ('paid', 'disputed', 'refunded') then coalesce(paid_at, $4)
+             else paid_at end,
+           refunded_at = case when $5 = 'refunded'
+             then least(coalesce(refunded_at, $4), $4) else refunded_at end,
+           disputed_at = case when $5 = 'disputed'
+             then least(coalesce(disputed_at, $4), $4) else disputed_at end,
+           last_event_at = greatest(coalesce(last_event_at, $4), $4), updated_at = now()
+         where organization_id = $1 and order_id = $2
+         returning ${this.billingOrderColumns()}`,
+        [selectedOrganizationId, input.orderId, projectedState, occurredAt, input.eventType],
+      )
+      const row = result.rows[0]
+      if (row === undefined) throw new RegistryTenancyError('unavailable')
+      return billingOrderOf(row)
+    })
+  }
+
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing
     this.closed = true
@@ -1486,6 +1785,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       if (fingerprintTenancyPolicies(policies) !== selectedVersion.policy_fingerprint) {
         throw new RegistryTenancyError('unavailable')
       }
+      this.policyFingerprint = selectedVersion.policy_fingerprint
       await client.query('commit')
       begun = false
     } catch (error) {
@@ -1526,7 +1826,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       const version = await client.query<{ readonly schema_version: number }>(
         `select schema_version from ${this.schema}.tenancy_meta where singleton = true`)
       if (version.rows.length !== 1 || (version.rows[0]?.schema_version !== 1
-        && version.rows[0]?.schema_version !== SCHEMA_VERSION)) {
+        && version.rows[0]?.schema_version !== 2 && version.rows[0]?.schema_version !== SCHEMA_VERSION)) {
         throw new RegistryTenancyError('unavailable')
       }
       await client.query(`create table if not exists ${this.schema}.accounts (
@@ -1625,12 +1925,69 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       await client.query(`create unique index if not exists organization_invitations_pending_claim_uidx
         on ${this.schema}.organization_invitations (organization_id, claimed_by_account_id)
         where status = 'pending' and claimed_by_account_id is not null`)
+      await client.query(`create table if not exists ${this.schema}.billing_orders (
+        order_id uuid primary key,
+        organization_id text not null references ${this.schema}.organizations(id) on delete restrict,
+        idempotency_key text not null check (
+          idempotency_key ~ '^[A-Za-z0-9]([A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$'),
+        request_hash text not null check (request_hash ~ '^[0-9a-f]{64}$'),
+        provider text not null check (provider in ('stripe', 'alipay')),
+        plan_id text not null check (plan_id ~ '^[A-Za-z0-9]([A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$'),
+        currency text not null check (currency ~ '^[A-Z]{3}$'),
+        unit_amount bigint not null check (unit_amount >= 0 and unit_amount <= 9007199254740991),
+        interval text not null check (interval in ('month', 'year')),
+        state text not null check (
+          state in ('creating', 'checkout-pending', 'paid', 'refunded', 'disputed', 'failed', 'expired')),
+        provider_checkout_id text check (provider_checkout_id is null or (
+          provider_checkout_id = btrim(provider_checkout_id) and provider_checkout_id <> ''
+          and octet_length(provider_checkout_id) <= 512 and provider_checkout_id !~ '[[:cntrl:]]')),
+        checkout_expires_at timestamptz,
+        paid_at timestamptz,
+        refunded_at timestamptz,
+        disputed_at timestamptz,
+        last_event_at timestamptz,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        unique (organization_id, idempotency_key),
+        unique (organization_id, order_id, provider),
+        check ((provider_checkout_id is null) = (checkout_expires_at is null)),
+        check (checkout_expires_at is null or checkout_expires_at > created_at),
+        check ((paid_at is not null) = (state in ('paid', 'refunded', 'disputed'))),
+        check (refunded_at is null or state = 'refunded'),
+        check (disputed_at is null or paid_at is not null),
+        check (updated_at >= created_at)
+      )`)
+      await client.query(`create unique index if not exists billing_orders_provider_checkout_uidx
+        on ${this.schema}.billing_orders (provider, provider_checkout_id)
+        where provider_checkout_id is not null`)
+      await client.query(`create index if not exists billing_orders_owner_list_idx
+        on ${this.schema}.billing_orders (organization_id, created_at desc, order_id desc)`)
+      await client.query(`create table if not exists ${this.schema}.billing_provider_events (
+        provider text not null check (provider in ('stripe', 'alipay')),
+        event_id text not null check (event_id = btrim(event_id) and event_id <> ''
+          and octet_length(event_id) <= 512 and event_id !~ '[[:cntrl:]]'),
+        organization_id text not null,
+        order_id uuid not null,
+        event_type text not null check (event_type in (
+          'checkout-paid', 'checkout-expired', 'checkout-failed', 'refunded', 'disputed')),
+        payload_hash text not null check (payload_hash ~ '^[0-9a-f]{64}$'),
+        occurred_at timestamptz not null,
+        received_at timestamptz not null default now(),
+        primary key (provider, event_id),
+        foreign key (organization_id, order_id, provider)
+          references ${this.schema}.billing_orders(organization_id, order_id, provider) on delete restrict
+      )`)
+      await client.query(`create index if not exists billing_provider_events_order_idx
+        on ${this.schema}.billing_provider_events
+          (organization_id, order_id, received_at desc, provider, event_id)`)
       await this.installPolicies(client)
       const policies = await this.readPolicies(client)
       this.requireExpectedPolicies(policies)
+      const policyFingerprint = fingerprintTenancyPolicies(policies)
       await client.query(`update ${this.schema}.tenancy_meta
         set schema_version = $1, policy_fingerprint = $2 where singleton = true`,
-      [SCHEMA_VERSION, fingerprintTenancyPolicies(policies)])
+      [SCHEMA_VERSION, policyFingerprint])
+      this.policyFingerprint = policyFingerprint
       await client.query('commit')
       begun = false
     } catch (error) {
@@ -1714,23 +2071,12 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
   }
 
   private async installPolicies(client: PoolClient): Promise<void> {
-    for (const table of ['organizations', 'organization_memberships', 'organization_creations',
-      'organization_invitations']) {
+    for (const table of TENANT_SCOPED_TABLES) {
       await client.query(`alter table ${this.schema}.${table} enable row level security`)
       await client.query(`alter table ${this.schema}.${table} force row level security`)
     }
-    const policies = [
-      'organizations_select', 'organizations_insert', 'organizations_update',
-      'organization_memberships_select', 'organization_memberships_insert',
-      'organization_memberships_update',
-      'organization_creations_select', 'organization_creations_insert',
-      'organization_invitations_select', 'organization_invitations_insert', 'organization_invitations_update',
-    ]
-    for (const policy of policies) {
-      const table = policy.startsWith('organization_memberships') ? 'organization_memberships'
-        : policy.startsWith('organization_creations') ? 'organization_creations' : 'organizations'
-      const selectedTable = policy.startsWith('organization_invitations') ? 'organization_invitations' : table
-      await client.query(`drop policy if exists ${policy} on ${this.schema}.${selectedTable}`)
+    for (const policy of TENANCY_POLICIES) {
+      await client.query(`drop policy if exists ${policy.name} on ${this.schema}.${policy.table}`)
     }
     const accountSetting = "nullif(current_setting('app.account_id', true), '')"
     const organizationSetting = "nullif(current_setting('app.organization_id', true), '')"
@@ -1792,6 +2138,39 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       ) with check (
         ${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}'
         and (${organizationSetting} is null or organization_id = ${organizationSetting})
+      )`)
+    await client.query(`create policy billing_orders_select on ${this.schema}.billing_orders
+      for select using (
+        (${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}' and organization_id = ${organizationSetting})
+        or (organization_id = ${organizationSetting} and exists (
+          select 1 from ${this.schema}.organization_memberships as membership
+          where membership.organization_id = billing_orders.organization_id
+            and membership.account_id::text = ${accountSetting}
+            and membership.role = 'owner' and membership.state = 'active'
+        ))
+      )`)
+    await client.query(`create policy billing_orders_insert on ${this.schema}.billing_orders
+      for insert with check (
+        organization_id = ${organizationSetting} and exists (
+          select 1 from ${this.schema}.organization_memberships as membership
+          where membership.organization_id = billing_orders.organization_id
+            and membership.account_id::text = ${accountSetting}
+            and membership.role = 'owner' and membership.state = 'active'
+        )
+      )`)
+    await client.query(`create policy billing_orders_update on ${this.schema}.billing_orders
+      for update using (
+        ${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}' and organization_id = ${organizationSetting}
+      ) with check (
+        ${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}' and organization_id = ${organizationSetting}
+      )`)
+    await client.query(`create policy billing_provider_events_select
+      on ${this.schema}.billing_provider_events for select using (
+        ${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}' and organization_id = ${organizationSetting}
+      )`)
+    await client.query(`create policy billing_provider_events_insert
+      on ${this.schema}.billing_provider_events for insert with check (
+        ${accountSetting} = '${CONTROL_ACCOUNT_CONTEXT}' and organization_id = ${organizationSetting}
       )`)
   }
 
@@ -1915,6 +2294,17 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       from ${this.schema}.organizations as organization
       join ${this.schema}.organization_memberships as membership on membership.organization_id = organization.id
       where ${where}${orderBy === undefined ? '' : ` order by ${orderBy}`}`
+  }
+
+  private billingOrderColumns(): string {
+    return `order_id, organization_id, provider, plan_id, currency, unit_amount, interval, state,
+      provider_checkout_id, checkout_expires_at, paid_at, refunded_at, disputed_at, last_event_at,
+      created_at, updated_at`
+  }
+
+  private billingOrderQuery(where: string, suffix = '', extraColumns = ''): string {
+    return `select ${this.billingOrderColumns()}${extraColumns}
+      from ${this.schema}.billing_orders where ${where}${suffix}`
   }
 
   private async selectAccess(client: PoolClient, selectedAccountId: RegistryAccountId,

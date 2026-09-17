@@ -119,7 +119,7 @@ where namespace.nspname = :'target_schema' and relation.relkind in ('r', 'p')
   and relation.relname in (
     'units', 'unit_globals', 'unit_records',
     'accounts', 'account_identities', 'organizations', 'organization_memberships',
-    'organization_creations', 'organization_invitations'
+    'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events'
   )
 order by relation.relname
 \gexec
@@ -264,7 +264,7 @@ begin
             when relation.relname in (
               'units', 'unit_globals', 'unit_records',
               'accounts', 'account_identities', 'organizations', 'organization_memberships',
-              'organization_creations', 'organization_invitations'
+              'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events'
             ) then acl.privilege_type not in ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
             else true
           end
@@ -369,7 +369,7 @@ begin
       and relation.relname in (
         'units', 'unit_globals', 'unit_records',
         'accounts', 'account_identities', 'organizations', 'organization_memberships',
-        'organization_creations', 'organization_invitations'
+        'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events'
       )
       and (not has_table_privilege('registry_app', relation.oid, 'SELECT')
         or not has_table_privilege('registry_app', relation.oid, 'INSERT')
@@ -391,7 +391,7 @@ begin
         'storage_meta', 'tenancy_meta',
         'units', 'unit_globals', 'unit_records',
         'accounts', 'account_identities', 'organizations', 'organization_memberships',
-        'organization_creations', 'organization_invitations'
+        'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events'
       )
       and (has_table_privilege('registry_app', relation.oid,
           'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN')

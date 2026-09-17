@@ -46,6 +46,12 @@ export function apply(ctx: Context, config: Config = Config({})): void {
   const readInvitation: RegistryPageInjected['readInvitation'] = (token, signal) => api.readInvitation(token, signal)
   const acceptInvitation: RegistryPageInjected['acceptInvitation'] = (token, signal) => api.acceptInvitation(token, signal)
   const declineInvitation: RegistryPageInjected['declineInvitation'] = (token, signal) => api.declineInvitation(token, signal)
+  const listBillingPlans: RegistryPageInjected['listBillingPlans'] = (organizationId, signal) =>
+    api.listBillingPlans(organizationId, signal)
+  const listBillingOrders: RegistryPageInjected['listBillingOrders'] = (organizationId, signal) =>
+    api.listBillingOrders(organizationId, signal)
+  const createBillingCheckout: RegistryPageInjected['createBillingCheckout'] = (organizationId, request, signal) =>
+    api.createBillingCheckout(organizationId, request, signal)
   const listInstances: RegistryPageInjected['listInstances'] = (organizationId, signal) =>
     api.listInstances(organizationId, signal)
   const renameInstance: RegistryPageInjected['renameInstance'] = (organizationId, bindingId, instanceName, signal) =>
@@ -118,6 +124,9 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       readInvitation,
       acceptInvitation,
       declineInvitation,
+      listBillingPlans,
+      listBillingOrders,
+      createBillingCheckout,
       listInstances,
       renameInstance,
       revokeInstance,

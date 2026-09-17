@@ -2,6 +2,12 @@
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
+import type {
+  RegistryBillingCheckoutAttachment,
+  RegistryBillingEvent,
+  RegistryBillingOrder,
+  RegistryBillingOrderReservation,
+} from './billing.ts'
 
 /** Server-issued Registry account identity, independent from any one organization. */
 export type RegistryAccountId = Branded<'RegistryAccountId'>
@@ -149,5 +155,15 @@ export interface RegistryTenancyStore {
   /** Mirror an already committed directory member change when that member is linked to an account. */
   syncMembershipFromDirectory(organizationId: OrganizationId, memberId: MemberId,
     role: RegistryOrganizationRole, state: RegistryOrganizationMembershipState): Promise<void>
+  /** Reserve one organization-scoped commercial intent before contacting its provider. */
+  reserveBillingOrder(accountId: RegistryAccountId, memberId: MemberId,
+    input: RegistryBillingOrderReservation): Promise<RegistryBillingOrder>
+  /** Attach provider checkout metadata without persisting its bearer-like redirect URL. */
+  attachBillingCheckout(input: RegistryBillingCheckoutAttachment): Promise<RegistryBillingOrder>
+  /** List newest orders only after reloading a current active Owner membership. */
+  listBillingOrders(accountId: RegistryAccountId, memberId: MemberId,
+    organizationId: OrganizationId): Promise<readonly RegistryBillingOrder[]>
+  /** Apply one signature-verified provider event through the core transition table. */
+  applyVerifiedBillingEvent(input: RegistryBillingEvent): Promise<RegistryBillingOrder>
   close(): Promise<void>
 }

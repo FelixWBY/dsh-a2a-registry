@@ -87,7 +87,7 @@ test('tenancy policy reader verifies canonical deparse settings before catalog a
   assert.deepEqual(calls.map(call => call.values), [
     ['pg_catalog', 'off'],
     ['registry_saas', ['organizations', 'organization_memberships',
-      'organization_creations', 'organization_invitations']],
+      'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events']],
   ])
 
   await assert.rejects(store.readPolicies({

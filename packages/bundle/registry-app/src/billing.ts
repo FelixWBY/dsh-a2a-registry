@@ -1,8 +1,13 @@
 /** Deployment-owned billing boundary. Registry ships disabled and never stores merchant secrets. */
 import { Context, Service } from '@deepseek-ai/cordis'
+import type { OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { DisclosureSubject } from '@deepseek-ai/dsh-a2a-registry-domain'
 
 export type RegistryBillingProviderName = 'stripe' | 'alipay'
+export type RegistryBillingOrderState = 'creating' | 'checkout-pending' | 'paid' | 'refunded' | 'disputed'
+  | 'failed' | 'expired'
+export type RegistryBillingEventType = 'checkout-paid' | 'checkout-expired' | 'checkout-failed' | 'refunded'
+  | 'disputed'
 
 /** Browser-safe commercial offer. Provider price identifiers remain server-side. */
 export interface RegistryBillingPlan {
@@ -16,6 +21,8 @@ export interface RegistryBillingPlan {
 /** Checkout request authorized to the current organization owner. */
 export interface RegistryBillingCheckoutInput {
   readonly subject: DisclosureSubject
+  /** Registry order identifier copied into provider metadata for verified webhook correlation. */
+  readonly orderId: string
   readonly planId: string
   readonly idempotencyKey: string
   /** Same-origin route to return to; the provider owns the absolute public origin. */
@@ -27,6 +34,57 @@ export interface RegistryBillingCheckout {
   readonly checkoutId: string
   readonly checkoutUrl: string
   readonly expiresAt: number
+}
+
+/** Server-priced order reservation; no browser-supplied amount reaches this contract. */
+export interface RegistryBillingOrderReservation {
+  readonly organizationId: OrganizationId
+  readonly provider: RegistryBillingProviderName
+  readonly planId: string
+  readonly idempotencyKey: string
+  readonly currency: string
+  readonly unitAmount: number
+  readonly interval: RegistryBillingPlan['interval']
+}
+
+/** Provider checkout identity persisted after a hosted checkout has been created. */
+export interface RegistryBillingCheckoutAttachment {
+  readonly organizationId: OrganizationId
+  readonly orderId: string
+  readonly provider: RegistryBillingProviderName
+  readonly providerCheckoutId: string
+  readonly expiresAt: number
+}
+
+/** Signature-verified provider event. Raw webhook bodies and secrets never enter the order store. */
+export interface RegistryBillingEvent {
+  readonly organizationId: OrganizationId
+  readonly orderId: string
+  readonly provider: RegistryBillingProviderName
+  readonly eventId: string
+  readonly eventType: RegistryBillingEventType
+  readonly payloadHash: string
+  readonly occurredAt: number
+}
+
+/** Browser-safe provider-neutral order snapshot. */
+export interface RegistryBillingOrder {
+  readonly orderId: string
+  readonly organizationId: OrganizationId
+  readonly provider: RegistryBillingProviderName
+  readonly planId: string
+  readonly currency: string
+  readonly unitAmount: number
+  readonly interval: RegistryBillingPlan['interval']
+  readonly state: RegistryBillingOrderState
+  readonly providerCheckoutId: string | null
+  readonly checkoutExpiresAt: number | null
+  readonly paidAt: number | null
+  readonly refundedAt: number | null
+  readonly disputedAt: number | null
+  readonly lastEventAt: number | null
+  readonly createdAt: number
+  readonly updatedAt: number
 }
 
 declare module '@deepseek-ai/cordis' {

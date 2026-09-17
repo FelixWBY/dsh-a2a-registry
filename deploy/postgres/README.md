@@ -1,6 +1,6 @@
 # 本地 PostgreSQL（Docker）
 
-Windows 使用 Docker Desktop 的 WSL 2 / Linux 容器引擎，不安装 Windows 原生 PostgreSQL。固定 `postgres:18.6-bookworm`，数据库 `registry`，只监听 `127.0.0.1:5432`。这是 Registry 专用 cluster；backup 安全契约会撤销其他数据库的 `PUBLIC CONNECT`，不能混放其他业务数据库。`registry_migrator` 只供停服后的结构迁移，`registry_app` 只供在线业务读写，`registry_backup` 只供停服备份；三个角色互不继承。注册站已提供 PostgreSQL KV 后端与显式迁移工具；切换仍必须由部署者停写、备份并执行迁移，不能只修改配置。
+Windows 使用 Docker Desktop 的 WSL 2 / Linux 容器引擎，不安装 Windows 原生 PostgreSQL。固定 `postgres:18.6-bookworm`，数据库 `registry`，只监听 `127.0.0.1:5432`。这是 Registry 专用 cluster；backup 安全契约会撤销其他数据库的 `PUBLIC CONNECT`，不能混放其他业务数据库。`registry_migrator` 只供停服后的结构迁移，`registry_app` 只供在线业务读写，`registry_backup` 只供停服备份；三个角色互不继承。注册站已提供 PostgreSQL KV 后端、SaaS 控制面 schema v3 与显式迁移工具；切换仍必须由部署者停写、备份并执行迁移，不能只修改配置。
 
 ## 启停
 
@@ -17,7 +17,7 @@ powershell -ExecutionPolicy Bypass -File scripts/local-postgres.ps1 Backup
 
 `Prepare` 可在 Docker 未启动时准备首次本地凭据。密码随机生成，仅存于忽略目录 `.artifacts/postgres/private`；`connection.env` 分别保存在线、迁移和备份连接串，但不会自动覆盖根目录环境文件。不要把此目录、连接串或数据库备份发到 GitHub。Registry 服务环境只能注入 `DSH_REGISTRY_POSTGRES_URL`，不能包含 migrator／backup URL 或 `REGISTRY_BACKUP_PASSWORD`。
 
-迁移和在线账号都不是超级管理员，也没有 `BYPASSRLS`。迁移账号持有 schema 和表，并仅额外继承 `pg_read_all_stats` 以检查当前数据库会话。备份账号因强制 RLS 必须固定 `BYPASSRLS`，但同时固定 `NOINHERIT`、两连接上限、零角色成员关系，并且只能连接数据库和读取唯一权威 SaaS schema；其凭据不得进入在线进程。在线账号没有数据库临时对象权限、schema `CREATE`、对象所有权或离线角色成员关系，只获得 schema `USAGE`、元数据只读和已知业务表 DML。PostgreSQL KV schema v2 在三张领域表上保存 `tenant_id`，并使用强制 RLS 和复合主外键隔离租户。上层仍必须给每个组织传入正确的 `tenantId`；未传时只会进入保留的空字符串全局作用域，不能把这个兼容作用域当作组织路由。
+迁移和在线账号都不是超级管理员，也没有 `BYPASSRLS`。迁移账号持有 schema 和表，并仅额外继承 `pg_read_all_stats` 以检查当前数据库会话。备份账号因强制 RLS 必须固定 `BYPASSRLS`，但同时固定 `NOINHERIT`、两连接上限、零角色成员关系，并且只能连接数据库和读取唯一权威 SaaS schema；其凭据不得进入在线进程。在线账号没有数据库临时对象权限、schema `CREATE`、对象所有权或离线角色成员关系，只获得 schema `USAGE`、元数据只读和已知业务表 DML。PostgreSQL KV 领域存储 schema v2 在三张领域表上保存 `tenant_id`，并使用强制 RLS 和复合主外键隔离租户；SaaS 控制面 schema v3 另含账号、组织、邀请、成员关系、`billing_orders` 和 `billing_provider_events`，组织作用域表同样强制 RLS。上层仍必须给每个组织传入正确的 `tenantId`；未传时只会进入保留的空字符串全局作用域，不能把这个兼容作用域当作组织路由。
 
 当前数据面仍由单个 Registry 进程持有内存快照和排他写入队列。同一生产 schema 只能由一个业务副本使用；不能双实例滚动发布或水平扩容。任一 schema 的离线升级会拒绝当前数据库中的全部 `registry_app` 会话，因此共库的其他 Registry 也必须先停止。升级后只启动一个新实例并完成探针验证。
 
@@ -49,7 +49,7 @@ $split | docker.exe --context desktop-linux compose -f deploy/postgres/compose.y
 if ($LASTEXITCODE -ne 0) { throw '最终最小权限固化失败，不能启动 Registry' }
 ```
 
-第一次权限拆分让迁移角色接管已有对象；离线命令只建表、升级并重装策略，执行后立即关闭连接；第二次权限拆分给新增业务表补齐最小授权并移除两张元数据表的写权限。三步使用同一个 schema 级快速失败锁，并按数据库账号而非仅按可伪装的 `application_name` 检查在线会话。在线配置必须显式使用 `schemaMode: validate`，启动时只在只读事务中核验角色、版本、表、表权限和 RLS 策略；在线账号能 DDL、元数据写入、危险表权限或缺少业务 DML 时均拒绝启动。
+第一次权限拆分让迁移角色接管已有对象；离线命令只建表、升级并重装策略，执行后立即关闭连接；第二次权限拆分给包括 `billing_orders` 和 `billing_provider_events` 在内的新增业务表补齐最小授权，并移除两张元数据表的写权限。三步使用同一个 schema 级快速失败锁，并按数据库账号而非仅按可伪装的 `application_name` 检查在线会话。在线配置必须显式使用 `schemaMode: validate`，启动时只在只读事务中核验角色、版本、表、表权限和 RLS 策略；在线账号能 DDL、元数据写入、危险表权限或缺少业务 DML 时均拒绝启动。
 
 已有卷第一次落地该角色模型时，顺序固定为：停止 3081 和 3181，运行新版 `scripts/local-postgres.ps1 Start` 补齐角色与秘密，再显式运行：
 
@@ -65,7 +65,13 @@ powershell -ExecutionPolicy Bypass -File deploy/registry/start-local-keycloak.ps
 
 本地 Keycloak patch 暂时显式启用 `allowUnsafeSharedDatabase`，仅用于 `registry_mvp` 等 legacy schema 尚未完成 P-MIGRATE、但与 `registry_saas_local` 共用一个开发数据库的阶段。生产模板没有也不得启用该开关；旧 schema 完成角色拆分后立即从本地 patch 删除。
 
-## schema v1 升级到 v2
+## SaaS 控制面 schema v2 升级到 v3
+
+控制面 schema v3 新增 `billing_orders` 和 `billing_provider_events`。前者保存组织、服务端方案快照、组织级幂等键、支付提供方结账标识和显式订单状态；后者以 `provider + event_id` 唯一约束保存规范化事件摘要，供验签后的支付适配器防重放和审计。两表都以 `organization_id` 强制 RLS，并已进入在线权限、策略指纹、就绪检查和 SaaS 备份清单。
+
+升级必须停写并执行上面的 `split → migrate → split`。完成后确认 `tenancy_meta.schema_version = 3`，两表同时启用并强制 RLS，在线账号拥有所需的 `SELECT／INSERT／UPDATE／DELETE` 且没有 DDL、`TRUNCATE`、`REFERENCES`、`TRIGGER` 或 `MAINTAIN` 权限。结构升级只提供支付持久化核心，不会安装 Stripe／支付宝适配器或商户凭据；未配置支付提供方时 API 仍应返回 HTTP 501。
+
+## 领域存储 schema v1 升级到 v2
 
 先停止全部 Registry 进程并运行 `Backup`，在隔离数据库验证备份可恢复。已有 v1 数据不能靠 JSON 猜组织：第一次用新版后端启动时，必须在 PostgreSQL 插件配置中显式设置 `legacyTenantId`，而且它必须与旧站运行时的 `ingest.organizationId`（部署变量 `DSH_REGISTRY_ORGANIZATION_ID`）逐字一致。首次迁移只启动一个新版进程；不要生成新 ID，也不要让两个实例并发迁移。迁移在一个事务内增加租户列、回填旧行、替换复合主外键、启用并强制 RLS，最后才把 schema 版本写成 2；失败会回滚到 v1。
 

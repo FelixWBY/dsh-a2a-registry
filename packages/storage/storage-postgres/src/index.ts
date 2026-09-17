@@ -18,7 +18,7 @@ const REGISTRY_META_TABLES = ['storage_meta', 'tenancy_meta'] as const
 const REGISTRY_BUSINESS_TABLES = [
   'units', 'unit_globals', 'unit_records',
   'accounts', 'account_identities', 'organizations', 'organization_memberships',
-  'organization_creations', 'organization_invitations',
+  'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events',
 ] as const
 
 export type PostgresSchemaMode = 'migrate' | 'validate'

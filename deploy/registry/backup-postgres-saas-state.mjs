@@ -22,7 +22,7 @@ const REGISTRY_APPLICATIONS = ['dsh-a2a-registry', 'dsh-a2a-registry-tenancy']
 const REGISTRY_TABLES = Object.freeze([
   'storage_meta', 'units', 'unit_globals', 'unit_records',
   'tenancy_meta', 'accounts', 'account_identities', 'organizations', 'organization_memberships',
-  'organization_creations', 'organization_invitations',
+  'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events',
 ])
 const SQLITE_DATABASES = Object.freeze([
   { role: 'admission', environment: 'DSH_REGISTRY_ADMISSION_SQLITE_PATH', file: 'admission.sqlite' },
@@ -379,7 +379,7 @@ async function postgresState(database, schema) {
      order by relation.relname`, [schema, REGISTRY_TABLES])
   if (tables.rows.length !== REGISTRY_TABLES.length
     || REGISTRY_TABLES.some(name => !tables.rows.some(row => row.table_name === name))) {
-    fail('target schema is missing a required Registry v2 table')
+    fail('target schema is missing a required Registry table')
   }
   const qualified = `"${schema}"`
   const versions = await database.query(
@@ -388,8 +388,8 @@ async function postgresState(database, schema) {
        (select schema_version from ${qualified}.tenancy_meta where singleton = true)
        as tenancy_version`)
   if (versions.rows.length !== 1 || versions.rows[0]?.storage_version !== 2
-    || versions.rows[0]?.tenancy_version !== 2) {
-    fail('target schema must contain storage and tenancy schema version 2')
+    || versions.rows[0]?.tenancy_version !== 3) {
+    fail('target schema must contain storage schema version 2 and tenancy schema version 3')
   }
   const active = await database.query(
     `select count(*)::integer as count

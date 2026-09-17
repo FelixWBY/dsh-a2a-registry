@@ -26,6 +26,9 @@ function OrganizationRegistryPage({ organizationId, page, props }:
     listInvitations: signal => props.listInvitations(organizationId, signal),
     createInvitation: (request, signal) => props.createInvitation(organizationId, request, signal),
     revokeInvitation: (invitationId, signal) => props.revokeInvitation(organizationId, invitationId, signal),
+    listBillingPlans: signal => props.listBillingPlans(organizationId, signal),
+    listBillingOrders: signal => props.listBillingOrders(organizationId, signal),
+    createBillingCheckout: (request, signal) => props.createBillingCheckout(organizationId, request, signal),
     listInstances: signal => props.listInstances(organizationId, signal),
     renameInstance: (bindingId, instanceName, signal) =>
       props.renameInstance(organizationId, bindingId, instanceName, signal),
@@ -52,7 +55,8 @@ function OrganizationRegistryPage({ organizationId, page, props }:
     cancelQuestion: (disclosureId, requestId, signal) =>
       props.cancelQuestion(organizationId, disclosureId, requestId, signal),
   }), [organizationId, props.approveBinding, props.askDisclosure, props.cancelQuestion, props.changeDirectory,
-    props.createInvitation, props.importDisclosure, props.listAudit, props.listBranches, props.listDisclosures, props.listInvitations, props.listImportTargets,
+    props.createBillingCheckout, props.createInvitation, props.importDisclosure, props.listAudit, props.listBillingOrders,
+    props.listBillingPlans, props.listBranches, props.listDisclosures, props.listInvitations, props.listImportTargets,
     props.listInstances, props.readDirectory, props.readDisclosure, props.readDisclosureContent, props.readImport,
     props.readQuestion, props.rejectBinding, props.renameInstance, props.reviewBinding, props.revokeInstance,
     props.revokeInvitation])
@@ -91,7 +95,9 @@ function OrganizationRegistryPage({ organizationId, page, props }:
   }
   if (page === 'audit') return <AuditPage t={t} listAudit={api.listAudit} />
   if (page === 'settings') return <SettingsPage organizationId={organizationId} t={t} useTheme={useTheme} setTheme={setTheme}
-    localTestIdentityBanner={props.localTestIdentityBanner} readStatus={props.readStatus} />
+    localTestIdentityBanner={props.localTestIdentityBanner} readStatus={props.readStatus}
+    listBillingPlans={api.listBillingPlans} listBillingOrders={api.listBillingOrders}
+    createBillingCheckout={api.createBillingCheckout} />
   if (page === 'overview') return <OverviewPage organizationId={organizationId} t={t} localTestIdentityBanner={props.localTestIdentityBanner}
     readStatus={props.readStatus} />
   if (page === 'members') return <MembersPage t={t} readDirectory={api.readDirectory}

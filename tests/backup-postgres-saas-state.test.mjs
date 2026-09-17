@@ -35,10 +35,10 @@ function migratorPostgres() {
       if (statement.includes('as table_name')) return { rows: [
         'storage_meta', 'units', 'unit_globals', 'unit_records',
         'tenancy_meta', 'accounts', 'account_identities', 'organizations', 'organization_memberships',
-        'organization_creations', 'organization_invitations',
+        'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events',
       ].map(table_name => ({ table_name })) }
       if (statement.includes('as storage_version')) {
-        return { rows: [{ storage_version: 2, tenancy_version: 2 }] }
+        return { rows: [{ storage_version: 2, tenancy_version: 3 }] }
       }
       if (statement.includes('from pg_stat_activity')) return { rows: [{ count: 0 }] }
       if (statement.includes('pg_current_wal_lsn')) return { rows: [{ wal_lsn: '16/B374D848' }] }
@@ -70,7 +70,7 @@ function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () 
       }
       if (statement.includes("namespace.nspname <> $1")) return { rows: [{ accessible: 0 }] }
       if (statement.includes("relation.relkind in ('r', 'p', 'v', 'm', 'f')")) {
-        return { rows: [{ count: 11, missing_select: 0, missing_direct_select: 0,
+        return { rows: [{ count: 13, missing_select: 0, missing_direct_select: 0,
           invalid_direct: 0, column_acl: 0, writable: 0 }] }
       }
       if (statement.includes("relation.relkind = 'S'")) {

@@ -9,6 +9,10 @@ import type {
   RegistryAuditPage,
   RegistryA2aRequestPage,
   RegistryBindingReview,
+  RegistryBillingCheckout,
+  RegistryBillingCheckoutRequest,
+  RegistryBillingOrderPage,
+  RegistryBillingPlanPage,
   RegistryDisclosureContent,
   RegistryDisclosureDetail,
   RegistryDisclosurePage,
@@ -90,6 +94,13 @@ export interface RegistryPageInjected {
   readInvitation: (token: string, signal: AbortSignal) => Promise<RegistryInvitationPreview>
   acceptInvitation: (token: string, signal: AbortSignal) => Promise<RegistryOrganizationSummary>
   declineInvitation: (token: string, signal: AbortSignal) => Promise<RegistryInvitationPreview>
+  /** List deployment-owned fixed-price plans for an active organization Owner. */
+  listBillingPlans: (organizationId: string, signal: AbortSignal) => Promise<RegistryBillingPlanPage>
+  /** List the newest persistent organization orders for an active organization Owner. */
+  listBillingOrders: (organizationId: string, signal: AbortSignal) => Promise<RegistryBillingOrderPage>
+  /** Reserve an order and create one provider-hosted checkout. */
+  createBillingCheckout: (organizationId: string, request: RegistryBillingCheckoutRequest,
+    signal: AbortSignal) => Promise<RegistryBillingCheckout>
   /** Read current account-owned instance bindings and ephemeral observations. */
   listInstances: (organizationId: string, signal: AbortSignal) => Promise<RegistryInstancePage>
   /** Rename one currently confirmed binding owned by the authenticated account. */
@@ -153,6 +164,10 @@ export interface RegistryOrganizationPageActions {
   createInvitation: (request: RegistryInvitationCreateRequest,
     signal: AbortSignal) => Promise<RegistryInvitationCreated>
   revokeInvitation: (invitationId: string, signal: AbortSignal) => Promise<RegistryInvitation>
+  listBillingPlans: (signal: AbortSignal) => Promise<RegistryBillingPlanPage>
+  listBillingOrders: (signal: AbortSignal) => Promise<RegistryBillingOrderPage>
+  createBillingCheckout: (request: RegistryBillingCheckoutRequest,
+    signal: AbortSignal) => Promise<RegistryBillingCheckout>
   listInstances: (signal: AbortSignal) => Promise<RegistryInstancePage>
   renameInstance: (bindingId: string, instanceName: string, signal: AbortSignal) => Promise<RegistryInstance>
   revokeInstance: (bindingId: string, signal: AbortSignal) => Promise<RegistryInstance>

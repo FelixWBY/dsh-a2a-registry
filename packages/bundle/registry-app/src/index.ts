@@ -33,8 +33,9 @@ export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
 export { RegistryAccountAuthenticator, type RegistryAuthenticatedAccount } from './account-auth.ts'
 export { RegistryBillingProvider } from './billing.ts'
-export type { RegistryBillingCheckout, RegistryBillingCheckoutInput, RegistryBillingPlan,
-  RegistryBillingProviderName } from './billing.ts'
+export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, RegistryBillingCheckoutInput,
+  RegistryBillingEvent, RegistryBillingEventType, RegistryBillingOrder, RegistryBillingOrderReservation,
+  RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName } from './billing.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
 export { RegistryTenancyError } from './tenancy.ts'

@@ -119,7 +119,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify({
     schema: input.schema,
     storageSchemaVersion: 2,
-    tenancySchemaVersion: 2,
+    tenancySchemaVersion: 3,
     migrated: true,
   })}\n`)
 }

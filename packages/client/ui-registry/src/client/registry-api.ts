@@ -224,6 +224,57 @@ export type RegistryTenancyMode = 'saas' | 'single-organization' | 'unconfigured
 export type RegistryIdentityProvider = 'oidc' | 'external' | 'local-test' | 'unconfigured'
 export type RegistryBillingProvider = 'stripe' | 'alipay' | 'unconfigured'
 
+export interface RegistryBillingPlan {
+  readonly planId: string
+  readonly displayName: string
+  readonly currency: string
+  readonly unitAmount: number
+  readonly interval: 'month' | 'year'
+}
+
+export interface RegistryBillingPlanPage {
+  readonly items: readonly RegistryBillingPlan[]
+}
+
+export type RegistryBillingOrderState = 'creating' | 'checkout-pending' | 'paid' | 'refunded' | 'disputed'
+  | 'failed' | 'expired'
+
+export interface RegistryBillingOrder {
+  readonly orderId: string
+  readonly organizationId: string
+  readonly provider: Exclude<RegistryBillingProvider, 'unconfigured'>
+  readonly planId: string
+  readonly currency: string
+  readonly unitAmount: number
+  readonly interval: 'month' | 'year'
+  readonly state: RegistryBillingOrderState
+  readonly checkoutExpiresAt: number | null
+  readonly paidAt: number | null
+  readonly refundedAt: number | null
+  readonly disputedAt: number | null
+  readonly lastEventAt: number | null
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export interface RegistryBillingOrderPage {
+  readonly items: readonly RegistryBillingOrder[]
+}
+
+export interface RegistryBillingCheckoutRequest {
+  readonly planId: string
+  readonly idempotencyKey: string
+  readonly returnPath: string
+}
+
+export interface RegistryBillingCheckout {
+  readonly checkoutId: string
+  readonly checkoutUrl: string
+  readonly expiresAt: number
+  readonly orderId: string
+  readonly state: RegistryBillingOrderState
+}
+
 /** Startup configuration facts; these labels do not claim ongoing worker health. */
 export interface RegistryRuntimeStatus {
   /** Server-owned deployment class; `standard` is not itself a production-health claim. */
@@ -352,6 +403,10 @@ export interface RegistryApi {
   readInvitation(token: string, signal: AbortSignal): Promise<RegistryInvitationPreview>
   acceptInvitation(token: string, signal: AbortSignal): Promise<RegistryOrganizationSummary>
   declineInvitation(token: string, signal: AbortSignal): Promise<RegistryInvitationPreview>
+  listBillingPlans(organizationId: string, signal: AbortSignal): Promise<RegistryBillingPlanPage>
+  listBillingOrders(organizationId: string, signal: AbortSignal): Promise<RegistryBillingOrderPage>
+  createBillingCheckout(organizationId: string, request: RegistryBillingCheckoutRequest,
+    signal: AbortSignal): Promise<RegistryBillingCheckout>
   listInstances(organizationId: string, signal: AbortSignal): Promise<RegistryInstancePage>
   renameInstance(organizationId: string, bindingId: string, instanceName: string,
     signal: AbortSignal): Promise<RegistryInstance>
@@ -408,6 +463,11 @@ const ORGANIZATION_STATES: readonly RegistryOrganizationState[] = ['provisioning
 const ORGANIZATION_ROLES: readonly RegistryOrganizationRole[] = ['owner', 'admin', 'member']
 const ORGANIZATION_MEMBERSHIP_STATES: readonly RegistryOrganizationMembershipState[] = ['active', 'suspended', 'removed']
 const CONFIGURATION_STATES: readonly RegistryConfigurationState[] = ['configured', 'unconfigured']
+const BILLING_PROVIDERS = ['stripe', 'alipay'] as const
+const BILLING_INTERVALS: readonly RegistryBillingPlan['interval'][] = ['month', 'year']
+const BILLING_ORDER_STATES: readonly RegistryBillingOrderState[] = [
+  'creating', 'checkout-pending', 'paid', 'refunded', 'disputed', 'failed', 'expired',
+]
 const CONTROLS: readonly RegistryControlState[] = ['active', 'paused', 'revoked', 'expired', 'deleting', 'deleted']
 const PRODUCERS: readonly RegistryProducerState[] = ['idle', 'backfilling', 'live', 'offline', 'error_retryable', 'error_conflict']
 const INGESTS: readonly RegistryIngestState[] = ['pending', 'ready', 'frozen']
@@ -910,6 +970,109 @@ function runtimeStatus(value: unknown): RegistryRuntimeStatus {
     disclosureCleanup, mailboxCleanup, billing, billingProvider }
 }
 
+function billingPlan(value: unknown): RegistryBillingPlan {
+  const source = record(value)
+  const interval = member(source?.interval, BILLING_INTERVALS)
+  const unitAmount = safeInteger(source?.unitAmount, 0)
+  if (source === null || !hasExactKeys(source, ['planId', 'displayName', 'currency', 'unitAmount', 'interval'])
+    || typeof source.planId !== 'string' || !IDENTIFIER.test(source.planId)
+    || !validDisplayName(source.displayName)
+    || typeof source.currency !== 'string' || !/^[A-Z]{3}$/u.test(source.currency)
+    || unitAmount === null || interval === null) throw new RegistryApiError('unavailable')
+  return { planId: source.planId, displayName: source.displayName, currency: source.currency, unitAmount, interval }
+}
+
+function billingPlanPage(value: unknown): RegistryBillingPlanPage {
+  const source = record(value)
+  if (source === null || !hasExactKeys(source, ['items']) || !Array.isArray(source.items)) {
+    throw new RegistryApiError('unavailable')
+  }
+  const seen = new Set<string>()
+  const items = source.items.map((value) => {
+    const plan = billingPlan(value)
+    if (seen.has(plan.planId)) throw new RegistryApiError('unavailable')
+    seen.add(plan.planId)
+    return plan
+  })
+  return { items }
+}
+
+function nullableTimestamp(value: unknown): number | null {
+  if (value === null) return null
+  const decoded = safeInteger(value, 0)
+  if (decoded === null) throw new RegistryApiError('unavailable')
+  return decoded
+}
+
+function billingOrder(value: unknown): RegistryBillingOrder {
+  const source = record(value)
+  const provider = member(source?.provider, BILLING_PROVIDERS)
+  const interval = member(source?.interval, BILLING_INTERVALS)
+  const state = member(source?.state, BILLING_ORDER_STATES)
+  const unitAmount = safeInteger(source?.unitAmount, 0)
+  const createdAt = safeInteger(source?.createdAt, 0)
+  const updatedAt = safeInteger(source?.updatedAt, 0)
+  if (source === null || !hasExactKeys(source, ['orderId', 'organizationId', 'provider', 'planId', 'currency',
+    'unitAmount', 'interval', 'state', 'checkoutExpiresAt', 'paidAt', 'refundedAt', 'disputedAt',
+    'lastEventAt', 'createdAt', 'updatedAt'])
+    || typeof source.orderId !== 'string' || !IDENTIFIER.test(source.orderId)
+    || typeof source.organizationId !== 'string' || !IDENTIFIER.test(source.organizationId)
+    || typeof source.planId !== 'string' || !IDENTIFIER.test(source.planId)
+    || typeof source.currency !== 'string' || !/^[A-Z]{3}$/u.test(source.currency)
+    || provider === null || interval === null || state === null || unitAmount === null
+    || createdAt === null || updatedAt === null || updatedAt < createdAt) throw new RegistryApiError('unavailable')
+  return {
+    orderId: source.orderId,
+    organizationId: source.organizationId,
+    provider,
+    planId: source.planId,
+    currency: source.currency,
+    unitAmount,
+    interval,
+    state,
+    checkoutExpiresAt: nullableTimestamp(source.checkoutExpiresAt),
+    paidAt: nullableTimestamp(source.paidAt),
+    refundedAt: nullableTimestamp(source.refundedAt),
+    disputedAt: nullableTimestamp(source.disputedAt),
+    lastEventAt: nullableTimestamp(source.lastEventAt),
+    createdAt,
+    updatedAt,
+  }
+}
+
+function billingOrderPage(value: unknown, organizationId: string): RegistryBillingOrderPage {
+  const source = record(value)
+  if (source === null || !hasExactKeys(source, ['items']) || !Array.isArray(source.items)) {
+    throw new RegistryApiError('unavailable')
+  }
+  const seen = new Set<string>()
+  const items = source.items.map((value) => {
+    const order = billingOrder(value)
+    if (order.organizationId !== organizationId || seen.has(order.orderId)) throw new RegistryApiError('unavailable')
+    seen.add(order.orderId)
+    return order
+  })
+  return { items }
+}
+
+function billingCheckout(value: unknown): RegistryBillingCheckout {
+  const source = record(value)
+  const expiresAt = safeInteger(source?.expiresAt, 1)
+  const state = member(source?.state, BILLING_ORDER_STATES)
+  if (source === null || !hasExactKeys(source, ['checkoutId', 'checkoutUrl', 'expiresAt', 'orderId', 'state'])
+    || typeof source.checkoutId !== 'string' || !IDENTIFIER.test(source.checkoutId)
+    || typeof source.orderId !== 'string' || !IDENTIFIER.test(source.orderId)
+    || typeof source.checkoutUrl !== 'string' || expiresAt === null || state === null) {
+    throw new RegistryApiError('unavailable')
+  }
+  let checkoutUrl: URL
+  try { checkoutUrl = new URL(source.checkoutUrl) } catch { throw new RegistryApiError('unavailable') }
+  if (checkoutUrl.protocol !== 'https:' || checkoutUrl.username !== '' || checkoutUrl.password !== '') {
+    throw new RegistryApiError('unavailable')
+  }
+  return { checkoutId: source.checkoutId, checkoutUrl: checkoutUrl.href, expiresAt, orderId: source.orderId, state }
+}
+
 function importResult(value: unknown): RegistryImportResult {
   const source = record(value)
   const status = member(source?.status, IMPORT_STATUSES)
@@ -1079,6 +1242,16 @@ export function createRegistryApi(): RegistryApi {
       `${API_BASE}/invitations/decline`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) },
       invitationPreview,
+    ),
+    listBillingPlans: (organizationId, signal) => request(
+      `${organizationBase(organizationId)}/billing/plans`, { method: 'GET', signal }, billingPlanPage),
+    listBillingOrders: (organizationId, signal) => request(
+      `${organizationBase(organizationId)}/billing/orders`, { method: 'GET', signal },
+      value => billingOrderPage(value, organizationId)),
+    createBillingCheckout: (organizationId, input, signal) => request(
+      `${organizationBase(organizationId)}/billing/checkout`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) },
+      billingCheckout,
     ),
     listInstances: (organizationId, signal) => request(
       `${organizationBase(organizationId)}/instances`, { method: 'GET', signal }, instances),

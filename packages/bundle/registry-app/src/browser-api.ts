@@ -25,7 +25,7 @@ import type { RegistryDirectory } from './directory.ts'
 import { RegistryBrowserAdmission, type RegistryBrowserAdmissionConfig,
   type RegistryBrowserAdmissionDecision } from './browser-admission.ts'
 import type { RegistryOperationalRateLimitScope } from './operational-alerts.ts'
-import type { RegistryBillingCheckout, RegistryBillingPlan } from './billing.ts'
+import type { RegistryBillingCheckout, RegistryBillingOrder, RegistryBillingPlan } from './billing.ts'
 import type { RegistryAccount, RegistryAccountId, RegistryOrganizationAccess } from './tenancy.ts'
 import { RegistryTenancyError } from './tenancy.ts'
 import type { RegistryTenantRuntime } from './ingest-runtime.ts'
@@ -131,6 +131,7 @@ type TenantApiRoute = TenantRoute & (
   | { readonly kind: 'invitation-revoke'; readonly invitationId: string }
   | { readonly kind: 'billing-plans' }
   | { readonly kind: 'billing-checkout' }
+  | { readonly kind: 'billing-orders' }
   | { readonly kind: 'audit'; readonly cursor?: string }
   | { readonly kind: 'branches'; readonly cursor?: string }
   | { readonly kind: 'list'; readonly cursor?: string }
@@ -587,10 +588,10 @@ function directoryResult(value: unknown, actorRole: DisclosureSubject['role'], m
   return result
 }
 
-function billingPlansResult(value: readonly RegistryBillingPlan[], maxValueBytes: number): Record<string, unknown> {
+function billingPlans(value: readonly RegistryBillingPlan[]): readonly RegistryBillingPlan[] {
   if (!Array.isArray(value) || value.length > 32) throw new ApiFailure(503, 'unavailable')
   const planIds = new Set<string>()
-  const items = value.map((item) => {
+  return value.map((item) => {
     if (typeof item.planId !== 'string' || !IDENTIFIER.test(item.planId) || planIds.has(item.planId)
       || typeof item.displayName !== 'string' || item.displayName.length === 0 || item.displayName !== item.displayName.trim()
       || !item.displayName.isWellFormed() || /[\u0000-\u001f\u007f]/u.test(item.displayName)
@@ -601,12 +602,16 @@ function billingPlansResult(value: readonly RegistryBillingPlan[], maxValueBytes
     return { planId: item.planId, displayName: item.displayName, currency: item.currency,
       unitAmount: item.unitAmount, interval: item.interval }
   })
+}
+
+function billingPlansResult(value: readonly RegistryBillingPlan[], maxValueBytes: number): Record<string, unknown> {
+  const items = billingPlans(value)
   const result = { items }
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
   return result
 }
 
-function billingCheckoutResult(value: RegistryBillingCheckout, maxValueBytes: number): Record<string, unknown> {
+function billingCheckout(value: RegistryBillingCheckout): RegistryBillingCheckout {
   if (typeof value.checkoutId !== 'string' || !IDENTIFIER.test(value.checkoutId)
     || typeof value.checkoutUrl !== 'string' || value.checkoutUrl.length > 2048
     || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now() || Object.is(value.expiresAt, -0)) {
@@ -617,7 +622,60 @@ function billingCheckoutResult(value: RegistryBillingCheckout, maxValueBytes: nu
   if (checkoutUrl.protocol !== 'https:' || checkoutUrl.username !== '' || checkoutUrl.password !== '') {
     throw new ApiFailure(503, 'unavailable')
   }
-  const result = { checkoutId: value.checkoutId, checkoutUrl: checkoutUrl.href, expiresAt: value.expiresAt }
+  return { checkoutId: value.checkoutId, checkoutUrl: checkoutUrl.href, expiresAt: value.expiresAt }
+}
+
+function billingCheckoutResult(value: RegistryBillingCheckout, order: RegistryBillingOrder,
+  maxValueBytes: number): Record<string, unknown> {
+  const checkout = billingCheckout(value)
+  const result = { ...checkout, orderId: order.orderId, state: order.state }
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
+  return result
+}
+
+function billingOrdersResult(value: readonly RegistryBillingOrder[], expectedOrganizationId: OrganizationId,
+  maxValueBytes: number): Record<string, unknown> {
+  if (!Array.isArray(value) || value.length > 100) throw new ApiFailure(503, 'unavailable')
+  const orderIds = new Set<string>()
+  const states = ['creating', 'checkout-pending', 'paid', 'refunded', 'disputed', 'failed', 'expired'] as const
+  const nullableTimestamp = (candidate: number | null): boolean => candidate === null
+    || Number.isSafeInteger(candidate) && candidate >= 0 && !Object.is(candidate, -0)
+  const items = value.map((item) => {
+    if (typeof item.orderId !== 'string' || !IDENTIFIER.test(item.orderId) || orderIds.has(item.orderId)
+      || item.organizationId !== expectedOrganizationId
+      || (item.provider !== 'stripe' && item.provider !== 'alipay')
+      || typeof item.planId !== 'string' || !IDENTIFIER.test(item.planId)
+      || typeof item.currency !== 'string' || !/^[A-Z]{3}$/u.test(item.currency)
+      || !Number.isSafeInteger(item.unitAmount) || item.unitAmount < 0 || Object.is(item.unitAmount, -0)
+      || (item.interval !== 'month' && item.interval !== 'year')
+      || !(states as readonly string[]).includes(item.state)
+      || !nullableTimestamp(item.checkoutExpiresAt) || !nullableTimestamp(item.paidAt)
+      || !nullableTimestamp(item.refundedAt) || !nullableTimestamp(item.disputedAt)
+      || !nullableTimestamp(item.lastEventAt)
+      || !Number.isSafeInteger(item.createdAt) || item.createdAt < 0 || Object.is(item.createdAt, -0)
+      || !Number.isSafeInteger(item.updatedAt) || item.updatedAt < item.createdAt || Object.is(item.updatedAt, -0)) {
+      throw new ApiFailure(503, 'unavailable')
+    }
+    orderIds.add(item.orderId)
+    return {
+      orderId: item.orderId,
+      organizationId: item.organizationId,
+      provider: item.provider,
+      planId: item.planId,
+      currency: item.currency,
+      unitAmount: item.unitAmount,
+      interval: item.interval,
+      state: item.state,
+      checkoutExpiresAt: item.checkoutExpiresAt,
+      paidAt: item.paidAt,
+      refundedAt: item.refundedAt,
+      disputedAt: item.disputedAt,
+      lastEventAt: item.lastEventAt,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+    }
+  })
+  const result = { items }
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxValueBytes) throw new ApiFailure(503, 'unavailable')
   return result
 }
@@ -1050,10 +1108,17 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
   }
   if (url.pathname === `${BILLING_PATH}/plans`) {
     noQuery(url)
+    if (organizationId === undefined) throw new ApiFailure(404, 'not-found')
     return scoped({ kind: 'billing-plans' })
+  }
+  if (url.pathname === `${BILLING_PATH}/orders`) {
+    noQuery(url)
+    if (organizationId === undefined) throw new ApiFailure(404, 'not-found')
+    return scoped({ kind: 'billing-orders' })
   }
   if (url.pathname === `${BILLING_PATH}/checkout`) {
     noQuery(url)
+    if (organizationId === undefined) throw new ApiFailure(404, 'not-found')
     return scoped({ kind: 'billing-checkout' })
   }
   if (url.pathname === AUDIT_PATH) {
@@ -1147,8 +1212,12 @@ function assertMethod(request: IncomingMessage, route: ApiRoute): void {
     if (request.method !== 'GET' && request.method !== 'POST') throw new ApiFailure(405, 'method-not-allowed', allowed)
     return
   }
-  if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
+  if (route.kind === 'billing-plans' || route.kind === 'billing-orders' || route.kind === 'billing-checkout') {
     const allowed = route.kind === 'billing-plans' ? 'GET' : 'POST'
+    if (route.kind === 'billing-orders') {
+      if (request.method !== 'GET') throw new ApiFailure(405, 'method-not-allowed', 'GET')
+      return
+    }
     if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
     return
   }
@@ -1408,14 +1477,21 @@ async function directoryAuthority(ctx: Context, request: IncomingMessage, signal
 }
 
 async function billingOwner(ctx: Context, request: IncomingMessage, signal: AbortSignal,
-  organizationId?: OrganizationId): Promise<DisclosureSubject> {
+  organizationId: OrganizationId): Promise<{
+  readonly identity: RegistryAuthenticatedIdentity
+  readonly account: RegistryAuthenticatedAccount
+}> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
-  if (account.subject.membership !== 'active' || account.subject.role !== 'owner') {
+  const [identity, account] = await Promise.all([
+    globalIdentity(ctx, request, signal),
+    requireAuthenticatedAccount(authenticator, request, signal, organizationId),
+  ])
+  if (identity.memberId !== account.subject.memberId || account.subject.organizationId !== organizationId
+    || account.subject.membership !== 'active' || account.subject.role !== 'owner') {
     throw new ApiFailure(404, 'not-found')
   }
-  return structuredClone(account.subject)
+  return { identity, account }
 }
 
 async function auditAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal,
@@ -1737,14 +1813,16 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
       }
       const checkoutInput = route.kind === 'billing-checkout'
         ? await billingInput(request, config, controller.signal) : undefined
+      const billingRoute = route.kind === 'billing-plans' || route.kind === 'billing-orders'
+        || route.kind === 'billing-checkout'
       const organizationId = 'organizationId' in route ? route.organizationId : undefined
       const anonymousTenantRoute = route.kind === 'binding-start' || route.kind === 'binding-confirm'
-      if (organizationId !== undefined && !anonymousTenantRoute) {
+      if (organizationId !== undefined && !anonymousTenantRoute && !billingRoute) {
         const authenticator = ctx.get('registryAccountAuthenticator')
         if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
         await requireAuthenticatedAccount(authenticator, request, controller.signal, organizationId)
       }
-      tenantLease = await tenantRuntime(ctx, organizationId)
+      tenantLease = billingRoute ? undefined : await tenantRuntime(ctx, organizationId)
       const selectedRuntime = tenantLease?.runtime
       if (route.kind === 'status') {
         const tenantRouterConfigured = ctx.get('registryTenantRouter') !== undefined
@@ -1949,10 +2027,13 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         succeed(response, directoryResult(value, authenticatedSubject.role, config.maxValueBytes))
         return
       }
-      if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
+      if (route.kind === 'billing-plans' || route.kind === 'billing-orders' || route.kind === 'billing-checkout') {
+        if (route.organizationId === undefined) throw new ApiFailure(404, 'not-found')
+        const { identity, account } = await billingOwner(ctx, request, controller.signal, route.organizationId)
+        const subject = account.subject
         const provider = ctx.get('registryBillingProvider')
-        if (provider === undefined) throw new ApiFailure(501, 'operation-not-configured')
-        const subject = await billingOwner(ctx, request, controller.signal, route.organizationId)
+        const router = ctx.get('registryTenantRouter')
+        if (provider === undefined || router === undefined) throw new ApiFailure(501, 'operation-not-configured')
         if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(subject.organizationId,
           subject.memberId), 'account')
         if (route.kind === 'billing-plans') {
@@ -1961,10 +2042,46 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           succeed(response, billingPlansResult(plans, config.maxValueBytes))
           return
         }
+        const accountId = brandString<RegistryAccountId>(identity.accountId)
+        if (route.kind === 'billing-orders') {
+          const orders = await router.tenancy.listBillingOrders(accountId, subject.memberId, route.organizationId)
+          requireOperationActive(controller.signal)
+          succeed(response, billingOrdersResult(orders, route.organizationId, config.maxValueBytes))
+          return
+        }
         if (checkoutInput === undefined) throw new ApiFailure(503, 'unavailable')
-        const checkout = await provider.createCheckout({ subject, ...checkoutInput }, controller.signal)
+        const plans = billingPlans(await provider.listPlans(subject, controller.signal))
         requireOperationActive(controller.signal)
-        succeed(response, billingCheckoutResult(checkout, config.maxValueBytes))
+        const plan = plans.find(candidate => candidate.planId === checkoutInput.planId)
+        if (plan === undefined) throw new ApiFailure(400, 'invalid-input')
+        const order = await router.tenancy.reserveBillingOrder(accountId, subject.memberId, {
+          organizationId: route.organizationId,
+          provider: provider.provider,
+          planId: plan.planId,
+          idempotencyKey: checkoutInput.idempotencyKey,
+          currency: plan.currency,
+          unitAmount: plan.unitAmount,
+          interval: plan.interval,
+        })
+        requireOperationActive(controller.signal)
+        if (order.state !== 'creating' && order.state !== 'checkout-pending') {
+          throw new ApiFailure(409, 'conflict')
+        }
+        const checkout = billingCheckout(await provider.createCheckout({
+          subject,
+          orderId: order.orderId,
+          ...checkoutInput,
+        }, controller.signal))
+        requireOperationActive(controller.signal)
+        const attached = await router.tenancy.attachBillingCheckout({
+          organizationId: route.organizationId,
+          orderId: order.orderId,
+          provider: provider.provider,
+          providerCheckoutId: checkout.checkoutId,
+          expiresAt: checkout.expiresAt,
+        })
+        requireOperationActive(controller.signal)
+        succeed(response, billingCheckoutResult(checkout, attached, config.maxValueBytes))
         return
       }
       if (route.kind === 'audit') {
