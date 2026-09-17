@@ -47,3 +47,15 @@ Harness 仍是单独安装的外部程序。`registry/harness-production-publica
 `registry/backup-registry-state.mjs`、`registry/backup-sqlite.mjs`、`registry/verify-registry-restore.mjs` 提供三库备份、摘要验证和隔离恢复检查。按各脚本的 `--help` 与生产环境模板使用，恢复到新路径，保留原介质。
 
 告警恢复演练工具 `verify-operational-alert-recovery.mjs` 需用 `node --import tsx/esm` 运行，并将 `REGISTRY_DRILL_TLS_DIR` 设为独立测试证书目录，包含 `ca.pem`、`server.pem`、`server-key.pem`，服务端证书必须包含 IP SAN `127.0.0.1`。本仓库不提交任何私钥；不要使用生产证书进行此演练。
+
+## 上线前需要部署者提供
+
+| 类别 | 必需输入 | 当前缺少时的行为 |
+| --- | --- | --- |
+| 组织与身份 | 正式组织 ID、初始 Owner 成员 ID/名称；正式 OIDC issuer、client ID、client secret、允许的回调地址，以及能稳定映射到成员 ID 的 claim | 保持身份未配置；本地 Keycloak 只能用于本机验收 |
+| Harness | 每台实例的稳定 instance ID、独立设备私钥与短期 token；仅授予需要的 `disclosure.sync`／`a2a.receive` scope；公网 WSS 地址与设备公钥登记 | 不能连接生产 Registry；不会退化为网页账号或共享测试密钥 |
+| 密钥管理 | 选定的生产 KMS／秘密管理服务、披露数据密钥的生成、作用域授权、轮换、恢复和销毁流程 | 不发布生产披露；不从仓库或普通 `.env` 读取披露私钥 |
+| 公网部署 | 正式域名、DNS 控制权、ACME 邮箱、HTTPS 告警接收地址、异机备份位置、Linux 服务账号和 PostgreSQL 生产连接信息 | 只允许回环本地运行；不宣称已公网可用 |
+| 支付（可选） | 是否首发收费；若收费，选择 Stripe／支付宝并提供商户账号、产品/Price、Webhook 验签资料、退款/税务/发票规则 | 支付 provider 保持关闭，方案和结账接口返回未配置，不产生交易 |
+
+秘密只写入部署平台的 secret store 或受限的主机文件，不要通过聊天发送，也不要提交到 Git。准备好非秘密项后，先填写 `registry.env.example`、`harness.env.example` 和 `edge.env.example` 的副本，再运行对应范围的 `check-production-environment.mjs`。
