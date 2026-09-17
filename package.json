@@ -16,6 +16,7 @@
     "build": "node scripts/build.mjs",
     "start": "node --import tsx/esm src/dsh.ts --profile registry",
     "test": "node --import tsx/esm --test tests/smoke.test.mjs tests/saas-device-auth.test.mjs tests/oidc-session-introspection.test.mjs tests/verify-registry-restore.test.mjs tests/backup-postgres-saas-state.test.mjs tests/production-deployment.test.mjs tests/production-graph.test.mjs tests/tenancy-policy-fingerprint.test.mjs tests/readiness.test.mjs tests/harness-compatibility.test.mjs tests/windows-enrollment-path-gate.test.mjs",
+    "test:harness-compatibility": "node --import tsx/esm --test tests/harness-compatibility.test.mjs",
     "verify:harness-compatibility": "node --import tsx/esm deploy/registry/verify-harness-compatibility.mjs"
   },
   "dependencies": {

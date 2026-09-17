@@ -47,12 +47,15 @@ node deploy/registry/enroll-registry-device.mjs export-env `
 npm run verify:harness-compatibility -- `
   --harness-root C:\path\to\deepseek-harness `
   --node-path C:\path\to\node.exe `
-  --overlay C:\path\to\dsh-a2a-registry\deploy\registry\harness-registry-connection.example.patch.yml
+  --overlay C:\path\to\dsh-a2a-registry\deploy\registry\harness-registry-connection.example.patch.yml `
+  --publication-overlay C:\path\to\dsh-a2a-registry\deploy\registry\harness-production-publication.example.patch.yml
 ```
 
-检查使用显式指定的目标 Node.js 24 或更高版本。Registry 会编码 `challenge`、`authenticated`、`heartbeat-ack` 和带签名固定检查点的 `import-dispatch`，交给目标 Harness 的源码与已构建 codec 解码；目标 codec 再编码无凭据的 `hello`、固定伪签名 `prove` 和 `heartbeat`，由 Registry 解码。随后目标源码和已构建 web-app 会用自己的 app-boot 解析传入的实际连接专用 overlay，并以 `ProductionRegistryConnectionConfigSchema` 校验其中的真实字段；最后已构建 CLI 在新建的临时工作目录和临时 `DSH_HOME` 内执行 `--dump-config`，确认该 overlay 确实合成为唯一的 connection-only `web-runtime`，完成后删除临时目录，不写目标 Harness 的真实 profile。
+检查使用显式指定的目标 Node.js 24 或更高版本。Registry 会生成内部一致且真实签名的披露事件与检查点，再把连接、披露注册回执、事件／检查点回执、导入派发／释放和纯文本问题派发、运行、完成、失败及授权释放的代表性 v1 服务端帧交给目标 Harness 的源码与已构建 codec 解码；目标 codec 会反向编码连接、披露注册／事件／检查点、导入完成／重试释放和问题运行／完成／失败等客户端帧，由 Registry 解码。
 
-检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名只验证 v1 codec 兼容，不证明 WSS 挑战已由真实设备私钥签署；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
+目标源码和已构建 web-app／session-controller 还会用各自的 app-boot 与 schema 分别解析实际 connection-only overlay 和完整 publication overlay。最后已构建 CLI 会为两层 overlay 分别创建临时工作目录与临时 `DSH_HOME` 执行 `--dump-config`：前者必须只合成生产连接，后者必须同时合成生产连接、披露发布、确定会话导入和手动纯文本问题消费，且不得混入测试或 loopback provider；完成后删除临时目录，不写目标 Harness 的真实 profile。
+
+检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名和静态状态分支只验证 v1 codec 与配置兼容，不证明 WSS 挑战已由真实设备私钥签署，也不把完成与失败样本解释成同一次真实请求的状态轨迹；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
 
 Windows 本地验收可在 `export-env` 后用 `start-bound-harness.ps1` 从独立的 Harness 源码 checkout 启动上述连接专用 overlay。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程，也不会修改 Harness 源码；CLI 从源码的已构建 `apps/cli/lib/bin.js` 读取，工作目录、DSH_HOME 和日志均在外部私有目录。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 
