@@ -44,6 +44,7 @@
       publicOrigin: !!js process.env.DSH_REGISTRY_PUBLIC_ORIGIN
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
       memberIdClaim: dsh_member_id
+      legacyOwnerSubject: !!js process.env.DSH_REGISTRY_LEGACY_OWNER_SUBJECT
       scopes: openid profile email
       sessionTtlMs: 3600000
       transactionTtlMs: 300000

@@ -17,7 +17,33 @@ powershell -ExecutionPolicy Bypass -File scripts/local-postgres.ps1 Backup
 
 `Prepare` 可在 Docker 未启动时准备首次本地凭据。密码随机生成，仅存于忽略目录 `.artifacts/postgres/private`；`connection.env` 保存应用连接串，但不会自动覆盖根目录环境文件。不要把此目录、连接串或数据库备份发到 GitHub。
 
-应用账号不是超级管理员，不能创建其他数据库／角色，只能连接 `registry` 并在自己的 `registry` schema 内建表和读写。当前 Registry 领域表是通用 KV 行，组织隔离仍由单组织进程和应用授权负责；不能把 PostgreSQL 接入视为多租户 RLS 已完成。
+应用账号不是超级管理员，不能创建其他数据库／角色，只能连接 `registry` 并在自己的 `registry` schema 内建表和读写。PostgreSQL KV schema v2 在三张领域表上保存 `tenant_id`，并使用强制 RLS 和复合主外键隔离租户。上层仍必须给每个组织传入正确的 `tenantId`；未传时只会进入保留的空字符串全局作用域，不能把这个兼容作用域当作组织路由。
+
+当前数据面仍由单个 Registry 进程持有内存快照和排他写入队列。一个数据库只能连接一个业务副本；不能双实例滚动发布或水平扩容。升级时先停旧进程，再启动新进程并完成探针验证。
+
+## schema v1 升级到 v2
+
+先停止全部 Registry 进程并运行 `Backup`，在隔离数据库验证备份可恢复。已有 v1 数据不能靠 JSON 猜组织：第一次用新版后端启动时，必须在 PostgreSQL 插件配置中显式设置 `legacyTenantId`，而且它必须与旧站运行时的 `ingest.organizationId`（部署变量 `DSH_REGISTRY_ORGANIZATION_ID`）逐字一致。首次迁移只启动一个新版进程；不要生成新 ID，也不要让两个实例并发迁移。迁移在一个事务内增加租户列、回填旧行、替换复合主外键、启用并强制 RLS，最后才把 schema 版本写成 2；失败会回滚到 v1。
+
+需要运维人员离线执行时，可以使用：
+
+```powershell
+$legacyTenant = '<旧数据唯一所属的租户 ID>'
+Get-Content -Raw deploy/postgres/migrations/002-tenant-scope-rls.sql | `
+  docker.exe --context desktop-linux compose -f deploy/postgres/compose.yaml exec -T postgres `
+  psql -U postgres -d registry -v ON_ERROR_STOP=1 "--set=legacy_tenant_id=$legacyTenant"
+```
+
+脚本和应用内迁移二选一，不能并发执行。首次启动后至少确认：`storage_meta.schema_version = 2`；三张领域表都同时启用 `relrowsecurity` 与 `relforcerowsecurity`；`units` 中只有预期的旧组织 ID；应用账号既不是超级管理员也没有 `BYPASSRLS`；旧组织页面仍能读到原数据，并且新建第二个组织后双方数据互不可见。确认无误后可删除临时 `legacyTenantId` 配置。回滚必须停止新版进程并恢复升级前备份；不要手工删除租户列或降低 `storage_meta` 版本。
+
+```sql
+select schema_version from registry.storage_meta where singleton = true;
+select tenant_id, count(*) from registry.units group by tenant_id order by tenant_id;
+select relname, relrowsecurity, relforcerowsecurity
+from pg_class where oid in ('registry.units'::regclass, 'registry.unit_globals'::regclass,
+  'registry.unit_records'::regclass) order by relname;
+select rolname, rolsuper, rolbypassrls from pg_roles where rolname = 'registry_app';
+```
 
 ## 注册站接入与迁移
 

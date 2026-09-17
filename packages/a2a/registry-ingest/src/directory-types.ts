@@ -30,8 +30,8 @@ export interface RegistryDirectoryConfig {
   readonly maxTeamMembers: number
   readonly maxNameBytes: number
   readonly maxBytes: number
-  /** Used only when the domain is empty; changing configuration does not replace an existing owner. */
-  readonly bootstrapOwner: { readonly memberId: MemberId; readonly displayName: string }
+  /** Used only when the domain is empty. Omission requires an existing directory and fails closed otherwise. */
+  readonly bootstrapOwner?: { readonly memberId: MemberId; readonly displayName: string }
 }
 
 /** Commands enter the serialized owner with an expected directory revision. */

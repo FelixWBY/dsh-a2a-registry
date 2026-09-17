@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react'
 import type { RegistryPageProps } from './contract.ts'
+import { organizationHref } from './navigation.ts'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import type { RegistryConfigurationState, RegistryRuntimeStatus } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type SettingsPageProps = Pick<RegistryPageProps, 't' | 'useTheme' | 'setTheme' | 'localTestIdentityBanner' | 'readStatus'>
+type SettingsPageProps = Pick<RegistryPageProps, 't' | 'useTheme' | 'setTheme' | 'localTestIdentityBanner' | 'readStatus'> & {
+  readonly organizationId: string
+}
 type SettingsState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'retry' }
@@ -27,7 +30,7 @@ function statusKey(state: RegistryConfigurationState, localTest: boolean): 'stat
 }
 
 /** Render runtime-confirmed setup facts without treating local test identity as production sign-in. */
-export function SettingsPage({ t, useTheme, setTheme, localTestIdentityBanner, readStatus }: SettingsPageProps) {
+export function SettingsPage({ organizationId, t, useTheme, setTheme, localTestIdentityBanner, readStatus }: SettingsPageProps) {
   const preference = useTheme(snapshot => snapshot.preference)
   const [requestRevision, setRequestRevision] = useState(0)
   const [state, setState] = useState<SettingsState>({ kind: 'loading' })
@@ -72,7 +75,7 @@ export function SettingsPage({ t, useTheme, setTheme, localTestIdentityBanner, r
             ? fields.every(field => state.status[field] === 'configured') ? 'configured' : 'unconfigured'
             : null
           const configured = status === 'configured' && !localTest
-          return <div className={css.requirement} key={titleKey}><dt>{t(titleKey)}</dt><dd>{t(bodyKey)}{fields[0] === 'deviceBinding' ? <p><a href="#/binding">{t('bindingScopeLink')}</a></p> : null}</dd><dd className={configured ? css.overviewConfigured : css.overviewUnconfigured}>{t(status === null ? 'statusUnknown' : statusKey(status, localTest))}</dd></div>
+          return <div className={css.requirement} key={titleKey}><dt>{t(titleKey)}</dt><dd>{t(bodyKey)}{fields[0] === 'deviceBinding' ? <p><a href={organizationHref(organizationId, 'binding')}>{t('bindingScopeLink')}</a></p> : null}</dd><dd className={configured ? css.overviewConfigured : css.overviewUnconfigured}>{t(status === null ? 'statusUnknown' : statusKey(status, localTest))}</dd></div>
         })}</dl>
       </section>
       <div className={css.notice}><RegistryIcon name="info" /><p>{t('securityNote')}</p></div>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { disclosureHref, organizationHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
@@ -11,7 +12,8 @@ import {
 } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type NodeDetailProps = Pick<RegistryPageProps, 't' | 'listInstances' | 'listDisclosures'> & {
+type NodeDetailProps = Pick<RegistryOrganizationPageProps, 't' | 'listInstances' | 'listDisclosures'> & {
+  readonly organizationId: string
   readonly instanceId: string
 }
 
@@ -60,7 +62,7 @@ function isoTimestamp(value: number): string | undefined {
 }
 
 /** Account-authorized node facts and only the currently loaded disclosures from that node. */
-export function NodeDetailPage({ instanceId, t, listInstances, listDisclosures }: NodeDetailProps) {
+export function NodeDetailPage({ organizationId, instanceId, t, listInstances, listDisclosures }: NodeDetailProps) {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<NodeDetailState>({ kind: 'loading' })
   const moreController = useRef<AbortController | null>(null)
@@ -121,7 +123,7 @@ export function NodeDetailPage({ instanceId, t, listInstances, listDisclosures }
   if (state.kind === 'accessLoss') return <AccessLossPage t={t} />
   return <section>
     <div className={css.pageHeading}>
-      <a className={css.backLink} href="#/nodes">← {t('backToNodes')}</a>
+      <a className={css.backLink} href={organizationHref(organizationId, 'nodes')}>← {t('backToNodes')}</a>
       <h1>{t('nodeDetail')}</h1>
       <p>{t('nodeDetailDescription')}</p>
     </div>
@@ -140,7 +142,7 @@ export function NodeDetailPage({ instanceId, t, listInstances, listDisclosures }
           <span className={state.node.phase === 'confirmed' ? css.nodePhaseActive : css.nodePhaseRevoked}>
             {t(state.node.phase === 'confirmed' ? 'nodeConfirmed' : 'nodeRevoked')}
           </span>
-          <a className={css.secondaryButton} href="#/nodes">{t('manageNodeBindings')}</a>
+          <a className={css.secondaryButton} href={organizationHref(organizationId, 'nodes')}>{t('manageNodeBindings')}</a>
         </div>
       </article>
 
@@ -175,12 +177,12 @@ export function NodeDetailPage({ instanceId, t, listInstances, listDisclosures }
               <table className={`${css.table} ${css.responsiveTable}`}>
                 <thead><tr>{(['disclosureId', 'controlState', 'producerState', 'checkpoint', 'expiry', 'actions'] as const).map(key => <th scope="col" key={key}>{t(key)}</th>)}</tr></thead>
                 <tbody>{state.disclosures.map(item => <tr key={item.disclosureId}>
-                  <td data-label={t('disclosureId')}><a className={css.metadataLink} href={`#/disclosures/${encodeURIComponent(item.disclosureId)}`}><bdi className={css.tableIdentifier} title={item.disclosureId}>{item.disclosureId}</bdi></a></td>
+                  <td data-label={t('disclosureId')}><a className={css.metadataLink} href={disclosureHref(organizationId, item.disclosureId)}><bdi className={css.tableIdentifier} title={item.disclosureId}>{item.disclosureId}</bdi></a></td>
                   <td data-label={t('controlState')}><code>{item.control}</code></td>
                   <td data-label={t('producerState')}><code>{item.producer}</code></td>
                   <td data-label={t('checkpoint')}>{t('checkpointSummary', { policyVersion: item.checkpoint.policyVersion, eventCount: item.checkpoint.eventCount })}</td>
                   <td data-label={t('expiry')}><time dateTime={isoTimestamp(item.expiresAt)}>{disclosureTime(item.expiresAt)}</time></td>
-                  <td data-label={t('actions')}><a className={css.rowAction} href={`#/disclosures/${encodeURIComponent(item.disclosureId)}`}>{t('viewDetails')}</a></td>
+                  <td data-label={t('actions')}><a className={css.rowAction} href={disclosureHref(organizationId, item.disclosureId)}>{t('viewDetails')}</a></td>
                 </tr>)}</tbody>
               </table>
             </div>

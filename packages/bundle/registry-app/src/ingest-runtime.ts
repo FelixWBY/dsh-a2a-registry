@@ -4,7 +4,8 @@ import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { RegistryIngestError, type RegistryAuditConfig, type RegistryBindingConfig,
-  type RegistryDirectoryConfig, type RegistryIngestLimits } from '@deepseek-ai/dsh-a2a-registry-ingest'
+  type RegistryDirectoryConfig, type RegistryIngestLimits,
+  type RegistryIngestStorageScope } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import { decodeRegistryAudience } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type {} from '@deepseek-ai/dsh-storage-domain'
@@ -142,44 +143,57 @@ function auditPage(records: ReturnType<import('@deepseek-ai/dsh-a2a-registry-ing
   return structuredClone(page)
 }
 
-/** Mount the shared owner; identity is required only for explicitly enabled synchronization.
- * @param ctx - Private lifecycle context with the configured storage facility.
- * @param config - Validated explicit consumers and resource limits.
- * @returns Startup after durable organization ownership is verified, before any consumer is published. */
-export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): Promise<void> {
+/** One organization-owned runtime. A tenant router may hold many of these without replacing global services. */
+export interface RegistryTenantRuntime {
+  readonly organizationId: OrganizationId
+  readonly store: RegistryRuntimeStore
+  readonly control: RegistryDisclosureControl
+  readonly reader: RegistryDisclosureReader
+  readonly auditReader?: RegistryAuditReader
+  readonly directory?: RegistryDirectory
+  readonly enrollment?: RegistryEnrollment
+  readonly signal: AbortSignal
+  readonly reportRateLimit?: (scope: RegistryOperationalRateLimitScope) => void
+  close(): Promise<void>
+}
+
+export interface RegistryTenantRuntimeOpenOptions {
+  readonly storage?: RegistryIngestStorageScope
+  /** A multi-tenant router owns one shared exporter instead of opening the same outbox per organization. */
+  readonly alerts?: RegistryOperationalAlertExporter
+}
+
+/** Open one isolated organization runtime without publishing process-global Cordis services. */
+export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIngestRuntimeConfig,
+  openOptions: RegistryTenantRuntimeOpenOptions = {}): Promise<RegistryTenantRuntime> {
   const options = structuredClone(config)
-  const provider = ctx.get('registryProducerAuthenticator')
-  let sync: { config: RegistrySyncConfig; provider: NonNullable<typeof provider> } | undefined
-  if (options.sync !== undefined) {
-    if (provider === undefined) throw new Error('Registry sync requires registryProducerAuthenticator')
-    sync = { config: options.sync, provider }
-  }
   const abort = new AbortController()
-  const alerts = options.alerts === undefined ? undefined : new RegistryOperationalAlertExporter(ctx, options.alerts)
+  const ownAlerts = openOptions.alerts === undefined && options.alerts !== undefined
+  const alerts = openOptions.alerts ?? (options.alerts === undefined
+    ? undefined : new RegistryOperationalAlertExporter(ctx, options.alerts))
   const store = new RegistryRuntimeStore(ctx, ctx.storageDomain, options.organizationId, options.limits, abort,
-    options.audit, options.directory, options.bindings, alerts)
-  let stopSync: (() => Promise<void>) | undefined
+    options.audit, options.directory, options.bindings, alerts, openOptions.storage)
   let worker = Promise.resolve()
-  ctx.effect(() => {
-    return async () => {
+  let closing: Promise<void> | undefined
+  const close = (): Promise<void> => {
+    closing ??= (async () => {
       abort.abort()
-      const outcomes = await Promise.allSettled([stopSync?.(), worker, store.close()])
-      const alertOutcomes = await Promise.allSettled([alerts?.close()])
-      if ([...outcomes, ...alertOutcomes].some(outcome => outcome.status === 'rejected')) {
-        ctx.logger.error('Registry ingest runtime cleanup failed')
+      const outcomes = await Promise.allSettled([worker, store.close(), ownAlerts ? alerts?.close() : undefined])
+      if (outcomes.some(outcome => outcome.status === 'rejected')) {
+        ctx.logger.error('Registry tenant runtime cleanup failed')
+        throw new Error('Registry tenant runtime cleanup failed')
       }
-    }
-  }, 'registry-app: exclusive ingest lifecycle')
-  await store.run(async () => {})
-  if (!store.active()) throw new RegistryIngestError('closed')
-  if (alerts !== undefined) {
-    ctx.provide('registryOperationalAlertReporter', Object.freeze({
-      reportRateLimit: (scope: RegistryOperationalRateLimitScope) => {
-        alerts.reportRateLimit(options.organizationId, scope)
-      },
-    }))
+    })()
+    return closing
   }
-  const control: RegistryDisclosureControl = {
+  try {
+    await store.run(async () => {})
+    if (!store.active()) throw new RegistryIngestError('closed')
+  } catch (error) {
+    await close().catch(() => undefined)
+    throw error
+  }
+  const control = Object.freeze<RegistryDisclosureControl>({
     register(authority, registration) {
       let captured: typeof registration
       try { captured = structuredClone(registration) } catch {
@@ -198,9 +212,8 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
     transitionControl: (authority, id, target, expectedVersion) =>
       store.run(ingest => ingest.transitionControl(authority, id, target, expectedVersion)),
     delete: (authority, id, expectedVersion) => store.run(ingest => ingest.delete(authority, id, expectedVersion)),
-  }
-  ctx.provide('registryDisclosureControl', Object.freeze(control))
-  const reader: RegistryDisclosureReader = {
+  })
+  const reader = Object.freeze<RegistryDisclosureReader>({
     list: (authority, options) => store.run(ingest => ingest.listMetadata(authority, options)),
     readMetadata: (authority, disclosureId, action, options) =>
       store.run(ingest => ingest.readMetadataWithResolver(authority, disclosureId, action, options)),
@@ -236,10 +249,9 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
       }
       return callback({ metadata, prefix })
     }),
-  }
-  ctx.provide('registryDisclosureReader', Object.freeze(reader))
-  if (options.audit !== undefined) {
-    const auditReader: RegistryAuditReader = {
+  })
+  const auditReader: RegistryAuditReader | undefined = options.audit === undefined ? undefined
+    : Object.freeze<RegistryAuditReader>({
       list: (authority: FreshRegistryAuditAuthority, listOptions) => store.run(async (ingest) => {
         let subject: Awaited<ReturnType<FreshRegistryAuditAuthority>>
         try { subject = await authority() } catch { throw new RegistryIngestError('not-found') }
@@ -249,11 +261,9 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
         }
         return auditPage(ingest.inspectAudit(), listOptions)
       }),
-    }
-    ctx.provide('registryAuditReader', Object.freeze(auditReader))
-  }
-  if (options.directory !== undefined) {
-    const directory: RegistryDirectory = {
+    })
+  const directory: RegistryDirectory | undefined = options.directory === undefined ? undefined
+    : Object.freeze<RegistryDirectory>({
       read: (authority, scope, maxResponseBytes) => store.run(ingest => ingest.readDirectory(authority, scope, maxResponseBytes)),
       change(authority, command, expectedRevision) {
         let captured: typeof command
@@ -262,11 +272,9 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
         }
         return store.run(ingest => ingest.changeDirectory(authority, captured, expectedRevision))
       },
-    }
-    ctx.provide('registryDirectory', Object.freeze(directory))
-  }
-  if (options.bindings !== undefined) {
-    const enrollment: RegistryEnrollment = {
+    })
+  const enrollment: RegistryEnrollment | undefined = options.bindings === undefined ? undefined
+    : Object.freeze<RegistryEnrollment>({
       start(request) {
         let captured: typeof request
         try { captured = structuredClone(request) } catch {
@@ -297,11 +305,48 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
         }
         return store.run(ingest => ingest.confirmBinding(bindingId, captured))
       },
-    }
-    ctx.provide('registryEnrollment', Object.freeze(enrollment))
-  }
-  if (sync !== undefined) stopSync = installRegistrySync(ctx, sync.config, sync.provider, store, abort.signal)
+    })
   if (options.maintenance !== undefined) {
     worker = runRegistryMaintenance(ctx, options.organizationId, options.maintenance, store, abort.signal)
+  }
+  return Object.freeze({
+    organizationId: options.organizationId,
+    store,
+    control,
+    reader,
+    ...(auditReader === undefined ? {} : { auditReader }),
+    ...(directory === undefined ? {} : { directory }),
+    ...(enrollment === undefined ? {} : { enrollment }),
+    signal: abort.signal,
+    ...(alerts === undefined ? {} : {
+      reportRateLimit: (scope: RegistryOperationalRateLimitScope) => { alerts.reportRateLimit(options.organizationId, scope) },
+    }),
+    close,
+  })
+}
+
+/** Mount one legacy fixed-organization owner and publish its services process-wide. */
+export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): Promise<void> {
+  const options = structuredClone(config)
+  const provider = ctx.get('registryProducerAuthenticator')
+  let sync: { config: RegistrySyncConfig; provider: NonNullable<typeof provider> } | undefined
+  if (options.sync !== undefined) {
+    if (provider === undefined) throw new Error('Registry sync requires registryProducerAuthenticator')
+    sync = { config: options.sync, provider }
+  }
+  const runtime = await openRegistryTenantRuntime(ctx, options)
+  let stopSync: (() => Promise<void>) | undefined
+  if (sync !== undefined) stopSync = installRegistrySync(ctx, sync.config, sync.provider, runtime.store, runtime.signal)
+  ctx.effect(() => async () => {
+    const outcomes = await Promise.allSettled([stopSync?.(), runtime.close()])
+    if (outcomes.some(outcome => outcome.status === 'rejected')) ctx.logger.error('Registry ingest runtime cleanup failed')
+  }, 'registry-app: exclusive ingest lifecycle')
+  ctx.provide('registryDisclosureControl', runtime.control)
+  ctx.provide('registryDisclosureReader', runtime.reader)
+  if (runtime.auditReader !== undefined) ctx.provide('registryAuditReader', runtime.auditReader)
+  if (runtime.directory !== undefined) ctx.provide('registryDirectory', runtime.directory)
+  if (runtime.enrollment !== undefined) ctx.provide('registryEnrollment', runtime.enrollment)
+  if (runtime.reportRateLimit !== undefined) {
+    ctx.provide('registryOperationalAlertReporter', Object.freeze({ reportRateLimit: runtime.reportRateLimit }))
   }
 }

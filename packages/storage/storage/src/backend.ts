@@ -46,6 +46,12 @@ export interface KvFacet {
 export interface KvUnitDescriptor {
   /** Unit name; must match {@link UNIT_NAME_RE}. Also the file-name / SQL-identifier segment. */
   readonly name: string
+  /**
+   * Optional physical tenant scope. Backends without tenant-aware isolation may
+   * ignore it; tenant-aware backends must include it in every durable identity.
+   * Absence denotes the backend's reserved global scope.
+   */
+  readonly tenantId?: string
   /** Unit format version; a non-negative integer stamped on the medium at first materialization. */
   readonly version: number
   /** Table names; each must match {@link UNIT_NAME_RE}. */

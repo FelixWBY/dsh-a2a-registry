@@ -35,6 +35,8 @@ export interface DomainTableSpec<K extends string = string, V = unknown> {
 export interface DomainSpec {
   /** Domain name; must match `UNIT_NAME_RE` (doubles as the backend unit name). */
   readonly name: string
+  /** Optional physical tenant scope; absence selects the backend's reserved global scope. */
+  readonly tenantId?: string
   /** Current domain format version; reads enforce it according to the selected layout. */
   readonly version: number
   /**
@@ -111,6 +113,9 @@ export function defineDomain<S extends DomainSpec>(spec: S): S {
   if (!Number.isInteger(spec.version) || spec.version < 0) {
     throw new Error(`domain '${spec.name}' version must be a non-negative integer, got ${spec.version}`)
   }
+  if (spec.tenantId !== undefined && typeof spec.tenantId !== 'string') {
+    throw new Error(`domain '${spec.name}' tenantId must be a string when present`)
+  }
   for (const compat of spec.compatibleVersions ?? []) {
     if (!Number.isInteger(compat) || compat < 0 || compat >= spec.version) {
       throw new Error(
@@ -154,6 +159,7 @@ export function defineDomain<S extends DomainSpec>(spec: S): S {
 export function descriptorOf(spec: DomainSpec): KvUnitDescriptor {
   return {
     name: spec.name,
+    ...(spec.tenantId === undefined ? {} : { tenantId: spec.tenantId }),
     version: spec.version,
     tables: Object.keys(spec.tables),
     hasGlobal: spec.global !== undefined,

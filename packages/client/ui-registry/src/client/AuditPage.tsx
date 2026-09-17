@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryAuditActorKind, type RegistryAuditMetadata } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type AuditProps = Pick<RegistryPageProps, 't' | 'listAudit'>
+type AuditProps = Pick<RegistryOrganizationPageProps, 't' | 'listAudit'>
 type AuditState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }

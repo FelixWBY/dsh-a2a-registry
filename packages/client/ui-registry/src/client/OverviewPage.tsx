@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react'
 import type { RegistryPageProps } from './contract.ts'
+import { organizationHref } from './navigation.ts'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import type { RegistryConfigurationState, RegistryRuntimeStatus } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type OverviewProps = Pick<RegistryPageProps, 't' | 'localTestIdentityBanner' | 'readStatus'>
+type OverviewProps = Pick<RegistryPageProps, 't' | 'localTestIdentityBanner' | 'readStatus'> & {
+  readonly organizationId: string
+}
 type OverviewState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'retry' }
@@ -45,7 +48,7 @@ function statusKey(state: RegistryConfigurationState, localTest: boolean): 'stat
 }
 
 /** Truthful startup configuration overview; it never turns configuration into a health claim. */
-export function OverviewPage({ t, localTestIdentityBanner, readStatus }: OverviewProps) {
+export function OverviewPage({ organizationId, t, localTestIdentityBanner, readStatus }: OverviewProps) {
   const [requestRevision, setRequestRevision] = useState(0)
   const [state, setState] = useState<OverviewState>({ kind: 'loading' })
 
@@ -91,7 +94,7 @@ export function OverviewPage({ t, localTestIdentityBanner, readStatus }: Overvie
         <h2>{t('overviewQuickLinks')}</h2><p>{t('overviewQuickLinksDescription')}</p>
       </div>
       <nav className={css.overviewLinks} aria-label={t('overviewQuickLinks')}>
-        {QUICK_LINKS.map(item => <a key={item.page} href={`#/${item.page}`}>
+        {QUICK_LINKS.map(item => <a key={item.page} href={organizationHref(organizationId, item.page)}>
           <RegistryIcon name={item.page} />
           <span><strong>{t(item.page)}</strong><small>{t(item.descriptionKey)}</small></span>
           <RegistryIcon name="arrowRight" />

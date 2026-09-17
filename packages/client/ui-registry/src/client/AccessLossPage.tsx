@@ -10,8 +10,8 @@ export function AccessLossPage({ t }: Pick<RegistryPageProps, 't'>) {
       <h1 id="registry-access-loss-title">{t('accessDenied')}</h1>
       <p>{t('accessDescription')}</p>
       <div className={css.accessActions}>
-        <a className={css.primaryAction} href="#/disclosures">{t('backToDisclosures')}</a>
-        <a className={css.secondaryAction} href="#/overview">{t('backToOverview')}</a>
+        <a className={css.primaryAction} href="#/">{t('backToDisclosures')}</a>
+        <a className={css.secondaryAction} href="#/">{t('backToOverview')}</a>
       </div>
     </section>
   )

@@ -30,32 +30,47 @@ export function apply(ctx: Context, config: Config = Config({})): void {
   }
   const api = createRegistryApi()
   const readStatus: RegistryPageInjected['readStatus'] = signal => api.readStatus(signal)
-  const readDirectory: RegistryPageInjected['readDirectory'] = signal => api.readDirectory(signal)
-  const changeDirectory: RegistryPageInjected['changeDirectory'] = (expectedRevision, change, signal) =>
-    api.changeDirectory(expectedRevision, change, signal)
-  const listInstances: RegistryPageInjected['listInstances'] = signal => api.listInstances(signal)
-  const renameInstance: RegistryPageInjected['renameInstance'] = (bindingId, instanceName, signal) =>
-    api.renameInstance(bindingId, instanceName, signal)
-  const revokeInstance: RegistryPageInjected['revokeInstance'] = (bindingId, signal) =>
-    api.revokeInstance(bindingId, signal)
-  const reviewBinding: RegistryPageInjected['reviewBinding'] = (bindingId, code, signal) =>
-    api.reviewBinding(bindingId, code, signal)
-  const approveBinding: RegistryPageInjected['approveBinding'] = (bindingId, code, instanceName, signal) =>
-    api.approveBinding(bindingId, code, instanceName, signal)
-  const rejectBinding: RegistryPageInjected['rejectBinding'] = (bindingId, code, signal) =>
-    api.rejectBinding(bindingId, code, signal)
-  const listAudit: RegistryPageInjected['listAudit'] = (request, signal) => api.listAudit(request, signal)
-  const listBranches: RegistryPageInjected['listBranches'] = (request, signal) => api.listBranches(request, signal)
-  const listDisclosures: RegistryPageInjected['listDisclosures'] = (request, signal) => api.listDisclosures(request, signal)
-  const readDisclosure: RegistryPageInjected['readDisclosure'] = (disclosureId, signal) => api.readDisclosure(disclosureId, signal)
-  const readDisclosureContent: RegistryPageInjected['readDisclosureContent'] = (disclosureId, checkpointHash, signal) =>
-    api.readDisclosureContent(disclosureId, checkpointHash, signal)
-  const listImportTargets: RegistryPageInjected['listImportTargets'] = (disclosureId, signal) => api.listImportTargets(disclosureId, signal)
-  const importDisclosure: RegistryPageInjected['importDisclosure'] = (disclosureId, request, signal) => api.importDisclosure(disclosureId, request, signal)
-  const readImport: RegistryPageInjected['readImport'] = (disclosureId, operationId, signal) => api.readImport(disclosureId, operationId, signal)
-  const askDisclosure: RegistryPageInjected['askDisclosure'] = (disclosureId, request, signal) => api.askDisclosure(disclosureId, request, signal)
-  const readQuestion: RegistryPageInjected['readQuestion'] = (disclosureId, requestId, signal) => api.readQuestion(disclosureId, requestId, signal)
-  const cancelQuestion: RegistryPageInjected['cancelQuestion'] = (disclosureId, requestId, signal) => api.cancelQuestion(disclosureId, requestId, signal)
+  const createOrganization: RegistryPageInjected['createOrganization'] = (request, signal) =>
+    api.createOrganization(request, signal)
+  const readDirectory: RegistryPageInjected['readDirectory'] = (organizationId, signal) =>
+    api.readDirectory(organizationId, signal)
+  const changeDirectory: RegistryPageInjected['changeDirectory'] = (organizationId, expectedRevision, change, signal) =>
+    api.changeDirectory(organizationId, expectedRevision, change, signal)
+  const listInstances: RegistryPageInjected['listInstances'] = (organizationId, signal) =>
+    api.listInstances(organizationId, signal)
+  const renameInstance: RegistryPageInjected['renameInstance'] = (organizationId, bindingId, instanceName, signal) =>
+    api.renameInstance(organizationId, bindingId, instanceName, signal)
+  const revokeInstance: RegistryPageInjected['revokeInstance'] = (organizationId, bindingId, signal) =>
+    api.revokeInstance(organizationId, bindingId, signal)
+  const reviewBinding: RegistryPageInjected['reviewBinding'] = (organizationId, bindingId, code, signal) =>
+    api.reviewBinding(organizationId, bindingId, code, signal)
+  const approveBinding: RegistryPageInjected['approveBinding'] = (organizationId, bindingId, code, instanceName, signal) =>
+    api.approveBinding(organizationId, bindingId, code, instanceName, signal)
+  const rejectBinding: RegistryPageInjected['rejectBinding'] = (organizationId, bindingId, code, signal) =>
+    api.rejectBinding(organizationId, bindingId, code, signal)
+  const listAudit: RegistryPageInjected['listAudit'] = (organizationId, request, signal) =>
+    api.listAudit(organizationId, request, signal)
+  const listBranches: RegistryPageInjected['listBranches'] = (organizationId, request, signal) =>
+    api.listBranches(organizationId, request, signal)
+  const listDisclosures: RegistryPageInjected['listDisclosures'] = (organizationId, request, signal) =>
+    api.listDisclosures(organizationId, request, signal)
+  const readDisclosure: RegistryPageInjected['readDisclosure'] = (organizationId, disclosureId, signal) =>
+    api.readDisclosure(organizationId, disclosureId, signal)
+  const readDisclosureContent: RegistryPageInjected['readDisclosureContent'] =
+    (organizationId, disclosureId, checkpointHash, signal) =>
+      api.readDisclosureContent(organizationId, disclosureId, checkpointHash, signal)
+  const listImportTargets: RegistryPageInjected['listImportTargets'] = (organizationId, disclosureId, signal) =>
+    api.listImportTargets(organizationId, disclosureId, signal)
+  const importDisclosure: RegistryPageInjected['importDisclosure'] = (organizationId, disclosureId, request, signal) =>
+    api.importDisclosure(organizationId, disclosureId, request, signal)
+  const readImport: RegistryPageInjected['readImport'] = (organizationId, disclosureId, operationId, signal) =>
+    api.readImport(organizationId, disclosureId, operationId, signal)
+  const askDisclosure: RegistryPageInjected['askDisclosure'] = (organizationId, disclosureId, request, signal) =>
+    api.askDisclosure(organizationId, disclosureId, request, signal)
+  const readQuestion: RegistryPageInjected['readQuestion'] = (organizationId, disclosureId, requestId, signal) =>
+    api.readQuestion(organizationId, disclosureId, requestId, signal)
+  const cancelQuestion: RegistryPageInjected['cancelQuestion'] = (organizationId, disclosureId, requestId, signal) =>
+    api.cancelQuestion(organizationId, disclosureId, requestId, signal)
   const page = createSnapshotStore(parseRegistryPage(typeof window === 'undefined' ? '' : window.location.hash))
   const theme = createSnapshotStore(ctx.theme.getTheme())
   ctx.on('theme/change', (snapshot) => { theme.set(snapshot) })
@@ -73,6 +88,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       hooks: { page, locale: ctx.locale },
       setLocale: (id) => { ctx.locale.setLocale(id) },
       localTestIdentityBanner: config.localTestIdentityBanner,
+      readAccount: signal => api.readAccount(signal),
     }),
   }, RegistryRoot)
   ctx.slots.register({
@@ -82,6 +98,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       setTheme: (preference) => { ctx.theme.setTheme(preference) },
       localTestIdentityBanner: config.localTestIdentityBanner,
       readStatus,
+      createOrganization,
       readDirectory,
       changeDirectory,
       listInstances,

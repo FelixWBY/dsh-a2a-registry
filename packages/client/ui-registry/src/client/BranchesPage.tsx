@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { questionHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryA2aRequestMetadata, type RegistryQuestionStatus } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type BranchesProps = Pick<RegistryPageProps, 't' | 'listBranches'>
+type BranchesProps = Pick<RegistryOrganizationPageProps, 't' | 'listBranches'> & { readonly organizationId: string }
 type BranchesState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }
@@ -51,9 +52,10 @@ function displayTime(value: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function RequestRows({ items, t }: { readonly items: readonly RegistryA2aRequestMetadata[]; readonly t: BranchesProps['t'] }) {
+function RequestRows({ organizationId, items, t }:
+  { readonly organizationId: string; readonly items: readonly RegistryA2aRequestMetadata[]; readonly t: BranchesProps['t'] }) {
   return <>{items.map((item) => {
-    const href = `#/disclosures/${encodeURIComponent(item.disclosureId)}/questions/${encodeURIComponent(item.requestId)}`
+    const href = questionHref(organizationId, item.disclosureId, item.requestId)
     return <tr key={item.requestId}>
       <td data-label={t('requestId')}><a className={css.metadataLink} href={href}><bdi className={css.tableIdentifier} title={item.requestId}>{item.requestId}</bdi></a></td>
       <td data-label={t('disclosureId')}><bdi className={css.tableIdentifier} title={item.disclosureId}>{item.disclosureId}</bdi></td>
@@ -68,7 +70,7 @@ function RequestRows({ items, t }: { readonly items: readonly RegistryA2aRequest
 }
 
 /** Authorized, body-free question discovery; each detail click crosses the Host authorization boundary again. */
-export function BranchesPage({ t, listBranches }: BranchesProps) {
+export function BranchesPage({ organizationId, t, listBranches }: BranchesProps) {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<BranchesState>({ kind: 'loading' })
   const moreController = useRef<AbortController | null>(null)
@@ -128,7 +130,7 @@ export function BranchesPage({ t, listBranches }: BranchesProps) {
         <div className={`${css.tableScroll} ${css.responsiveTableScroll}`} tabIndex={0} role="region" aria-label={t('branchRequests')}>
           <table className={`${css.table} ${css.responsiveTable} ${css.branchTable}`}>
             <thead><tr>{(['requestId', 'disclosureId', 'sourceInstance', 'checkpointHash', 'operationStatus', 'lastActivity', 'expiry', 'actions'] as const).map(column => <th scope="col" key={column}>{t(column)}</th>)}</tr></thead>
-            <tbody><RequestRows items={state.items} t={t} /></tbody>
+            <tbody><RequestRows organizationId={organizationId} items={state.items} t={t} /></tbody>
           </table>
         </div>
       </div>

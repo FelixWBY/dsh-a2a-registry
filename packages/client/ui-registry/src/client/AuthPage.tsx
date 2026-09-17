@@ -15,6 +15,7 @@ export function AuthPage({ mode, t, readStatus }:
   const headingId = useId()
   const statusId = useId()
   const isSignIn = mode === 'signIn'
+  const returnTo = encodeURIComponent(isSignIn ? '/#/' : '/#/new-organization')
   const showUnavailable = (): void => { setStatus(t('authProviderUnavailable')) }
 
   useEffect(() => {
@@ -30,7 +31,7 @@ export function AuthPage({ mode, t, readStatus }:
   return (
     <section className={css.authPage} aria-labelledby={headingId}>
       <div className={css.authPanel}>
-        <a className={css.authBrand} href="#/disclosures"><RegistryIcon name="brand" size={30} /><span>{t('brand')}</span></a>
+        <a className={css.authBrand} href="#/"><RegistryIcon name="brand" size={30} /><span>{t('brand')}</span></a>
         <div className={css.authFormWrap}>
           <header className={css.authHeading}>
             <h1 id={headingId}>{t(isSignIn ? 'authWelcomeBack' : 'authGetStarted')}</h1>
@@ -39,7 +40,7 @@ export function AuthPage({ mode, t, readStatus }:
 
           <div className={css.authProviders} aria-describedby={statusId}>
             {provider === 'oidc'
-              ? <a className={css.providerButton} href="/registry-auth/v1/start?returnTo=%2F%23%2Foverview">
+              ? <a className={css.providerButton} href={`/registry-auth/v1/start?returnTo=${returnTo}`}>
                 <RegistryIcon name="members" size={20} /><span>{t('continueSso')}</span><span aria-hidden="true">→</span>
               </a>
               : <button type="button" className={css.providerButton} disabled={provider === 'loading'} onClick={showUnavailable}>
@@ -51,14 +52,14 @@ export function AuthPage({ mode, t, readStatus }:
           <div id={statusId} className={css.authStatus} role="status">
             <RegistryIcon name="info" size={18} />
             <div><strong>{t(provider === 'oidc' ? 'authProviderReadyTitle' : 'authUnconfiguredTitle')}</strong><p>{status ?? t(provider === 'oidc' ? 'authProviderReadyDescription' : provider === 'loading' ? 'authCheckingProviderDescription' : 'authProviderUnavailable')}</p></div>
-            {provider === 'oidc' ? null : <a href="#/settings">{t('authSetupGuide')} →</a>}
+            {provider === 'oidc' ? null : <a href="#/sign-in">{t('authSetupGuide')} →</a>}
           </div>
         </div>
         <p className={css.authLegal}><RegistryIcon name="info" size={16} />{t('authLegal')}</p>
       </div>
 
       <aside className={css.authStory} aria-label={t('authStoryLabel')}>
-        <a className={css.authDocs} href="#/settings"><RegistryIcon name="documentation" size={18} /><span>{t('documentation')}</span></a>
+        <a className={css.authDocs} href="#/sign-in"><RegistryIcon name="documentation" size={18} /><span>{t('documentation')}</span></a>
         <div className={css.authStoryCopy}>
           <h2>{t('authStoryTitle')}</h2>
           <p>{t(isSignIn ? 'authStorySignIn' : 'authStorySignUp')}</p>

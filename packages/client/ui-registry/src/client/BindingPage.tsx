@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { organizationHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { BindingScopeHelp } from './BindingScopeHelp.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
@@ -12,8 +13,8 @@ import {
 } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type BindingProps = Pick<RegistryPageProps,
-  't' | 'listInstances' | 'reviewBinding' | 'approveBinding' | 'rejectBinding'>
+type BindingProps = Pick<RegistryOrganizationPageProps,
+  't' | 'listInstances' | 'reviewBinding' | 'approveBinding' | 'rejectBinding'> & { readonly organizationId: string }
 type Readiness = 'loading' | 'identityMissing' | 'runtimeMissing' | 'accessLoss' | 'retry' | 'ready'
 type PendingAction = 'idle' | 'review' | 'approve' | 'reject'
 type ActionFailure = 'invalid' | 'unavailable' | null
@@ -44,7 +45,7 @@ function displayTime(value: number, fallback: string): string {
 }
 
 /** Signed-in member review surface for a device-started binding; device keys and proofs never enter React. */
-export function BindingPage({ t, listInstances, reviewBinding, approveBinding, rejectBinding }: BindingProps) {
+export function BindingPage({ organizationId, t, listInstances, reviewBinding, approveBinding, rejectBinding }: BindingProps) {
   const [readinessRevision, setReadinessRevision] = useState(0)
   const [readiness, setReadiness] = useState<Readiness>('loading')
   const [bindingId, setBindingId] = useState('')
@@ -140,7 +141,7 @@ export function BindingPage({ t, listInstances, reviewBinding, approveBinding, r
       <RegistryIcon name="binding" size={64} />
       <h2>{t('unconfigured')}</h2>
       <p>{t(readiness === 'identityMissing' ? 'bindingIdentityMissing' : 'bindingRuntimeMissing')}</p>
-      <a className={css.primaryAction} href="#/settings">{t('requirements')}</a>
+      <a className={css.primaryAction} href={organizationHref(organizationId, 'settings')}>{t('requirements')}</a>
     </div>}
     {readiness === 'retry' && <div className={css.statePanel} role="alert">
       <RegistryIcon name="notFound" size={48} /><h2>{t('requestUnavailable')}</h2>
@@ -218,7 +219,7 @@ export function BindingPage({ t, listInstances, reviewBinding, approveBinding, r
         </div>}
         {review.phase === 'confirmed' && <div className={css.bindingStatus} role="status">
           <p>{t('bindingConfirmedMessage')}</p>
-          <a className={css.primaryButton} href="#/nodes">{t('bindingOpenNodes')}</a>
+          <a className={css.primaryButton} href={organizationHref(organizationId, 'nodes')}>{t('bindingOpenNodes')}</a>
         </div>}
         {(review.phase === 'rejected' || review.phase === 'revoked') && <div className={css.terminalNotice} role="status">
           <RegistryIcon name="info" />

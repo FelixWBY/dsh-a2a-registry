@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { DisclosureHash, DisclosureId, DshInstanceId } from '@deepseek-ai/dsh-a2a-protocol'
+import type { DisclosureHash, DisclosureId, DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { InstanceKeyId } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeRegistryChallenge, decodeRegistryProof } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { A2aRequestId, DisclosureSubject, MemberId, TeamId } from '@deepseek-ai/dsh-a2a-registry-domain'
@@ -12,7 +12,8 @@ import { RegistryIngestError, type FreshRegistryDirectoryAuthority,
   type RegistryBindingId, type RegistryBindingRequest, type RegistryBindingReview,
   type RegistryBindingScope, type RegistryDirectoryChange, type RegistryDisclosureMetadata } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type { RegistryAccountAuthenticator, RegistryAuthenticatedAccount } from './account-auth.ts'
+import type { RegistryAccountAuthenticator, RegistryAuthenticatedAccount,
+  RegistryAuthenticatedIdentity } from './account-auth.ts'
 import type { RegistryEnrollment } from './enrollment.ts'
 import type { RegistryDisclosureImportInput, RegistryDisclosureOperations, RegistryDisclosureOperationSelection,
   RegistryDisclosureQuestionInput, RegistryImportOperationId } from './operations.ts'
@@ -24,6 +25,10 @@ import { RegistryBrowserAdmission, type RegistryBrowserAdmissionConfig,
   type RegistryBrowserAdmissionDecision } from './browser-admission.ts'
 import type { RegistryOperationalRateLimitScope } from './operational-alerts.ts'
 import type { RegistryBillingCheckout, RegistryBillingPlan } from './billing.ts'
+import type { RegistryAccount, RegistryAccountId, RegistryOrganizationAccess } from './tenancy.ts'
+import { RegistryTenancyError } from './tenancy.ts'
+import type { RegistryTenantRuntime } from './ingest-runtime.ts'
+import type { RegistryTenantRuntimeLease } from './tenant-runtime-router.ts'
 
 const API_BASE = '/registry-api/v1'
 const DISCLOSURES_PATH = `${API_BASE}/disclosures`
@@ -33,10 +38,13 @@ const BINDINGS_PATH = `${API_BASE}/bindings`
 const DIRECTORY_PATH = `${API_BASE}/directory`
 const AUDIT_PATH = `${API_BASE}/audit`
 const STATUS_PATH = `${API_BASE}/status`
+const ACCOUNT_PATH = `${API_BASE}/account`
+const ORGANIZATIONS_PATH = `${API_BASE}/organizations`
 const BILLING_PATH = `${API_BASE}/billing`
 const TEST_ONLY_REVOKE_PATH = `${API_BASE}/test-only/revoke-seed`
 const TEST_ONLY_CONFIRM_HEADER = 'x-dsh-local-mvp-confirm'
 const TEST_ONLY_CONFIRM_VALUE = 'revoke-seed'
+const ACCOUNT_ADMISSION_ORGANIZATION = brandString<OrganizationId>('registry-account')
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const AUDIT_ACTORS = ['enrollment', 'producer', 'member', 'maintenance', 'unattributed'] as const
 const AUDIT_RESULTS = ['pending', 'succeeded', 'rejected'] as const
@@ -102,9 +110,9 @@ export const Config: z<RegistryBrowserApiConfig> = z.object({
 type ApiErrorCode = 'identity-not-configured' | 'registry-not-configured' | 'unauthenticated'
   | 'not-found' | 'invalid-input' | 'conflict' | 'unavailable' | 'operation-not-configured' | 'method-not-allowed' | 'rate-limited'
 
-type ApiRoute =
-  | { readonly kind: 'status' }
-  | { readonly kind: 'test-only-revoke' }
+type TenantRoute = { readonly organizationId?: OrganizationId }
+
+type TenantApiRoute = TenantRoute & (
   | { readonly kind: 'instances' }
   | { readonly kind: 'instance-action'; readonly bindingId: RegistryBindingId; readonly action: 'rename' | 'revoke' }
   | { readonly kind: 'binding-start' }
@@ -125,7 +133,14 @@ type ApiRoute =
   | { readonly kind: 'operation'; readonly disclosureId: DisclosureId; readonly action: 'import' | 'ask' }
   | { readonly kind: 'import-targets'; readonly disclosureId: DisclosureId }
   | { readonly kind: 'import-status'; readonly disclosureId: DisclosureId; readonly operationId: RegistryImportOperationId }
-  | { readonly kind: 'question'; readonly disclosureId: DisclosureId; readonly requestId: A2aRequestId }
+  | { readonly kind: 'question'; readonly disclosureId: DisclosureId; readonly requestId: A2aRequestId })
+
+type ApiRoute =
+  | { readonly kind: 'status' }
+  | { readonly kind: 'account' }
+  | { readonly kind: 'organization-create' }
+  | { readonly kind: 'test-only-revoke' }
+  | TenantApiRoute
 
 type OperationInput =
   | { readonly action: 'import'; readonly value: RegistryDisclosureImportInput }
@@ -143,6 +158,7 @@ type BindingInput =
 
 type DirectoryInput = { readonly expectedRevision: number; readonly change: RegistryDirectoryChange }
 type BillingInput = { readonly planId: string; readonly idempotencyKey: string; readonly returnPath: string }
+type OrganizationInput = { readonly displayName: string; readonly idempotencyKey: string }
 
 class ApiFailure extends Error {
   constructor(readonly status: number, readonly code: ApiErrorCode, readonly allow?: string,
@@ -876,6 +892,15 @@ async function billingInput(request: IncomingMessage, config: RegistryBrowserApi
     returnPath: `${parsed.pathname}${parsed.search}${parsed.hash}` }
 }
 
+async function organizationInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<OrganizationInput> {
+  const value = exactRecord(await readJson(request, config.maxOperationInputBytes, signal),
+    ['displayName', 'idempotencyKey'])
+  if (typeof value.displayName !== 'string' || !validInstanceName(value.displayName)
+    || Buffer.byteLength(value.displayName, 'utf8') > 256) throw new ApiFailure(400, 'invalid-input')
+  return { displayName: value.displayName, idempotencyKey: idempotencyKey(value.idempotencyKey) }
+}
+
 function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig): ApiRoute {
   const url = new URL(request.url ?? '/', 'http://registry.invalid')
   if (url.pathname === TEST_ONLY_REVOKE_PATH) {
@@ -886,22 +911,46 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     noQuery(url)
     return { kind: 'status' }
   }
+  if (url.pathname === ACCOUNT_PATH) {
+    noQuery(url)
+    return { kind: 'account' }
+  }
+  if (url.pathname === ORGANIZATIONS_PATH) {
+    noQuery(url)
+    return { kind: 'organization-create' }
+  }
+  let organizationId: OrganizationId | undefined
+  if (url.pathname.startsWith(`${ORGANIZATIONS_PATH}/`)) {
+    const remainder = url.pathname.slice(ORGANIZATIONS_PATH.length + 1)
+    const separator = remainder.indexOf('/')
+    const encodedOrganizationId = separator < 0 ? '' : remainder.slice(0, separator)
+    const resource = separator < 0 ? '' : remainder.slice(separator + 1)
+    let rawOrganizationId: string
+    try { rawOrganizationId = decodeURIComponent(encodedOrganizationId) } catch {
+      throw new ApiFailure(404, 'not-found')
+    }
+    if (!IDENTIFIER.test(rawOrganizationId) || resource.length === 0) throw new ApiFailure(404, 'not-found')
+    organizationId = brandString<OrganizationId>(rawOrganizationId)
+    url.pathname = `${API_BASE}/${resource}`
+  }
+  const scoped = (route: TenantApiRoute): TenantApiRoute => organizationId === undefined
+    ? route : { ...route, organizationId }
   if (url.pathname === INSTANCES_PATH) {
     noQuery(url)
-    return { kind: 'instances' }
+    return scoped({ kind: 'instances' })
   }
   if (url.pathname === `${BINDINGS_PATH}/start`) {
     noQuery(url)
-    return { kind: 'binding-start' }
+    return scoped({ kind: 'binding-start' })
   }
   if (url.pathname.startsWith(`${BINDINGS_PATH}/`)) {
     noQuery(url)
     const segments = url.pathname.slice(BINDINGS_PATH.length + 1).split('/')
     if (segments.length === 2 && segments[0] !== undefined && segments[1] !== undefined) {
       const selected = bindingId(segments[0])
-      if (segments[1] === 'confirm') return { kind: 'binding-confirm', bindingId: selected }
+      if (segments[1] === 'confirm') return scoped({ kind: 'binding-confirm', bindingId: selected })
       if (segments[1] === 'review' || segments[1] === 'approve' || segments[1] === 'reject') {
-        return { kind: 'binding-account-action', bindingId: selected, action: segments[1] }
+        return scoped({ kind: 'binding-account-action', bindingId: selected, action: segments[1] })
       }
     }
     throw new ApiFailure(404, 'not-found')
@@ -911,21 +960,21 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     const segments = url.pathname.slice(INSTANCES_PATH.length + 1).split('/')
     if (segments.length === 2 && segments[0] !== undefined
       && (segments[1] === 'rename' || segments[1] === 'revoke')) {
-      return { kind: 'instance-action', bindingId: bindingId(segments[0]), action: segments[1] }
+      return scoped({ kind: 'instance-action', bindingId: bindingId(segments[0]), action: segments[1] })
     }
     throw new ApiFailure(404, 'not-found')
   }
   if (url.pathname === DIRECTORY_PATH) {
     noQuery(url)
-    return { kind: 'directory' }
+    return scoped({ kind: 'directory' })
   }
   if (url.pathname === `${BILLING_PATH}/plans`) {
     noQuery(url)
-    return { kind: 'billing-plans' }
+    return scoped({ kind: 'billing-plans' })
   }
   if (url.pathname === `${BILLING_PATH}/checkout`) {
     noQuery(url)
-    return { kind: 'billing-checkout' }
+    return scoped({ kind: 'billing-checkout' })
   }
   if (url.pathname === AUDIT_PATH) {
     const keys = [...url.searchParams.keys()]
@@ -936,7 +985,7 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     if (cursor !== null && (cursor === '' || Buffer.byteLength(cursor, 'utf8') > config.maxCursorBytes)) {
       throw new ApiFailure(400, 'invalid-input')
     }
-    return cursor === null ? { kind: 'audit' } : { kind: 'audit', cursor }
+    return cursor === null ? scoped({ kind: 'audit' }) : scoped({ kind: 'audit', cursor })
   }
   if (url.pathname === BRANCHES_PATH) {
     const keys = [...url.searchParams.keys()]
@@ -946,7 +995,7 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     const cursor = url.searchParams.get('cursor')
     if (cursor !== null && (cursor === '' || Buffer.byteLength(cursor, 'utf8') > config.maxCursorBytes
       || !IDENTIFIER.test(cursor))) throw new ApiFailure(400, 'invalid-input')
-    return cursor === null ? { kind: 'branches' } : { kind: 'branches', cursor }
+    return cursor === null ? scoped({ kind: 'branches' }) : scoped({ kind: 'branches', cursor })
   }
   if (url.pathname === DISCLOSURES_PATH) {
     const keys = [...url.searchParams.keys()]
@@ -957,7 +1006,7 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     if (cursor !== null && (cursor === '' || Buffer.byteLength(cursor, 'utf8') > config.maxCursorBytes)) {
       throw new ApiFailure(400, 'invalid-input')
     }
-    return cursor === null ? { kind: 'list' } : { kind: 'list', cursor }
+    return cursor === null ? scoped({ kind: 'list' }) : scoped({ kind: 'list', cursor })
   }
   if (!url.pathname.startsWith(`${DISCLOSURES_PATH}/`)) throw new ApiFailure(404, 'not-found')
   const segments = url.pathname.slice(DISCLOSURES_PATH.length + 1).split('/')
@@ -972,28 +1021,33 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     if (checkpoint === null || !/^sha256:[0-9a-f]{64}$/u.test(checkpoint)) {
       throw new ApiFailure(400, 'invalid-input')
     }
-    return { kind: 'content', disclosureId: disclosureId(resource),
-      checkpointHash: brandString<DisclosureHash>(checkpoint) }
+    return scoped({ kind: 'content', disclosureId: disclosureId(resource),
+      checkpointHash: brandString<DisclosureHash>(checkpoint) })
   }
   noQuery(url)
-  if (segments.length === 1) return { kind: 'detail', disclosureId: disclosureId(resource) }
+  if (segments.length === 1) return scoped({ kind: 'detail', disclosureId: disclosureId(resource) })
   if (segments.length === 2 && (segments[1] === 'import' || segments[1] === 'questions')) {
-    return { kind: 'operation', disclosureId: disclosureId(resource),
-      action: segments[1] === 'import' ? 'import' : 'ask' }
+    return scoped({ kind: 'operation', disclosureId: disclosureId(resource),
+      action: segments[1] === 'import' ? 'import' : 'ask' })
   }
   if (segments.length === 2 && segments[1] === 'import-targets') {
-    return { kind: 'import-targets', disclosureId: disclosureId(resource) }
+    return scoped({ kind: 'import-targets', disclosureId: disclosureId(resource) })
   }
   if (segments.length === 3 && segments[1] === 'imports' && segments[2] !== undefined) {
-    return { kind: 'import-status', disclosureId: disclosureId(resource), operationId: operationId(segments[2]) }
+    return scoped({ kind: 'import-status', disclosureId: disclosureId(resource), operationId: operationId(segments[2]) })
   }
   if (segments.length === 3 && segments[1] === 'questions' && segments[2] !== undefined) {
-    return { kind: 'question', disclosureId: disclosureId(resource), requestId: requestId(segments[2]) }
+    return scoped({ kind: 'question', disclosureId: disclosureId(resource), requestId: requestId(segments[2]) })
   }
   throw new ApiFailure(404, 'not-found')
 }
 
 function assertMethod(request: IncomingMessage, route: ApiRoute): void {
+  if (route.kind === 'account' || route.kind === 'organization-create') {
+    const allowed = route.kind === 'account' ? 'GET' : 'POST'
+    if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
+    return
+  }
   if (route.kind === 'question') {
     const allowed = 'GET, DELETE'
     if (request.method !== 'GET' && request.method !== 'DELETE') {
@@ -1063,29 +1117,60 @@ async function revokeTestSeed(ctx: Context, request: IncomingMessage, signal: Ab
     authorizationVersion: receipt.authorizationVersion }
 }
 
+async function tenantRuntime(ctx: Context, organizationId: OrganizationId | undefined):
+Promise<RegistryTenantRuntimeLease | undefined> {
+  if (organizationId === undefined) return undefined
+  const router = ctx.get('registryTenantRouter')
+  if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
+  return router.acquireRuntime(organizationId)
+}
+
+async function authenticateAccount(authenticator: RegistryAccountAuthenticator, request: IncomingMessage,
+  signal: AbortSignal, organizationId: OrganizationId | undefined): Promise<RegistryAuthenticatedAccount | null> {
+  return organizationId === undefined
+    ? authenticator.authenticate(request, signal)
+    : authenticator.authenticateOrganization(request, organizationId, signal)
+}
+
+async function requireAuthenticatedAccount(authenticator: RegistryAccountAuthenticator, request: IncomingMessage,
+  signal: AbortSignal, organizationId: OrganizationId | undefined): Promise<RegistryAuthenticatedAccount> {
+  let account: RegistryAuthenticatedAccount | null
+  try { account = await authenticateAccount(authenticator, request, signal, organizationId) } catch {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  if (account !== null && account.subject.authenticated) return account
+  if (organizationId !== undefined) {
+    let identity: RegistryAuthenticatedIdentity | null
+    try { identity = await authenticator.authenticateIdentity(request, signal) } catch {
+      throw new ApiFailure(503, 'unavailable')
+    }
+    if (identity !== null) throw new ApiFailure(404, 'not-found')
+  }
+  throw new ApiFailure(401, 'unauthenticated')
+}
+
 async function requestAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal,
-  reauthorizationFailure: 'not-found' | 'unavailable' = 'not-found'):
+  reauthorizationFailure: 'not-found' | 'unavailable' = 'not-found',
+  organizationId?: OrganizationId, selectedRuntime?: RegistryTenantRuntime):
 Promise<{
   readonly reader: RegistryDisclosureReader
+  readonly enrollment?: RegistryEnrollment
   readonly authority: FreshRegistryMetadataAuthority
   readonly authenticatedSubject: DisclosureSubject
   readonly authorizedSubject: () => DisclosureSubject
 }> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  const reader = ctx.get('registryDisclosureReader')
+  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
+  const runtime = selectedRuntime
+  const reader = runtime?.reader ?? ctx.get('registryDisclosureReader')
   if (reader === undefined) throw new ApiFailure(503, 'registry-not-configured')
-  let account: Awaited<ReturnType<RegistryAccountAuthenticator['authenticate']>>
-  try { account = await authenticator.authenticate(request, signal) } catch {
-    throw new ApiFailure(503, 'unavailable')
-  }
-  if (account === null) throw new ApiFailure(401, 'unauthenticated')
-  if (!account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  const enrollment = runtime?.enrollment ?? ctx.get('registryEnrollment')
   const authenticatedSubject = structuredClone(account.subject)
   let authorizedSubject: DisclosureSubject | undefined
   const authority: FreshRegistryMetadataAuthority = async () => {
     let current: RegistryAuthenticatedAccount | null
-    try { current = await authenticator.authenticate(request, signal) } catch {
+    try { current = await authenticateAccount(authenticator, request, signal, organizationId) } catch {
       throw new RegistryIngestError(reauthorizationFailure === 'not-found' ? 'not-found' : 'storage-unavailable')
     }
     if (current === null || !current.subject.authenticated) throw new RegistryIngestError('not-found')
@@ -1097,13 +1182,15 @@ Promise<{
     authorizedSubject = structuredClone(current.subject)
     return { subject: authorizedSubject, now: Date.now(), historyFor: current.historyFor }
   }
-  return { reader, authority, authenticatedSubject, authorizedSubject: () => {
+  return { reader, ...(enrollment === undefined ? {} : { enrollment }), authority, authenticatedSubject,
+    authorizedSubject: () => {
     if (authorizedSubject === undefined) throw new ApiFailure(503, 'unavailable')
     return authorizedSubject
   } }
 }
 
-function operationSelection(ctx: Context, reader: RegistryDisclosureReader, authority: FreshRegistryMetadataAuthority,
+function operationSelection(reader: RegistryDisclosureReader, enrollment: RegistryEnrollment | undefined,
+  authority: FreshRegistryMetadataAuthority,
   selectedSubject: DisclosureSubject, disclosure: RegistryDisclosureMetadata, selectedDisclosureId: DisclosureId,
   action: 'import' | 'ask', maxResponseBytes: number): RegistryDisclosureOperationSelection {
   return {
@@ -1111,7 +1198,6 @@ function operationSelection(ctx: Context, reader: RegistryDisclosureReader, auth
     disclosure,
     authorizeTarget: async (targetInstanceId: DshInstanceId, operationSignal: AbortSignal) => {
       requireOperationActive(operationSignal)
-      const enrollment = ctx.get('registryEnrollment')
       if (enrollment === undefined) throw new RegistryIngestError('closed')
       const pinnedAuthority: FreshRegistryDirectoryAuthority = async () => {
         const current = await authority()
@@ -1148,24 +1234,22 @@ function operationSelection(ctx: Context, reader: RegistryDisclosureReader, auth
   }
 }
 
-async function enrollmentAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<{
+async function enrollmentAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  organizationId?: OrganizationId, selectedRuntime?: RegistryTenantRuntime): Promise<{
   readonly enrollment: RegistryEnrollment
   readonly authority: FreshRegistryDirectoryAuthority
   readonly authenticatedSubject: DisclosureSubject
 }> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  let account: RegistryAuthenticatedAccount | null
-  try { account = await authenticator.authenticate(request, signal) } catch {
-    throw new ApiFailure(503, 'unavailable')
-  }
-  if (account === null || !account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
   const authenticatedSubject = structuredClone(account.subject)
-  const enrollment = ctx.get('registryEnrollment')
+  const runtime = selectedRuntime
+  const enrollment = runtime?.enrollment ?? ctx.get('registryEnrollment')
   if (enrollment === undefined) throw new ApiFailure(503, 'registry-not-configured')
   const authority: FreshRegistryDirectoryAuthority = async () => {
     let current: RegistryAuthenticatedAccount | null
-    try { current = await authenticator.authenticate(request, signal) } catch {
+    try { current = await authenticateAccount(authenticator, request, signal, organizationId) } catch {
       throw new RegistryIngestError('not-found')
     }
     if (current === null || !current.subject.authenticated
@@ -1180,24 +1264,22 @@ async function enrollmentAuthority(ctx: Context, request: IncomingMessage, signa
   return { enrollment, authority, authenticatedSubject }
 }
 
-async function directoryAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<{
+async function directoryAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  organizationId?: OrganizationId, selectedRuntime?: RegistryTenantRuntime): Promise<{
   readonly directory: RegistryDirectory
   readonly authority: FreshRegistryDirectoryAuthority
   readonly authenticatedSubject: DisclosureSubject
 }> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  let account: RegistryAuthenticatedAccount | null
-  try { account = await authenticator.authenticate(request, signal) } catch {
-    throw new ApiFailure(503, 'unavailable')
-  }
-  if (account === null || !account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
   const authenticatedSubject = structuredClone(account.subject)
-  const directory = ctx.get('registryDirectory')
+  const runtime = selectedRuntime
+  const directory = runtime?.directory ?? ctx.get('registryDirectory')
   if (directory === undefined) throw new ApiFailure(503, 'registry-not-configured')
   const authority: FreshRegistryDirectoryAuthority = async () => {
     let current: RegistryAuthenticatedAccount | null
-    try { current = await authenticator.authenticate(request, signal) } catch {
+    try { current = await authenticateAccount(authenticator, request, signal, organizationId) } catch {
       throw new RegistryIngestError('not-found')
     }
     if (current === null || !current.subject.authenticated
@@ -1212,46 +1294,124 @@ async function directoryAuthority(ctx: Context, request: IncomingMessage, signal
   return { directory, authority, authenticatedSubject }
 }
 
-async function billingOwner(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<DisclosureSubject> {
+async function billingOwner(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  organizationId?: OrganizationId): Promise<DisclosureSubject> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  let account: RegistryAuthenticatedAccount | null
-  try { account = await authenticator.authenticate(request, signal) } catch {
-    throw new ApiFailure(503, 'unavailable')
-  }
-  if (account === null || !account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
   if (account.subject.membership !== 'active' || account.subject.role !== 'owner') {
     throw new ApiFailure(404, 'not-found')
   }
   return structuredClone(account.subject)
 }
 
-async function auditAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<{
+async function auditAuthority(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  organizationId?: OrganizationId, selectedRuntime?: RegistryTenantRuntime): Promise<{
   readonly reader: RegistryAuditReader
   readonly authority: FreshRegistryAuditAuthority
 }> {
   const authenticator = ctx.get('registryAccountAuthenticator')
   if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
-  const reader = ctx.get('registryAuditReader')
+  const account = await requireAuthenticatedAccount(authenticator, request, signal, organizationId)
+  const runtime = selectedRuntime
+  const reader = runtime?.auditReader ?? ctx.get('registryAuditReader')
   if (reader === undefined) throw new ApiFailure(503, 'registry-not-configured')
-  let account: RegistryAuthenticatedAccount | null
-  try { account = await authenticator.authenticate(request, signal) } catch {
-    throw new ApiFailure(503, 'unavailable')
-  }
-  if (account === null || !account.subject.authenticated) throw new ApiFailure(401, 'unauthenticated')
+  const authenticatedSubject = structuredClone(account.subject)
   const authority: FreshRegistryAuditAuthority = async () => {
     let current: RegistryAuthenticatedAccount | null
-    try { current = await authenticator.authenticate(request, signal) } catch {
+    try { current = await authenticateAccount(authenticator, request, signal, organizationId) } catch {
       throw new RegistryIngestError('not-found')
     }
-    if (current === null || !current.subject.authenticated) throw new RegistryIngestError('not-found')
+    if (current === null || !current.subject.authenticated
+      || current.subject.organizationId !== authenticatedSubject.organizationId
+      || current.subject.memberId !== authenticatedSubject.memberId) throw new RegistryIngestError('not-found')
     return structuredClone(current.subject)
   }
   return { reader, authority }
 }
 
+async function globalIdentity(ctx: Context, request: IncomingMessage,
+  signal: AbortSignal): Promise<RegistryAuthenticatedIdentity> {
+  const authenticator = ctx.get('registryAccountAuthenticator')
+  if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
+  let identity: RegistryAuthenticatedIdentity | null
+  try { identity = await authenticator.authenticateIdentity(request, signal) } catch {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  if (identity === null) throw new ApiFailure(401, 'unauthenticated')
+  return identity
+}
+
+function organizationAccessResult(access: RegistryOrganizationAccess): unknown {
+  return {
+    organizationId: access.organization.organizationId,
+    slug: access.organization.slug,
+    displayName: access.organization.displayName,
+    state: access.organization.state,
+    memberId: access.membership.memberId,
+    role: access.membership.role,
+    membershipState: access.membership.state,
+  }
+}
+
+async function accountResult(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<unknown> {
+  const identity = await globalIdentity(ctx, request, signal)
+  const router = ctx.get('registryTenantRouter')
+  if (router !== undefined) {
+    const organizations = await router.listOrganizations(brandString<RegistryAccountId>(identity.accountId))
+    return { accountId: identity.accountId, memberId: identity.memberId, displayName: identity.displayName,
+      organizations: organizations.map(organizationAccessResult) }
+  }
+  const authenticator = ctx.get('registryAccountAuthenticator')
+  let account: RegistryAuthenticatedAccount | null = null
+  if (authenticator !== undefined) {
+    try { account = await authenticator.authenticate(request, signal) } catch {
+      throw new ApiFailure(503, 'unavailable')
+    }
+  }
+  const organizations = account === null ? [] : [{
+    organizationId: account.subject.organizationId,
+    slug: account.subject.organizationId,
+    displayName: account.subject.organizationId,
+    state: 'active',
+    memberId: account.subject.memberId,
+    role: account.subject.role,
+    membershipState: account.subject.membership,
+  }]
+  return { accountId: identity.accountId, memberId: identity.memberId, displayName: identity.displayName,
+    organizations }
+}
+
+async function createOrganization(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  input: OrganizationInput): Promise<unknown> {
+  const identity = await globalIdentity(ctx, request, signal)
+  const router = ctx.get('registryTenantRouter')
+  if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
+  const account: RegistryAccount = {
+    accountId: brandString<RegistryAccountId>(identity.accountId),
+    memberId: brandString<MemberId>(identity.memberId),
+    displayName: identity.displayName,
+    createdAt: 0,
+    updatedAt: 0,
+  }
+  const created = await router.tenancy.createOrganization(account, input)
+  const lease = created.organization.state === 'active' ? undefined : await router.provision(created, identity.displayName)
+  try {
+    const current = await router.tenancy.getOrganizationForAccount(account.accountId,
+      created.organization.organizationId)
+    if (current === null || current.organization.state !== 'active') throw new RegistryTenancyError('unavailable')
+    return organizationAccessResult(current)
+  } finally { lease?.release() }
+}
+
 function mapFailure(error: unknown): ApiFailure {
   if (error instanceof ApiFailure) return error
+  if (error instanceof RegistryTenancyError) {
+    if (error.code === 'invalid-input') return new ApiFailure(400, 'invalid-input')
+    if (error.code === 'conflict') return new ApiFailure(409, 'conflict')
+    if (error.code === 'not-found') return new ApiFailure(404, 'not-found')
+    return new ApiFailure(503, 'unavailable')
+  }
   if (error instanceof RegistryIngestError) {
     if (error.code === 'not-found') return new ApiFailure(404, 'not-found')
     if (error.code === 'version-conflict') return new ApiFailure(409, 'conflict')
@@ -1276,6 +1436,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
   let testOnlyRevokeConsumed = false
   const unregister = ctx.webServer.register({ kind: 'prefix', path: API_BASE, handler: async (request, response) => {
     const controller = new AbortController()
+    let tenantLease: RegistryTenantRuntimeLease | undefined
     active.add(controller)
     const cancel = () => { controller.abort() }
     request.once('aborted', cancel)
@@ -1289,7 +1450,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
       assertMethod(request, route)
       if ((route.kind === 'operation' || route.kind === 'instance-action' || route.kind === 'binding-start'
         || route.kind === 'binding-confirm' || route.kind === 'binding-account-action'
-        || route.kind === 'directory' && request.method === 'POST' || route.kind === 'billing-checkout')
+        || route.kind === 'directory' && request.method === 'POST' || route.kind === 'billing-checkout'
+        || route.kind === 'organization-create')
         && admission !== undefined) {
         const address = request.socket.remoteAddress
         if (address === undefined) throw new ApiFailure(503, 'unavailable')
@@ -1306,11 +1468,23 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           : route.kind === 'binding-account-action'
             ? await bindingInput(request, route.action, config, controller.signal)
             : undefined
-      const organizationInput = route.kind === 'directory' && request.method === 'POST'
+      const directoryChangeInput = route.kind === 'directory' && request.method === 'POST'
         ? await directoryInput(request, config, controller.signal) : undefined
+      const organizationCreateInput = route.kind === 'organization-create'
+        ? await organizationInput(request, config, controller.signal) : undefined
       const checkoutInput = route.kind === 'billing-checkout'
         ? await billingInput(request, config, controller.signal) : undefined
+      const organizationId = 'organizationId' in route ? route.organizationId : undefined
+      const anonymousTenantRoute = route.kind === 'binding-start' || route.kind === 'binding-confirm'
+      if (organizationId !== undefined && !anonymousTenantRoute) {
+        const authenticator = ctx.get('registryAccountAuthenticator')
+        if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
+        await requireAuthenticatedAccount(authenticator, request, controller.signal, organizationId)
+      }
+      tenantLease = await tenantRuntime(ctx, organizationId)
+      const selectedRuntime = tenantLease?.runtime
       if (route.kind === 'status') {
+        const tenantRouterConfigured = ctx.get('registryTenantRouter') !== undefined
         const operations = ctx.get('registryDisclosureOperations')
         const disclosureOperationsConfigured = operations !== undefined
           && ['readContent', 'listQuestions', 'listImportTargets', 'importDisclosure', 'readImport',
@@ -1321,16 +1495,33 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           identity: ctx.get('registryAccountAuthenticator') === undefined ? 'unconfigured' : 'configured',
           identityProvider: ctx.get('registryAccountAuthenticator') === undefined
             ? 'unconfigured' : runtime.identityProvider,
-          registry: ctx.get('registryDisclosureReader') === undefined ? 'unconfigured' : 'configured',
+          registry: ctx.get('registryDisclosureReader') === undefined && !tenantRouterConfigured
+            ? 'unconfigured' : 'configured',
           disclosureOperations: disclosureOperationsConfigured ? 'configured' : 'unconfigured',
-          deviceBinding: ctx.get('registryEnrollment') === undefined ? 'unconfigured' : 'configured',
-          audit: ctx.get('registryAuditReader') === undefined ? 'unconfigured' : 'configured',
+          deviceBinding: ctx.get('registryEnrollment') === undefined && !tenantRouterConfigured
+            ? 'unconfigured' : 'configured',
+          audit: ctx.get('registryAuditReader') === undefined && !tenantRouterConfigured
+            ? 'unconfigured' : 'configured',
           rateLimits: admission === undefined ? 'unconfigured' : 'configured',
           disclosureCleanup: disclosureCleanupConfigured ? 'configured' : 'unconfigured',
           mailboxCleanup: mailboxCleanupConfigured ? 'configured' : 'unconfigured',
           billing: ctx.get('registryBillingProvider') === undefined ? 'unconfigured' : 'configured',
           billingProvider: ctx.get('registryBillingProvider')?.provider ?? 'unconfigured',
         })
+        return
+      }
+      if (route.kind === 'account') {
+        succeed(response, await accountResult(ctx, request, controller.signal))
+        return
+      }
+      if (route.kind === 'organization-create') {
+        if (organizationCreateInput === undefined) throw new ApiFailure(503, 'unavailable')
+        if (admission !== undefined) {
+          const identity = await globalIdentity(ctx, request, controller.signal)
+          requireAdmission(ctx, admission.admitAccount(ACCOUNT_ADMISSION_ORGANIZATION,
+            brandString<MemberId>(identity.memberId)), 'account')
+        }
+        succeed(response, await createOrganization(ctx, request, controller.signal, organizationCreateInput))
         return
       }
       if (route.kind === 'test-only-revoke') {
@@ -1347,7 +1538,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'binding-start' || route.kind === 'binding-confirm') {
-        const enrollment = ctx.get('registryEnrollment')
+        const enrollment = selectedRuntime?.enrollment ?? ctx.get('registryEnrollment')
         if (enrollment === undefined) throw new ApiFailure(503, 'registry-not-configured')
         if (route.kind === 'binding-start') {
           if (enrollmentInput?.action !== 'start') throw new ApiFailure(503, 'unavailable')
@@ -1363,7 +1554,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'binding-account-action') {
-        const { enrollment, authority, authenticatedSubject } = await enrollmentAuthority(ctx, request, controller.signal)
+        const { enrollment, authority, authenticatedSubject } = await enrollmentAuthority(ctx, request,
+          controller.signal, route.organizationId, selectedRuntime)
         if (admission !== undefined) {
           requireAdmission(ctx, admission.admitAccount(authenticatedSubject.organizationId,
             authenticatedSubject.memberId), 'account')
@@ -1388,7 +1580,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'instances' || route.kind === 'instance-action') {
-        const { enrollment, authority, authenticatedSubject } = await enrollmentAuthority(ctx, request, controller.signal)
+        const { enrollment, authority, authenticatedSubject } = await enrollmentAuthority(ctx, request,
+          controller.signal, route.organizationId, selectedRuntime)
         if (route.kind === 'instances') {
           const value = await enrollment.list(authority, config.maxValueBytes)
           succeed(response, instancesResult(value, config.maxValueBytes))
@@ -1415,12 +1608,14 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'directory') {
-        const { directory, authority, authenticatedSubject } = await directoryAuthority(ctx, request, controller.signal)
+        const { directory, authority, authenticatedSubject } = await directoryAuthority(ctx, request,
+          controller.signal, route.organizationId, selectedRuntime)
         if (request.method === 'POST') {
           if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(authenticatedSubject.organizationId,
             authenticatedSubject.memberId), 'account')
-          if (organizationInput === undefined) throw new ApiFailure(503, 'unavailable')
-          const receipt = await directory.change(authority, organizationInput.change, organizationInput.expectedRevision)
+          if (directoryChangeInput === undefined) throw new ApiFailure(503, 'unavailable')
+          const receipt = await directory.change(authority, directoryChangeInput.change,
+            directoryChangeInput.expectedRevision)
           requireOperationActive(controller.signal)
           succeed(response, { revision: receipt.revision, invalidatedDisclosures: receipt.invalidatedDisclosures })
           return
@@ -1432,7 +1627,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
       if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
         const provider = ctx.get('registryBillingProvider')
         if (provider === undefined) throw new ApiFailure(501, 'operation-not-configured')
-        const subject = await billingOwner(ctx, request, controller.signal)
+        const subject = await billingOwner(ctx, request, controller.signal, route.organizationId)
         if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(subject.organizationId,
           subject.memberId), 'account')
         if (route.kind === 'billing-plans') {
@@ -1448,7 +1643,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         return
       }
       if (route.kind === 'audit') {
-        const { reader, authority } = await auditAuthority(ctx, request, controller.signal)
+        const { reader, authority } = await auditAuthority(ctx, request, controller.signal, route.organizationId,
+          selectedRuntime)
         const value = await reader.list(authority, {
           pageSize: config.pageSize, maxPageSize: config.pageSize, maxResponseBytes: config.maxValueBytes,
           ...(route.cursor === undefined ? {} : { cursor: route.cursor }),
@@ -1456,8 +1652,9 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         succeed(response, auditResult(value, config.pageSize, config.maxValueBytes))
         return
       }
-      const { reader, authority, authenticatedSubject, authorizedSubject } = await requestAuthority(ctx, request,
-        controller.signal, route.kind === 'branches' ? 'unavailable' : 'not-found')
+      const { reader, enrollment, authority, authenticatedSubject, authorizedSubject } = await requestAuthority(ctx,
+        request, controller.signal, route.kind === 'branches' ? 'unavailable' : 'not-found', route.organizationId,
+        selectedRuntime)
       if (route.kind === 'operation' && admission !== undefined) {
         requireAdmission(ctx, admission.admitAccount(authenticatedSubject.organizationId,
           authenticatedSubject.memberId), 'account')
@@ -1493,7 +1690,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
             })
             const selectedSubject = authorizedSubject()
             if (value.instanceId !== sourceInstanceId) throw new RegistryIngestError('not-found')
-            return operationSelection(ctx, reader, authority, selectedSubject, value, selectedDisclosureId,
+            return operationSelection(reader, enrollment, authority, selectedSubject, value, selectedDisclosureId,
               'ask', config.maxValueBytes)
           },
         }, { pageSize: config.pageSize, ...(route.cursor === undefined ? {} : { cursor: route.cursor }) },
@@ -1519,7 +1716,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           if (operations === undefined) throw new ApiFailure(501, 'operation-not-configured')
           const selectedSubject = authorizedSubject()
           const action = route.kind === 'question' ? 'ask' : route.kind === 'operation' ? route.action : 'import'
-          const selection = operationSelection(ctx, reader, authority, selectedSubject, value, route.disclosureId,
+          const selection = operationSelection(reader, enrollment, authority, selectedSubject, value, route.disclosureId,
             action, config.maxValueBytes)
           if (route.kind === 'import-targets') {
             if (operations.listImportTargets === undefined) throw new ApiFailure(501, 'operation-not-configured')
@@ -1563,6 +1760,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
     } catch (error) {
       if (!response.headersSent && !response.destroyed) fail(response, mapFailure(error))
     } finally {
+      tenantLease?.release()
       request.off('aborted', cancel)
       response.off('close', cancel)
       active.delete(controller)

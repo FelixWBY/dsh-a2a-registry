@@ -1,11 +1,13 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent, MouseEvent } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { questionHref } from './navigation.ts'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { RegistryApiError, type RegistryDisclosureDetail, type RegistryQuestionResult, type RegistryQuestionStatus } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type AskSourceDialogProps = Pick<RegistryPageProps, 't' | 'askDisclosure'> & {
+type AskSourceDialogProps = Pick<RegistryOrganizationPageProps, 't' | 'askDisclosure'> & {
+  readonly organizationId: string
   readonly detail: RegistryDisclosureDetail
   readonly onBoundaryFailure: (error: unknown) => boolean
   readonly onClose: () => void
@@ -30,7 +32,7 @@ const QUESTION_STATUS_KEYS: Record<RegistryQuestionStatus,
 }
 
 /** Collect and submit one pure-text question without attaching local context or capabilities. */
-export function AskSourceDialog({ detail, t, askDisclosure, onBoundaryFailure, onClose }: AskSourceDialogProps) {
+export function AskSourceDialog({ organizationId, detail, t, askDisclosure, onBoundaryFailure, onClose }: AskSourceDialogProps) {
   const [question, setQuestion] = useState('')
   const [state, setState] = useState<QuestionState>({ kind: 'idle' })
   const controller = useRef<AbortController | null>(null)
@@ -117,7 +119,7 @@ export function AskSourceDialog({ detail, t, askDisclosure, onBoundaryFailure, o
           {state.kind === 'success' && <><p>{t('questionSubmitted')}</p><dl>
             <div><dt>{t('operationStatus')}</dt><dd>{t(QUESTION_STATUS_KEYS[state.result.status])}</dd></div>
             <div><dt>{t('requestId')}</dt><dd><bdi>{state.result.requestId}</bdi></dd></div>
-          </dl><a className={css.inlineAction} href={`#/disclosures/${encodeURIComponent(detail.disclosureId)}/questions/${encodeURIComponent(state.result.requestId)}`}>{t('viewQuestion')}</a></>}
+          </dl><a className={css.inlineAction} href={questionHref(organizationId, detail.disclosureId, state.result.requestId)}>{t('viewQuestion')}</a></>}
         </div>}
         <footer className={css.dialogActions}>
           <button type="button" className={css.secondaryButton} onClick={close}>{state.kind === 'success' ? t('close') : t('cancel')}</button>

@@ -1,13 +1,16 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent, MouseEvent } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { nodeHref, organizationHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryInstance, type RegistryInstanceReportState } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type NodesProps = Pick<RegistryPageProps, 't' | 'listInstances' | 'renameInstance' | 'revokeInstance'>
+type NodesProps = Pick<RegistryOrganizationPageProps, 't' | 'listInstances' | 'renameInstance' | 'revokeInstance'> & {
+  readonly organizationId: string
+}
 type NodesState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }
@@ -154,7 +157,7 @@ function NodeActionDialog({
 }
 
 /** Account-owned bindings with current transport observations and explicit owner actions. */
-export function NodesPage({ t, listInstances, renameInstance, revokeInstance }: NodesProps) {
+export function NodesPage({ organizationId, t, listInstances, renameInstance, revokeInstance }: NodesProps) {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<NodesState>({ kind: 'loading' })
   const [action, setAction] = useState<NodeAction | null>(null)
@@ -240,7 +243,7 @@ export function NodesPage({ t, listInstances, renameInstance, revokeInstance }: 
         <button type="button" className={css.secondaryButton} disabled={state.refreshing} onClick={refreshInstances}>
           {t(state.refreshing ? 'refreshingStatus' : 'refreshStatus')}
         </button>
-        <a className={css.primaryButton} href="#/binding">{t('addNode')}</a>
+        <a className={css.primaryButton} href={organizationHref(organizationId, 'binding')}>{t('addNode')}</a>
       </div>
     </>}
     {feedback !== null && <p className={css.nodeActionStatus} role="status">
@@ -256,7 +259,7 @@ export function NodesPage({ t, listInstances, renameInstance, revokeInstance }: 
           <table className={`${css.table} ${css.nodeTable}`}>
             <thead><tr>{(['nodeName', 'nodeConnection', 'nodeScopes', 'nodeActiveRequests', 'nodeHeartbeat', 'actions'] as const).map(key => <th scope="col" key={key}>{t(key)}</th>)}</tr></thead>
             <tbody>{visibleItems.map(item => <tr key={item.bindingId}>
-              <td data-label={t('nodeName')}><div className={css.nodeIdentity}><RegistryIcon name="nodes" size={20} /><div><a className={css.nodeNameLink} href={`#/nodes/${encodeURIComponent(item.instanceId)}`}><strong>{item.instanceName}</strong></a><span><bdi>{item.instanceId}</bdi> · {t(item.phase === 'confirmed' ? 'nodeConfirmed' : 'nodeRevoked')}</span></div></div></td>
+              <td data-label={t('nodeName')}><div className={css.nodeIdentity}><RegistryIcon name="nodes" size={20} /><div><a className={css.nodeNameLink} href={nodeHref(organizationId, item.instanceId)}><strong>{item.instanceName}</strong></a><span><bdi>{item.instanceId}</bdi> · {t(item.phase === 'confirmed' ? 'nodeConfirmed' : 'nodeRevoked')}</span></div></div></td>
               <td data-label={t('nodeConnection')}><div className={css.nodeStatus}><span className={`${css.statusDot} ${item.transport === 'connected' ? css.statusHealthy : css.statusMuted}`} aria-hidden="true" /><div><strong>{t(item.transport === 'connected' ? 'nodeConnected' : 'nodeNotObserved')}</strong><span>{item.reportState === null ? t('unknownValue') : t(REPORT_KEYS[item.reportState])}</span></div></div></td>
               <td data-label={t('nodeScopes')}><div className={css.nodePolicy}><strong>{item.requestedScopes.length === 0 ? t('unknownValue') : item.requestedScopes.map(scope => t(scope === 'a2a.receive' ? 'nodeScopeReceive' : 'nodeScopeSync')).join(' · ')}</strong><span>{t('nodePolicyAccepting', { value: item.acceptingA2A === null ? t('unknownValue') : t(item.acceptingA2A ? 'yes' : 'no') })}</span></div></td>
               <td data-label={t('nodeActiveRequests')}>{item.activeRequests ?? t('unknownValue')}</td>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
@@ -7,7 +7,7 @@ import { RegistryApiError, type RegistryDirectoryChange,
   type RegistryDirectoryMemberState, type RegistryDirectoryPage, type RegistryDirectoryRole } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type MembersProps = Pick<RegistryPageProps, 't' | 'readDirectory' | 'changeDirectory'>
+type MembersProps = Pick<RegistryOrganizationPageProps, 't' | 'readDirectory' | 'changeDirectory'>
 type MembersState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }

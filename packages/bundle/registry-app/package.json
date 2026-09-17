@@ -23,6 +23,7 @@
     "@deepseek-ai/dsh-storage-domain": "*",
     "@deepseek-ai/dsh-a2a-mailbox": "*",
     "openid-client": "6.8.8",
+    "pg": "^8.16.3",
     "@deepseek-ai/dsh-host-frontend-static": "*",
     "@deepseek-ai/dsh-a2a-registry-sync": "*",
     "ws": "^8.21.0",

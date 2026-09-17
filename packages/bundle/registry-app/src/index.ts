@@ -6,6 +6,7 @@ import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-client-modules'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import z from '@deepseek-ai/schemastery'
+import { credentialRef, type CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { installRegistryStatic } from './static.ts'
 import { installRegistryPreferences } from './preferences.ts'
 import { Config as BrowserApiSchema, installRegistryBrowserApi, type RegistryBrowserApiConfig } from './browser-api.ts'
@@ -19,6 +20,9 @@ import { RegistrySharedAdmission, RegistrySharedAdmissionConfigSchema,
   type RegistrySharedAdmissionConfig } from './shared-admission-sqlite.ts'
 import { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema,
   type RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
+import { PostgresRegistryTenancy, type PostgresRegistryTenancyConfig } from './tenancy-postgres.ts'
+import { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
+import { installRegistrySync } from './sync.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
@@ -28,6 +32,16 @@ export type { RegistryBillingCheckout, RegistryBillingCheckoutInput, RegistryBil
   RegistryBillingProviderName } from './billing.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
+export { RegistryTenancyError } from './tenancy.ts'
+export type { RegistryAccount, RegistryAccountId, RegistryLegacyOrganizationInput,
+  RegistryOidcAccountInput, RegistryOrganization, RegistryOrganizationAccess,
+  RegistryOrganizationCreationInput, RegistryOrganizationMembership,
+  RegistryOrganizationMembershipState, RegistryOrganizationRole, RegistryOrganizationState,
+  RegistryTenancyErrorCode, RegistryTenancyStore } from './tenancy.ts'
+export { PostgresRegistryTenancy } from './tenancy-postgres.ts'
+export type { PostgresRegistryTenancyConfig } from './tenancy-postgres.ts'
+export { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
+export type { RegistryTenantRuntimeLease, RegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 export type { RegistryAuthorizedPrefixSnapshot, RegistryDisclosureReader,
   RegistryReceiveBindingRequirement } from './reader.ts'
 export type { FreshRegistryAuditAuthority, RegistryAuditActorKind, RegistryAuditListOptions,
@@ -72,6 +86,15 @@ export const name = 'registry-app'
 /** The profile Loader and HTTP service own readiness and disposal. */
 export const inject = ['webServer', 'loader', 'clientModules']
 
+export interface RegistrySaasConfig extends Omit<PostgresRegistryTenancyConfig, 'connectionString'> {
+  /** Credential reference containing the PostgreSQL URL; the value is never returned to the browser. */
+  databaseUrlEnv: string
+  /** Presentation name for the pre-SaaS organization retained during migration. */
+  legacyOrganizationName: string
+  /** Single-process safety bound for lazily opened organization data-plane runtimes. */
+  maxActiveOrganizations: number
+}
+
 /** Registry runtime presentation configuration. Network binding belongs to the webserver row. */
 export interface Config {
   /** Print the clean loopback URL after the profile has settled. */
@@ -80,6 +103,8 @@ export interface Config {
   api?: RegistryBrowserApiConfig
   /** Optional standards-based browser identity; current membership remains owned by ingest.directory. */
   oidc?: RegistryOidcAccountAuthConfig
+  /** PostgreSQL account/organization control plane and explicit multi-tenant runtime routing. */
+  saas?: RegistrySaasConfig
   /** Optional dedicated same-host SQLite owner shared by browser and producer-sync admission. */
   sharedAdmission?: RegistrySharedAdmissionConfig
   /** Requires storageDomain; sync additionally requires registryProducerAuthenticator. Both remain opt-in. */
@@ -93,12 +118,29 @@ const schema: z<Config> = z.object({
   printUrl: z.boolean().default(true),
   api: z.union([BrowserApiSchema]),
   oidc: z.union([RegistryOidcAccountAuthConfigSchema]),
+  saas: z.union([z.object({
+    databaseUrlEnv: z.string().role('credential-ref').required(),
+    schema: z.string().default('registry'),
+    legacyOrganizationName: z.string().required(),
+    maxConnections: z.natural().min(1).max(16).default(4),
+    maxOrganizationsPerAccount: z.natural().min(1).max(100).default(5),
+    maxActiveOrganizations: z.natural().min(1).max(10_000).default(256),
+    idleTimeoutMs: z.natural().min(1_000).max(600_000).default(30_000),
+    statementTimeoutMs: z.natural().min(1_000).max(120_000).default(15_000),
+  }).required()]),
   sharedAdmission: z.union([RegistrySharedAdmissionConfigSchema]),
   ingest: z.union([ingestRuntime.Config]),
   mailboxMaintenance: z.union([mailboxMaintenance.Config]),
   localHarness: z.union([localHarnessOperations.Config]),
 })
 export const Config: z<Config> = z.transform(schema, (value) => {
+  if (value.saas !== undefined && (value.ingest?.directory === undefined || value.oidc === undefined
+    || value.api === undefined)) {
+    throw new z.ValidationError('Registry SaaS requires oidc, api and ingest.directory configuration', {})
+  }
+  if (value.saas !== undefined && (value.localHarness !== undefined || value.mailboxMaintenance !== undefined)) {
+    throw new z.ValidationError('Registry SaaS cannot use fixed-organization Local Harness or mailbox owners', {})
+  }
   if (value.ingest !== undefined && value.mailboxMaintenance !== undefined
     && value.ingest.organizationId !== value.mailboxMaintenance.organizationId) {
     throw new z.ValidationError('Registry storage owners require one organization', {})
@@ -164,13 +206,67 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   if (config.ingest !== undefined) {
-    if (config.ingest.sync !== undefined && ctx.get('registryProducerAuthenticator') === undefined) {
+    const syncProvider = ctx.get('registryProducerAuthenticator')
+    if (config.ingest.sync !== undefined && syncProvider === undefined) {
       throw new Error('Registry sync requires registry-runtime inject: [storageDomain, registryProducerAuthenticator]')
     }
     if (config.ingest.sync !== undefined && ctx.webServer.host !== '127.0.0.1') {
       throw new Error('Registry sync TLS proxy requires a 127.0.0.1 HTTP listener')
     }
-    await ctx.plugin(ingestRuntime, config.ingest)
+    if (config.saas === undefined) await ctx.plugin(ingestRuntime, config.ingest)
+    else {
+      const credentials: CredentialProvider | undefined = ctx.get('credentials')
+      if (credentials === undefined) {
+        throw new Error('Registry SaaS requires registry-runtime inject: [storageDomain, credentials]')
+      }
+      const databaseUrl = await credentials.resolve(credentialRef(config.saas.databaseUrlEnv))
+      if (databaseUrl === undefined || databaseUrl.value.length === 0) {
+        throw new Error('Registry SaaS PostgreSQL credential is unavailable')
+      }
+      const tenancy = await PostgresRegistryTenancy.open({
+        connectionString: databaseUrl.value,
+        ...(config.saas.schema === undefined ? {} : { schema: config.saas.schema }),
+        ...(config.saas.maxConnections === undefined ? {} : { maxConnections: config.saas.maxConnections }),
+        ...(config.saas.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: config.saas.idleTimeoutMs }),
+        ...(config.saas.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: config.saas.statementTimeoutMs }),
+        ...(config.saas.maxOrganizationsPerAccount === undefined ? {}
+          : { maxOrganizationsPerAccount: config.saas.maxOrganizationsPerAccount }),
+      })
+      const syncAbort = new AbortController()
+      let router: DefaultRegistryTenantRuntimeRouter | undefined
+      let withdraw: (() => void) | undefined
+      let stopSync: (() => Promise<void>) | undefined
+      try {
+        await tenancy.ensureLegacyOrganization({ organizationId: config.ingest.organizationId,
+          displayName: config.saas.legacyOrganizationName })
+        router = new DefaultRegistryTenantRuntimeRouter(ctx, tenancy, structuredClone(config.ingest),
+          config.ingest.organizationId, config.saas.maxActiveOrganizations)
+        withdraw = ctx.provide('registryTenantRouter', router)
+        stopSync = config.ingest.sync === undefined ? undefined : installRegistrySync(ctx,
+          config.ingest.sync, syncProvider!,
+          async (organizationId) => {
+            const lease = await router!.acquireRuntime(organizationId)
+            return { store: lease.runtime.store, release: lease.release }
+          }, syncAbort.signal)
+        const ownedRouter = router
+        const ownedWithdraw = withdraw
+        const ownedStopSync = stopSync
+        ctx.effect(() => async () => {
+          syncAbort.abort()
+          const syncOutcome = await Promise.allSettled([ownedStopSync?.()])
+          const outcomes = await Promise.allSettled([Promise.resolve().then(ownedWithdraw), ownedRouter.close()])
+          outcomes.push(...syncOutcome)
+          if (outcomes.some(outcome => outcome.status === 'rejected')) ctx.logger.error('Registry SaaS cleanup failed')
+        }, 'registry-app: SaaS tenant router lifetime')
+      } catch (error) {
+        syncAbort.abort()
+        await Promise.allSettled([stopSync?.()])
+        await Promise.allSettled([
+          withdraw === undefined ? undefined : Promise.resolve().then(withdraw), router?.close() ?? tenancy.close(),
+        ])
+        throw error
+      }
+    }
   }
   if (config.oidc !== undefined) {
     if (ctx.get('credentials') === undefined) {

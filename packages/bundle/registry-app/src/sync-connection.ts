@@ -9,7 +9,8 @@ import { RegistryIngestError, type RegistryDisclosureRegistration,
 import { DISCLOSURE_CAPABILITIES, type DisclosureAccessUpdate,
   type DisclosureGrant } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { MailboxError } from '@deepseek-ai/dsh-a2a-mailbox'
-import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type DisclosureId } from '@deepseek-ai/dsh-a2a-protocol'
+import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type DisclosureId,
+  type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { decodeRegistryClientFrame, encodeRegistryServerFrame, RegistrySyncProtocolError,
   type RegistryClientFrame, type RegistryInstanceReport, type RegistryProducerAccessUpdate,
   type RegistryProducerRegistration, type RegistryServerFrame, type RegistrySyncErrorCode } from '@deepseek-ai/dsh-a2a-registry-sync'
@@ -126,6 +127,15 @@ export function registryAuthenticatorTarget(value: RegistryProducerAuthenticator
     ?? value
 }
 
+/** Resolve the organization runtime only after the device identity provider has authenticated the organization. */
+export interface RegistryRuntimeStoreLease {
+  readonly store: RegistryRuntimeStore
+  release(): void
+}
+
+/** Resolve a store lease held until the authenticated WebSocket connection has fully drained. */
+export type RegistryRuntimeStoreResolver = (organizationId: OrganizationId) => Promise<RegistryRuntimeStoreLease>
+
 /** Own the socket, handshake handles, request cancellation and final provider cleanup. */
 export class RegistrySyncConnection {
   private readonly abort = new AbortController()
@@ -141,18 +151,24 @@ export class RegistrySyncConnection {
   } | undefined
   private timer: NodeJS.Timeout | undefined
   private readonly disclosures = new Set<DisclosureId>()
+  private readonly resolveStore: RegistryRuntimeStoreResolver
+  private store: RegistryRuntimeStore | undefined
+  private storeLease: RegistryRuntimeStoreLease | undefined
+  private unsubscribe: (() => void) | undefined
 
   /** @param ctx - Context for detecting replacement of the injected provider.
    * @param socket - Already upgraded socket owned exclusively by this connection.
    * @param config - Validated immutable deployment bounds.
    * @param provider - Exact provider owning this attempt and its authority leases.
-   * @param store - Shared exclusive Registry ingest lifecycle.
+   * @param store - Fixed legacy owner or post-authentication tenant resolver.
    * @param signal - Runtime cancellation.
    * @param admission - Rate budgets shared by every connection in the installed endpoint. */
   constructor(private readonly ctx: Context, private readonly socket: WebSocket,
     private readonly config: RegistrySyncConfig, private readonly provider: RegistryProducerAuthenticator,
-    private readonly store: RegistryRuntimeStore, private readonly signal: AbortSignal,
-    private readonly admission: RegistrySyncAdmission) {}
+    store: RegistryRuntimeStore | RegistryRuntimeStoreResolver, private readonly signal: AbortSignal,
+    private readonly admission: RegistrySyncAdmission) {
+    this.resolveStore = typeof store === 'function' ? store : async () => ({ store, release: () => {} })
+  }
 
   /** Serve until disconnected, then drain the admitted operation and all identity resources.
    * @returns Quiescent cleanup; provider close failures are reported only as a fixed category. */
@@ -164,24 +180,22 @@ export class RegistrySyncConnection {
     this.socket.on('message', (data, binary) => { this.receive(data as Buffer, binary) })
     this.signal.addEventListener('abort', stop, { once: true })
     this.timer = setTimeout(stop, this.config.handshakeTimeoutMs)
-    const unsubscribe = this.store.subscribeInvalidation((notice) => {
-      if (notice.kind === 'owner-unavailable') { this.stop(); return }
-      const identity = this.authority?.identity ?? this.attempt?.challenge
-      if (identity !== undefined && notice.change.organizationId === identity.organizationId
-        && notice.change.instanceId === identity.instanceId
-        && (notice.kind === 'binding' || this.disclosures.has(notice.change.disclosureId))) this.stop()
-    })
     await closed.promise
-    unsubscribe()
+    try { this.unsubscribe?.() } catch { /* Cleanup continues so the runtime lease is never stranded. */ }
     clearTimeout(this.timer)
     this.signal.removeEventListener('abort', stop)
-    await this.pending
+    let pendingFailed = false
+    try { await this.pending } catch { pendingFailed = true }
     this.authority?.invalidated.removeEventListener('abort', this.invalidate)
     const outcomes = await Promise.allSettled([
       Promise.resolve().then(() => this.attempt?.close()),
       Promise.resolve().then(() => this.authority?.close()),
     ])
-    if (outcomes.some(outcome => outcome.status === 'rejected')) throw new Error('Registry identity cleanup failed')
+    this.storeLease?.release()
+    this.storeLease = undefined
+    if (pendingFailed || outcomes.some(outcome => outcome.status === 'rejected')) {
+      throw new Error('Registry identity cleanup failed')
+    }
   }
 
   private readonly invalidate = (): void => { this.stop() }
@@ -191,10 +205,42 @@ export class RegistrySyncConnection {
     this.socket.terminate()
   }
 
+  private async selectStore(organizationId: OrganizationId): Promise<void> {
+    if (this.store !== undefined) throw new RegistrySyncProtocolError()
+    let lease: RegistryRuntimeStoreLease
+    try { lease = await this.resolveStore(organizationId) } catch { throw new Unauthorized() }
+    if (!lease.store.active() || lease.store.organizationId !== organizationId) {
+      lease.release()
+      throw new Unauthorized()
+    }
+    try {
+      this.storeLease = lease
+      this.store = lease.store
+      this.unsubscribe = lease.store.subscribeInvalidation((notice) => {
+        if (notice.kind === 'owner-unavailable') { this.stop(); return }
+        const identity = this.authority?.identity ?? this.attempt?.challenge
+        if (identity !== undefined && notice.change.organizationId === identity.organizationId
+          && notice.change.instanceId === identity.instanceId
+          && (notice.kind === 'binding' || this.disclosures.has(notice.change.disclosureId))) this.stop()
+      })
+    } catch {
+      this.store = undefined
+      this.storeLease = undefined
+      lease.release()
+      throw new Unauthorized()
+    }
+  }
+
+  private runtimeStore(): RegistryRuntimeStore {
+    const store = this.store
+    if (store === undefined || !store.active()) throw new Unauthorized()
+    return store
+  }
+
   private current(): void {
     const current = registryAuthenticatorTarget(this.ctx.get('registryProducerAuthenticator'))
     const expected = registryAuthenticatorTarget(this.provider)
-    if (this.abort.signal.aborted || !this.store.active()
+    if (this.abort.signal.aborted || (this.store !== undefined && !this.store.active())
       || current !== expected
       || this.authority?.invalidated.aborted === true) throw new Unauthorized()
   }
@@ -218,7 +264,7 @@ export class RegistrySyncConnection {
       if (frame.requestId <= this.lastRequestId) {
         if (this.authority !== undefined) {
           this.ctx.logger.warn('Registry request sequence rejected: %j', {
-            organizationId: this.store.organizationId, instanceId: this.authority.identity.instanceId,
+            organizationId: this.runtimeStore().organizationId, instanceId: this.authority.identity.instanceId,
             keyId: this.authority.identity.keyId, previousRequestId: this.lastRequestId, receivedRequestId: frame.requestId,
           })
         }
@@ -286,6 +332,7 @@ export class RegistrySyncConnection {
         try { this.authority = await this.attempt.complete(frame.signature, this.abort.signal) }
         catch { throw new Unauthorized() }
         this.authority.invalidated.addEventListener('abort', this.invalidate, { once: true })
+        await this.selectStore(this.authority.identity.organizationId)
         this.current()
         const authority = this.authority
         await this.withAuthority(authority, async (fresh) => {
@@ -293,7 +340,7 @@ export class RegistrySyncConnection {
           await this.send({ ...base, type: 'authenticated', identity: authority.identity })
         })
         this.current()
-        this.recordHeartbeat = this.store.transport.connect(authority.identity.instanceId, this.abort.signal)
+        this.recordHeartbeat = this.runtimeStore().transport.connect(authority.identity.instanceId, this.abort.signal)
         this.resetIdle()
       } else throw new RegistrySyncProtocolError()
       return
@@ -344,21 +391,21 @@ export class RegistrySyncConnection {
       let response: ResourceResponse
       switch (frame.type) {
         case 'status':
-          response = { ...base, type: 'status', status: await this.store.run(store => store.getSyncStatus(checked, frame.disclosureId)) }
+          response = { ...base, type: 'status', status: await this.runtimeStore().run(store => store.getSyncStatus(checked, frame.disclosureId)) }
           break
         case 'event':
-          response = { ...base, type: 'event-ack', receipt: await this.store.run(store =>
+          response = { ...base, type: 'event-ack', receipt: await this.runtimeStore().run(store =>
             store.ingestEvent(checked, frame.disclosureId, frame.envelope)) }
           break
         case 'checkpoint':
-          response = { ...base, type: 'checkpoint-ack', receipt: await this.store.run(store =>
+          response = { ...base, type: 'checkpoint-ack', receipt: await this.runtimeStore().run(store =>
             store.ingestCheckpoint(checked, frame.disclosureId, frame.checkpoint)) }
           break
         /* v8 ignore next -- closed-union exhaustiveness guard after strict or exact-outer decoding */
         default: return assertNever(frame, 'Registry authenticated request')
       }
       await checked()
-      const { delivery } = await this.store.run(async (store) => {
+      const { delivery } = await this.runtimeStore().run(async (store) => {
         const status = await store.getSyncStatus(checked, frame.disclosureId)
         const current = await checked()
         const originalVersion = response.type === 'status'
@@ -387,26 +434,26 @@ export class RegistrySyncConnection {
     switch (frame.type) {
       case 'producer-register': {
         const current = await checked()
-        receipt = await this.store.run(store => store.register(checked, producerRegistration(frame, current)))
+        receipt = await this.runtimeStore().run(store => store.register(checked, producerRegistration(frame, current)))
         break
       }
       case 'producer-update-access':
-        receipt = await this.store.run(store => store.updateAccess(checked, frame.disclosureId,
+        receipt = await this.runtimeStore().run(store => store.updateAccess(checked, frame.disclosureId,
           producerAccessUpdate(frame.update), frame.expectedAuthorizationVersion))
         break
       case 'producer-transition-control':
-        receipt = await this.store.run(store => store.transitionControl(checked, frame.disclosureId,
+        receipt = await this.runtimeStore().run(store => store.transitionControl(checked, frame.disclosureId,
           frame.target, frame.expectedAuthorizationVersion))
         break
       case 'producer-delete':
-        receipt = await this.store.run(store => store.delete(checked, frame.disclosureId,
+        receipt = await this.runtimeStore().run(store => store.delete(checked, frame.disclosureId,
           frame.expectedAuthorizationVersion))
         break
       /* v8 ignore next -- strict frame decoding leaves no other producer command. */
       default: return assertNever(frame, 'Registry producer command')
     }
     await checked()
-    const { delivery } = await this.store.run(async (store) => {
+    const { delivery } = await this.runtimeStore().run(async (store) => {
       const status = await store.getSyncStatus(checked, frame.disclosureId)
       const current = await checked()
       const version = status.kind === 'live' ? status.receipt.authorizationVersion : status.authorizationVersion
@@ -587,7 +634,7 @@ export class RegistrySyncConnection {
     try { current = await fresh() } catch { throw new Unauthorized() }
     this.current()
     const identity = authority.identity
-    if (identity.organizationId !== this.store.organizationId
+    if (identity.organizationId !== this.runtimeStore().organizationId
       || current.connection.organizationId !== identity.organizationId || current.connection.instanceId !== identity.instanceId
       || current.connection.keyId !== identity.keyId) throw new Unauthorized()
     return current
@@ -608,21 +655,21 @@ export class RegistrySyncConnection {
   }
 
   private async verifyProducer(fresh: FreshRegistryConnectionAuthority): Promise<void> {
-    try { await this.store.run(store => store.verifyProducer(fresh)) } catch (error) {
+    try { await this.runtimeStore().run(store => store.verifyProducer(fresh)) } catch (error) {
       if (error instanceof RegistryIngestError && error.code === 'not-found') throw new Unauthorized()
       throw error
     }
   }
 
   private async verifyConnection(fresh: FreshRegistryConnectionAuthority): Promise<void> {
-    try { await this.store.run(store => store.verifyConnection(fresh)) } catch (error) {
+    try { await this.runtimeStore().run(store => store.verifyConnection(fresh)) } catch (error) {
       if (error instanceof RegistryIngestError && error.code === 'not-found') throw new Unauthorized()
       throw error
     }
   }
 
   private async verifyReceiver(fresh: FreshRegistryConnectionAuthority): Promise<void> {
-    try { await this.store.run(store => store.verifyReceiver(fresh)) } catch (error) {
+    try { await this.runtimeStore().run(store => store.verifyReceiver(fresh)) } catch (error) {
       if (error instanceof RegistryIngestError && error.code === 'not-found') throw new Unauthorized()
       throw error
     }

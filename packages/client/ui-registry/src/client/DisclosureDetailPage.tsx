@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { organizationHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { AskSourceDialog } from './AskSourceDialog.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
@@ -13,8 +14,9 @@ import {
 import { UseContextDialog } from './UseContextDialog.tsx'
 import css from './Registry.module.css'
 
-type DetailProps = Pick<RegistryPageProps, 't' | 'readDisclosure' | 'readDisclosureContent'
+type DetailProps = Pick<RegistryOrganizationPageProps, 't' | 'readDisclosure' | 'readDisclosureContent'
   | 'listImportTargets' | 'importDisclosure' | 'readImport' | 'askDisclosure'> & {
+    readonly organizationId: string
     readonly disclosureId: string
   }
 type DetailState =
@@ -91,7 +93,7 @@ function DisclosureContentEventItem({ event, t }: {
 
 /** One authorized detail projection with Host-rechecked import and question actions. */
 export function DisclosureDetailPage({
-  disclosureId, t, readDisclosure, readDisclosureContent,
+  organizationId, disclosureId, t, readDisclosure, readDisclosureContent,
   listImportTargets, importDisclosure, readImport, askDisclosure,
 }: DetailProps) {
   const [revision, setRevision] = useState(0)
@@ -162,7 +164,7 @@ export function DisclosureDetailPage({
   if (state.kind === 'accessLoss') return <AccessLossPage t={t} />
   return <section>
     <div className={css.pageHeading}>
-      <a className={css.backLink} href="#/disclosures">← {t('backToList')}</a>
+      <a className={css.backLink} href={organizationHref(organizationId, 'disclosures')}>← {t('backToList')}</a>
       <h1>{t('disclosureDetail')}</h1>
       <p>{t('disclosureDetailDescription')}</p>
     </div>
@@ -221,13 +223,13 @@ export function DisclosureDetailPage({
             </div>
           })}
           <div className={css.operation}>
-            <a className={css.secondaryButton} href="#/branches">{t('viewExistingBranches')}</a>
+            <a className={css.secondaryButton} href={organizationHref(organizationId, 'branches')}>{t('viewExistingBranches')}</a>
             <p>{t('existingBranchesDescription')}</p>
           </div>
         </div>
       </section>
       {openDialog === 'import' && <UseContextDialog detail={state.detail} t={t} listImportTargets={listImportTargets} importDisclosure={importDisclosure} readImport={readImport} onBoundaryFailure={handleBoundaryFailure} onClose={() => { setOpenDialog(null) }} />}
-      {openDialog === 'ask' && <AskSourceDialog detail={state.detail} t={t} askDisclosure={askDisclosure} onBoundaryFailure={handleBoundaryFailure} onClose={() => { setOpenDialog(null) }} />}
+      {openDialog === 'ask' && <AskSourceDialog organizationId={organizationId} detail={state.detail} t={t} askDisclosure={askDisclosure} onBoundaryFailure={handleBoundaryFailure} onClose={() => { setOpenDialog(null) }} />}
     </div>}
   </section>
 }

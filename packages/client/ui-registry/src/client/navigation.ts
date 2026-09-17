@@ -1,63 +1,86 @@
-/** Public pages plus opaque authorized object addresses. */
-export type RegistryStaticPage = 'overview' | 'members' | 'nodes' | 'disclosures' | 'branches' | 'audit' | 'settings' | 'signIn' | 'signUp' | 'newOrganization' | 'binding' | 'notFound'
-export type RegistryPage = RegistryStaticPage
+/** Public pages, organization pages and opaque authorized object addresses. */
+export type RegistryStaticPage = 'overview' | 'members' | 'nodes' | 'disclosures' | 'branches' | 'audit' | 'settings'
+  | 'signIn' | 'signUp' | 'newOrganization' | 'binding' | 'notFound'
+export type RegistryOrganizationStaticPage = 'overview' | 'members' | 'nodes' | 'disclosures' | 'branches' | 'audit'
+  | 'settings' | 'binding'
+export type RegistryOrganizationPage = RegistryOrganizationStaticPage
   | { readonly kind: 'nodeDetail'; readonly instanceId: string }
   | { readonly kind: 'disclosureDetail'; readonly disclosureId: string }
   | { readonly kind: 'questionDetail'; readonly disclosureId: string; readonly requestId: string }
+export type RegistryPage = 'bootstrap' | 'signIn' | 'signUp' | 'newOrganization' | 'notFound'
+  | { readonly kind: 'organization'; readonly organizationId: string; readonly page: RegistryOrganizationPage }
 
 /** Primary navigation shared by the shell and its route tests. */
 export const PRIMARY_PAGES = ['overview', 'members', 'nodes', 'disclosures', 'branches', 'audit', 'settings'] as const
 
 const OPAQUE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 
-/** Locale/navigation key for a route, without exposing a detail identifier in shell chrome. */
-export function registryPageKey(page: RegistryPage): RegistryStaticPage | 'nodeDetail' | 'disclosureDetail' | 'questionDetail' {
-  return typeof page === 'string' ? page : page.kind
+function decodeIdentifier(value: string): string | null {
+  let decoded: string
+  try { decoded = decodeURIComponent(value) } catch { return null }
+  return OPAQUE_ID.test(decoded) ? decoded : null
 }
 
-/**
- * Decode an untrusted browser fragment without echoing object IDs or query text.
- * @param hash - Current location fragment.
- * @returns Known public page, or the uniform access-loss page.
- */
+/** Locale/navigation key for a route, without exposing object IDs in shell chrome. */
+export function registryPageKey(route: RegistryPage): RegistryStaticPage | 'nodeDetail' | 'disclosureDetail' | 'questionDetail' {
+  if (route === 'bootstrap') return 'overview'
+  if (typeof route === 'string') return route
+  return typeof route.page === 'string' ? route.page : route.page.kind
+}
+
+/** The selected organization ID is carried only by the URL and every scoped request. */
+export function registryOrganizationId(route: RegistryPage): string | null {
+  return typeof route === 'object' && route.kind === 'organization' ? route.organizationId : null
+}
+
+/** Create one organization-scoped hash without relying on browser storage or a selected-tenant cookie. */
+export function organizationHref(organizationId: string, page: RegistryOrganizationStaticPage): string {
+  return `#/organizations/${encodeURIComponent(organizationId)}/${page}`
+}
+
+export function nodeHref(organizationId: string, instanceId: string): string {
+  return `${organizationHref(organizationId, 'nodes')}/${encodeURIComponent(instanceId)}`
+}
+
+export function disclosureHref(organizationId: string, disclosureId: string): string {
+  return `${organizationHref(organizationId, 'disclosures')}/${encodeURIComponent(disclosureId)}`
+}
+
+export function questionHref(organizationId: string, disclosureId: string, requestId: string): string {
+  return `${disclosureHref(organizationId, disclosureId)}/questions/${encodeURIComponent(requestId)}`
+}
+
+/** Decode an untrusted browser fragment into a public or explicitly organization-scoped route. */
 export function parseRegistryPage(hash: string): RegistryPage {
   switch (hash) {
-    case '': case '#': case '#/': case '#/disclosures': return 'disclosures'
-    case '#/overview': return 'overview'
-    case '#/members': return 'members'
-    case '#/nodes': return 'nodes'
-    case '#/branches': return 'branches'
-    case '#/audit': return 'audit'
-    case '#/settings': return 'settings'
+    case '': case '#': case '#/': return 'bootstrap'
     case '#/sign-in': return 'signIn'
     case '#/sign-up': return 'signUp'
     case '#/new-organization': return 'newOrganization'
-    case '#/binding': return 'binding'
     default: {
-      const nodeMatch = /^#\/nodes\/([^/?#]+)$/u.exec(hash)
+      const match = /^#\/organizations\/([^/?#]+)(?:\/(.*))?$/u.exec(hash)
+      if (match?.[1] === undefined) return 'notFound'
+      const organizationId = decodeIdentifier(match[1])
+      const path = match[2] ?? 'overview'
+      if (organizationId === null) return 'notFound'
+      if (path === 'overview' || path === 'members' || path === 'nodes' || path === 'disclosures'
+        || path === 'branches' || path === 'audit' || path === 'settings' || path === 'binding') {
+        return { kind: 'organization', organizationId, page: path }
+      }
+      const nodeMatch = /^nodes\/([^/?#]+)$/u.exec(path)
       if (nodeMatch?.[1] !== undefined) {
-        let instanceId: string
-        try {
-          instanceId = decodeURIComponent(nodeMatch[1])
-        } catch {
-          return 'notFound'
-        }
-        return OPAQUE_ID.test(instanceId) ? { kind: 'nodeDetail', instanceId } : 'notFound'
+        const instanceId = decodeIdentifier(nodeMatch[1])
+        return instanceId === null ? 'notFound' : { kind: 'organization', organizationId,
+          page: { kind: 'nodeDetail', instanceId } }
       }
-      const match = /^#\/disclosures\/([^/?#]+)(?:\/questions\/([^/?#]+))?$/u.exec(hash)
-      if (match === null || match[1] === undefined) return 'notFound'
-      let disclosureId: string
-      let requestId: string | undefined
-      try {
-        disclosureId = decodeURIComponent(match[1])
-        requestId = match[2] === undefined ? undefined : decodeURIComponent(match[2])
-      } catch {
-        return 'notFound'
-      }
-      if (!OPAQUE_ID.test(disclosureId) || (requestId !== undefined && !OPAQUE_ID.test(requestId))) return 'notFound'
+      const disclosureMatch = /^disclosures\/([^/?#]+)(?:\/questions\/([^/?#]+))?$/u.exec(path)
+      if (disclosureMatch?.[1] === undefined) return 'notFound'
+      const disclosureId = decodeIdentifier(disclosureMatch[1])
+      const requestId = disclosureMatch[2] === undefined ? undefined : decodeIdentifier(disclosureMatch[2])
+      if (disclosureId === null || requestId === null) return 'notFound'
       return requestId === undefined
-        ? { kind: 'disclosureDetail', disclosureId }
-        : { kind: 'questionDetail', disclosureId, requestId }
+        ? { kind: 'organization', organizationId, page: { kind: 'disclosureDetail', disclosureId } }
+        : { kind: 'organization', organizationId, page: { kind: 'questionDetail', disclosureId, requestId } }
     }
   }
 }

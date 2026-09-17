@@ -12,6 +12,34 @@ export type RegistryApiErrorCode =
   | 'rate-limited'
   | 'unavailable'
 
+export type RegistryOrganizationState = 'provisioning' | 'active' | 'failed'
+export type RegistryOrganizationRole = 'owner' | 'admin' | 'member'
+export type RegistryOrganizationMembershipState = 'active' | 'suspended' | 'removed'
+
+/** One organization visible through the authenticated account's current membership. */
+export interface RegistryOrganizationSummary {
+  readonly organizationId: string
+  readonly slug: string
+  readonly displayName: string
+  readonly state: RegistryOrganizationState
+  readonly memberId: string
+  readonly role: RegistryOrganizationRole
+  readonly membershipState: RegistryOrganizationMembershipState
+}
+
+/** Global account bootstrap; it intentionally does not select a current organization. */
+export interface RegistryAccountContext {
+  readonly accountId: string
+  readonly memberId: string
+  readonly displayName: string
+  readonly organizations: readonly RegistryOrganizationSummary[]
+}
+
+export interface RegistryOrganizationCreateRequest {
+  readonly displayName: string
+  readonly idempotencyKey: string
+}
+
 export type RegistryAuthorizedAction = 'read' | 'import' | 'ask'
 export type RegistryControlState = 'active' | 'paused' | 'revoked' | 'expired' | 'deleting' | 'deleted'
 export type RegistryProducerState = 'idle' | 'backfilling' | 'live' | 'offline' | 'error_retryable' | 'error_conflict'
@@ -266,27 +294,39 @@ export interface RegistryA2aRequestPage {
 
 export interface RegistryApi {
   readStatus(signal: AbortSignal): Promise<RegistryRuntimeStatus>
-  readDirectory(signal: AbortSignal): Promise<RegistryDirectoryPage>
-  changeDirectory(expectedRevision: number, change: RegistryDirectoryChange,
+  readAccount(signal: AbortSignal): Promise<RegistryAccountContext>
+  createOrganization(request: RegistryOrganizationCreateRequest,
+    signal: AbortSignal): Promise<RegistryOrganizationSummary>
+  readDirectory(organizationId: string, signal: AbortSignal): Promise<RegistryDirectoryPage>
+  changeDirectory(organizationId: string, expectedRevision: number, change: RegistryDirectoryChange,
     signal: AbortSignal): Promise<RegistryDirectoryChangeReceipt>
-  listInstances(signal: AbortSignal): Promise<RegistryInstancePage>
-  renameInstance(bindingId: string, instanceName: string, signal: AbortSignal): Promise<RegistryInstance>
-  revokeInstance(bindingId: string, signal: AbortSignal): Promise<RegistryInstance>
-  reviewBinding(bindingId: string, code: string, signal: AbortSignal): Promise<RegistryBindingReview>
-  approveBinding(bindingId: string, code: string, instanceName: string, signal: AbortSignal): Promise<RegistryBindingReview>
-  rejectBinding(bindingId: string, code: string, signal: AbortSignal): Promise<RegistryBindingReview>
-  listAudit(request: RegistryListRequest, signal: AbortSignal): Promise<RegistryAuditPage>
-  listBranches(request: RegistryListRequest, signal: AbortSignal): Promise<RegistryA2aRequestPage>
-  listDisclosures(request: RegistryListRequest, signal: AbortSignal): Promise<RegistryDisclosurePage>
-  readDisclosure(disclosureId: string, signal: AbortSignal): Promise<RegistryDisclosureDetail>
-  readDisclosureContent(disclosureId: string, checkpointHash: string,
+  listInstances(organizationId: string, signal: AbortSignal): Promise<RegistryInstancePage>
+  renameInstance(organizationId: string, bindingId: string, instanceName: string,
+    signal: AbortSignal): Promise<RegistryInstance>
+  revokeInstance(organizationId: string, bindingId: string, signal: AbortSignal): Promise<RegistryInstance>
+  reviewBinding(organizationId: string, bindingId: string, code: string,
+    signal: AbortSignal): Promise<RegistryBindingReview>
+  approveBinding(organizationId: string, bindingId: string, code: string, instanceName: string,
+    signal: AbortSignal): Promise<RegistryBindingReview>
+  rejectBinding(organizationId: string, bindingId: string, code: string,
+    signal: AbortSignal): Promise<RegistryBindingReview>
+  listAudit(organizationId: string, request: RegistryListRequest, signal: AbortSignal): Promise<RegistryAuditPage>
+  listBranches(organizationId: string, request: RegistryListRequest, signal: AbortSignal): Promise<RegistryA2aRequestPage>
+  listDisclosures(organizationId: string, request: RegistryListRequest, signal: AbortSignal): Promise<RegistryDisclosurePage>
+  readDisclosure(organizationId: string, disclosureId: string, signal: AbortSignal): Promise<RegistryDisclosureDetail>
+  readDisclosureContent(organizationId: string, disclosureId: string, checkpointHash: string,
     signal: AbortSignal): Promise<RegistryDisclosureContent>
-  listImportTargets(disclosureId: string, signal: AbortSignal): Promise<RegistryImportTargetPage>
-  importDisclosure(disclosureId: string, request: RegistryImportRequest, signal: AbortSignal): Promise<RegistryImportResult>
-  readImport(disclosureId: string, operationId: string, signal: AbortSignal): Promise<RegistryImportResult>
-  askDisclosure(disclosureId: string, request: RegistryQuestionRequest, signal: AbortSignal): Promise<RegistryQuestionResult>
-  readQuestion(disclosureId: string, requestId: string, signal: AbortSignal): Promise<RegistryQuestionResult>
-  cancelQuestion(disclosureId: string, requestId: string, signal: AbortSignal): Promise<RegistryQuestionResult>
+  listImportTargets(organizationId: string, disclosureId: string, signal: AbortSignal): Promise<RegistryImportTargetPage>
+  importDisclosure(organizationId: string, disclosureId: string, request: RegistryImportRequest,
+    signal: AbortSignal): Promise<RegistryImportResult>
+  readImport(organizationId: string, disclosureId: string, operationId: string,
+    signal: AbortSignal): Promise<RegistryImportResult>
+  askDisclosure(organizationId: string, disclosureId: string, request: RegistryQuestionRequest,
+    signal: AbortSignal): Promise<RegistryQuestionResult>
+  readQuestion(organizationId: string, disclosureId: string, requestId: string,
+    signal: AbortSignal): Promise<RegistryQuestionResult>
+  cancelQuestion(organizationId: string, disclosureId: string, requestId: string,
+    signal: AbortSignal): Promise<RegistryQuestionResult>
 }
 
 /** Content-free application failure; response bodies and server messages never reach components. */
@@ -310,6 +350,9 @@ const INSTANCE_TRANSPORTS: readonly RegistryInstanceTransport[] = ['connected', 
 const INSTANCE_REPORT_STATES: readonly RegistryInstanceReportState[] = ['online', 'busy', 'paused', 'degraded']
 const DIRECTORY_ROLES: readonly RegistryDirectoryRole[] = ['owner', 'admin', 'member']
 const DIRECTORY_MEMBER_STATES: readonly RegistryDirectoryMemberState[] = ['active', 'suspended', 'removed']
+const ORGANIZATION_STATES: readonly RegistryOrganizationState[] = ['provisioning', 'active', 'failed']
+const ORGANIZATION_ROLES: readonly RegistryOrganizationRole[] = ['owner', 'admin', 'member']
+const ORGANIZATION_MEMBERSHIP_STATES: readonly RegistryOrganizationMembershipState[] = ['active', 'suspended', 'removed']
 const CONFIGURATION_STATES: readonly RegistryConfigurationState[] = ['configured', 'unconfigured']
 const CONTROLS: readonly RegistryControlState[] = ['active', 'paused', 'revoked', 'expired', 'deleting', 'deleted']
 const PRODUCERS: readonly RegistryProducerState[] = ['idle', 'backfilling', 'live', 'offline', 'error_retryable', 'error_conflict']
@@ -615,6 +658,44 @@ function validDisplayName(value: unknown): value is string {
     && value.isWellFormed() && !/[\u0000-\u001f\u007f]/u.test(value)
 }
 
+function organizationSummary(value: unknown): RegistryOrganizationSummary {
+  const source = record(value)
+  const state = member(source?.state, ORGANIZATION_STATES)
+  const role = member(source?.role, ORGANIZATION_ROLES)
+  const membershipState = member(source?.membershipState, ORGANIZATION_MEMBERSHIP_STATES)
+  if (source === null || typeof source.organizationId !== 'string' || !IDENTIFIER.test(source.organizationId)
+    || typeof source.slug !== 'string' || !IDENTIFIER.test(source.slug)
+    || !validDisplayName(source.displayName)
+    || typeof source.memberId !== 'string' || !IDENTIFIER.test(source.memberId)
+    || state === null || role === null || membershipState === null) throw new RegistryApiError('unavailable')
+  return {
+    organizationId: source.organizationId,
+    slug: source.slug,
+    displayName: source.displayName,
+    state,
+    memberId: source.memberId,
+    role,
+    membershipState,
+  }
+}
+
+function accountContext(value: unknown): RegistryAccountContext {
+  const source = record(value)
+  if (source === null || typeof source.accountId !== 'string' || !IDENTIFIER.test(source.accountId)
+    || typeof source.memberId !== 'string' || !IDENTIFIER.test(source.memberId)
+    || !validDisplayName(source.displayName) || !Array.isArray(source.organizations)) {
+    throw new RegistryApiError('unavailable')
+  }
+  const seen = new Set<string>()
+  const organizations = source.organizations.map((value) => {
+    const organization = organizationSummary(value)
+    if (seen.has(organization.organizationId)) throw new RegistryApiError('unavailable')
+    seen.add(organization.organizationId)
+    return organization
+  })
+  return { accountId: source.accountId, memberId: source.memberId, displayName: source.displayName, organizations }
+}
+
 function directory(value: unknown): RegistryDirectoryPage {
   const source = record(value)
   const revision = safeInteger(source?.revision, 0)
@@ -814,91 +895,101 @@ async function request<T>(path: string, init: RequestInit, decode: (value: unkno
 
 /** Create one stable adapter for the plugin lifetime; React receives only its narrow callbacks. */
 export function createRegistryApi(): RegistryApi {
+  const organizationBase = (organizationId: string): string =>
+    `${API_BASE}/organizations/${encodeURIComponent(organizationId)}`
   return {
     readStatus: signal => request(`${API_BASE}/status`, { method: 'GET', signal }, runtimeStatus),
-    readDirectory: signal => request(`${API_BASE}/directory`, { method: 'GET', signal }, directory),
-    changeDirectory: (expectedRevision, change, signal) => request(
-      `${API_BASE}/directory`,
+    readAccount: signal => request(`${API_BASE}/account`, { method: 'GET', signal }, accountContext),
+    createOrganization: (input, signal) => request(
+      `${API_BASE}/organizations`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) },
+      organizationSummary,
+    ),
+    readDirectory: (organizationId, signal) => request(
+      `${organizationBase(organizationId)}/directory`, { method: 'GET', signal }, directory),
+    changeDirectory: (organizationId, expectedRevision, change, signal) => request(
+      `${organizationBase(organizationId)}/directory`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ expectedRevision, change }) },
       directoryReceipt,
     ),
-    listInstances: signal => request(`${API_BASE}/instances`, { method: 'GET', signal }, instances),
-    renameInstance: (bindingId, instanceName, signal) => request(
-      `${API_BASE}/instances/${encodeURIComponent(bindingId)}/rename`,
+    listInstances: (organizationId, signal) => request(
+      `${organizationBase(organizationId)}/instances`, { method: 'GET', signal }, instances),
+    renameInstance: (organizationId, bindingId, instanceName, signal) => request(
+      `${organizationBase(organizationId)}/instances/${encodeURIComponent(bindingId)}/rename`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ instanceName }) },
       value => updatedInstance(value, { bindingId, instanceName, phase: 'confirmed' }),
     ),
-    revokeInstance: (bindingId, signal) => request(
-      `${API_BASE}/instances/${encodeURIComponent(bindingId)}/revoke`,
+    revokeInstance: (organizationId, bindingId, signal) => request(
+      `${organizationBase(organizationId)}/instances/${encodeURIComponent(bindingId)}/revoke`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirmation: 'revoke' }) },
       value => updatedInstance(value, { bindingId, phase: 'revoked' }),
     ),
-    reviewBinding: (bindingId, code, signal) => request(
-      `${API_BASE}/bindings/${encodeURIComponent(bindingId)}/review`,
+    reviewBinding: (organizationId, bindingId, code, signal) => request(
+      `${organizationBase(organizationId)}/bindings/${encodeURIComponent(bindingId)}/review`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) },
       value => bindingReview(value, { bindingId }),
     ),
-    approveBinding: (bindingId, code, instanceName, signal) => request(
-      `${API_BASE}/bindings/${encodeURIComponent(bindingId)}/approve`,
+    approveBinding: (organizationId, bindingId, code, instanceName, signal) => request(
+      `${organizationBase(organizationId)}/bindings/${encodeURIComponent(bindingId)}/approve`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ code, instanceName }) },
       value => bindingReview(value, { bindingId, phase: 'approved' }),
     ),
-    rejectBinding: (bindingId, code, signal) => request(
-      `${API_BASE}/bindings/${encodeURIComponent(bindingId)}/reject`,
+    rejectBinding: (organizationId, bindingId, code, signal) => request(
+      `${organizationBase(organizationId)}/bindings/${encodeURIComponent(bindingId)}/reject`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) },
       value => bindingReview(value, { bindingId, phase: 'rejected' }),
     ),
-    listAudit: (input, signal) => {
+    listAudit: (organizationId, input, signal) => {
       const query = input.cursor === undefined ? '' : `?cursor=${encodeURIComponent(input.cursor)}`
-      return request(`${API_BASE}/audit${query}`, { method: 'GET', signal }, auditPage)
+      return request(`${organizationBase(organizationId)}/audit${query}`, { method: 'GET', signal }, auditPage)
     },
-    listBranches: (input, signal) => {
+    listBranches: (organizationId, input, signal) => {
       const query = input.cursor === undefined ? '' : `?cursor=${encodeURIComponent(input.cursor)}`
-      return request(`${API_BASE}/branches${query}`, { method: 'GET', signal }, branchPage)
+      return request(`${organizationBase(organizationId)}/branches${query}`, { method: 'GET', signal }, branchPage)
     },
-    listDisclosures: (input, signal) => {
+    listDisclosures: (organizationId, input, signal) => {
       const query = input.cursor === undefined ? '' : `?cursor=${encodeURIComponent(input.cursor)}`
-      return request(`${API_BASE}/disclosures${query}`, { method: 'GET', signal }, page)
+      return request(`${organizationBase(organizationId)}/disclosures${query}`, { method: 'GET', signal }, page)
     },
-    readDisclosure: (disclosureId, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}`,
+    readDisclosure: (organizationId, disclosureId, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}`,
       { method: 'GET', signal },
       metadata,
     ),
-    readDisclosureContent: (disclosureId, checkpointHash, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/content?checkpoint=${encodeURIComponent(checkpointHash)}`,
+    readDisclosureContent: (organizationId, disclosureId, checkpointHash, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/content?checkpoint=${encodeURIComponent(checkpointHash)}`,
       { method: 'GET', signal },
       value => disclosureContent(value, checkpointHash),
     ),
-    listImportTargets: (disclosureId, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/import-targets`,
+    listImportTargets: (organizationId, disclosureId, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/import-targets`,
       { method: 'GET', signal },
       importTargets,
     ),
-    importDisclosure: (disclosureId, input, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/import`,
+    importDisclosure: (organizationId, disclosureId, input, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/import`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) },
       importResult,
     ),
-    readImport: (disclosureId, operationId, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/imports/${encodeURIComponent(operationId)}`,
+    readImport: (organizationId, disclosureId, operationId, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/imports/${encodeURIComponent(operationId)}`,
       { method: 'GET', signal },
       importResult,
     ),
-    askDisclosure: (disclosureId, input, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/questions`,
+    askDisclosure: (organizationId, disclosureId, input, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/questions`,
       { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) },
       questionResult,
     ),
-    readQuestion: (disclosureId, requestId, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/questions/${encodeURIComponent(requestId)}`,
+    readQuestion: (organizationId, disclosureId, requestId, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/questions/${encodeURIComponent(requestId)}`,
       { method: 'GET', signal },
       questionResult,
     ),
-    cancelQuestion: (disclosureId, requestId, signal) => request(
-      `${API_BASE}/disclosures/${encodeURIComponent(disclosureId)}/questions/${encodeURIComponent(requestId)}`,
+    cancelQuestion: (organizationId, disclosureId, requestId, signal) => request(
+      `${organizationBase(organizationId)}/disclosures/${encodeURIComponent(disclosureId)}/questions/${encodeURIComponent(requestId)}`,
       { method: 'DELETE', signal },
       questionResult,
     ),

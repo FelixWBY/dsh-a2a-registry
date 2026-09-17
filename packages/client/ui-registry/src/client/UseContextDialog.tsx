@@ -1,11 +1,11 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent, MouseEvent } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { RegistryApiError, type RegistryDisclosureDetail, type RegistryImportResult, type RegistryImportStatus, type RegistryImportTarget } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type UseContextDialogProps = Pick<RegistryPageProps, 't' | 'listImportTargets' | 'importDisclosure' | 'readImport'> & {
+type UseContextDialogProps = Pick<RegistryOrganizationPageProps, 't' | 'listImportTargets' | 'importDisclosure' | 'readImport'> & {
   readonly detail: RegistryDisclosureDetail
   readonly onBoundaryFailure: (error: unknown) => boolean
   readonly onClose: () => void

@@ -12,7 +12,7 @@
 pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node.exe
 ```
 
-脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。两项服务都只绑定回环地址。Keycloak realm 中的 `registry-owner` 必须与 Registry 目录成员匹配。
+脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。服务只绑定回环地址，Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织。
 
 普通服务器或已有身份服务可以直接使用 OIDC patch：
 
@@ -20,7 +20,7 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 npm start -- --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产组合模板，`registry/registry.env.example` 列出所需环境变量。模板中依赖的组织设备认证、披露操作与 KMS provider 需要按实际部署提供。缺少它们时启动会明确失败。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。模板中依赖的设备认证、披露操作与 KMS 提供方需要按实际部署提供，缺少它们时启动会明确失败。
 
 ## 公网入口
 
@@ -52,7 +52,7 @@ Harness 仍是单独安装的外部程序。`registry/harness-production-publica
 
 | 类别 | 必需输入 | 当前缺少时的行为 |
 | --- | --- | --- |
-| 组织与身份 | 正式组织 ID、初始 Owner 成员 ID/名称；正式 OIDC issuer、client ID、client secret、允许的回调地址，以及能稳定映射到成员 ID 的 claim | 保持身份未配置；本地 Keycloak 只能用于本机验收 |
+| 账号、组织与身份 | 正式 OIDC issuer、client ID、client secret、允许的回调地址，以及能稳定映射到成员 ID 的不可变 claim；旧单组织迁移时还需明确旧组织 ID、初始 Owner 主体和显示名称 | 保持身份未配置；本地 Keycloak 只能用于本机验收；不会自动认领旧组织 |
 | Harness | 每台实例的稳定 instance ID、独立设备私钥与短期 token；仅授予需要的 `disclosure.sync`／`a2a.receive` scope；公网 WSS 地址与设备公钥登记 | 不能连接生产 Registry；不会退化为网页账号或共享测试密钥 |
 | 密钥管理 | 选定的生产 KMS／秘密管理服务、披露数据密钥的生成、作用域授权、轮换、恢复和销毁流程 | 不发布生产披露；不从仓库或普通 `.env` 读取披露私钥 |
 | 公网部署 | 正式域名、DNS 控制权、ACME 邮箱、HTTPS 告警接收地址、异机备份位置、Linux 服务账号和 PostgreSQL 生产连接信息 | 只允许回环本地运行；不宣称已公网可用 |

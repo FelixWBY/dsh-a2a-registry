@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { disclosureHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryDisclosureMetadata } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type ListProps = Pick<RegistryPageProps, 't' | 'listDisclosures'>
+type ListProps = Pick<RegistryOrganizationPageProps, 't' | 'listDisclosures'> & { readonly organizationId: string }
 type ListState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }
@@ -39,9 +40,10 @@ function displayTime(value: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function DisclosureRows({ items, t }: { readonly items: readonly RegistryDisclosureMetadata[]; readonly t: ListProps['t'] }) {
+function DisclosureRows({ organizationId, items, t }:
+  { readonly organizationId: string; readonly items: readonly RegistryDisclosureMetadata[]; readonly t: ListProps['t'] }) {
   return <>{items.map(item => <tr key={item.disclosureId}>
-    <td data-label={t('disclosureId')}><a className={css.metadataLink} href={`#/disclosures/${encodeURIComponent(item.disclosureId)}`}><bdi className={css.tableIdentifier} title={item.disclosureId}>{item.disclosureId}</bdi></a></td>
+    <td data-label={t('disclosureId')}><a className={css.metadataLink} href={disclosureHref(organizationId, item.disclosureId)}><bdi className={css.tableIdentifier} title={item.disclosureId}>{item.disclosureId}</bdi></a></td>
     <td data-label={t('sourceInstance')}><bdi className={css.tableIdentifier} title={item.instanceId}>{item.instanceId}</bdi></td>
     <td data-label={t('controlState')}><code>{item.control}</code></td>
     <td data-label={t('producerState')}><code>{item.producer}</code></td>
@@ -50,12 +52,12 @@ function DisclosureRows({ items, t }: { readonly items: readonly RegistryDisclos
     <td data-label={t('lastSync')}><time dateTime={expiresAt(item.checkpointVerifiedAt)}>{displayTime(item.checkpointVerifiedAt)}</time></td>
     <td data-label={t('expiry')}><time dateTime={expiresAt(item.expiresAt)}>{displayTime(item.expiresAt)}</time></td>
     <td data-label={t('authorizationVersion')}>{item.authorizationVersion}</td>
-    <td data-label={t('actions')}><a className={css.rowAction} href={`#/disclosures/${encodeURIComponent(item.disclosureId)}`}>{t('viewDetails')}</a></td>
+    <td data-label={t('actions')}><a className={css.rowAction} href={disclosureHref(organizationId, item.disclosureId)}>{t('viewDetails')}</a></td>
   </tr>)}</>
 }
 
 /** Authorized paged disclosure metadata; it never synthesizes title, owner or body fields. */
-export function DisclosureListPage({ t, listDisclosures }: ListProps) {
+export function DisclosureListPage({ organizationId, t, listDisclosures }: ListProps) {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<ListState>({ kind: 'loading' })
   const [search, setSearch] = useState('')
@@ -166,7 +168,7 @@ export function DisclosureListPage({ t, listDisclosures }: ListProps) {
             <thead><tr>{(['disclosureId', 'sourceInstance', 'controlState', 'producerState', 'ingestState', 'checkpoint', 'lastSync', 'expiry', 'authorizationVersion', 'actions'] as const).map(column => <th scope="col" key={column}>{t(column)}</th>)}</tr></thead>
             <tbody>{visibleItems.length === 0
               ? <tr><td className={css.disclosureFilterEmpty} colSpan={10}>{t('disclosureFilterNoMatches')}</td></tr>
-              : <DisclosureRows items={visibleItems} t={t} />}</tbody>
+              : <DisclosureRows organizationId={organizationId} items={visibleItems} t={t} />}</tbody>
           </table>
         </div>
       </div>

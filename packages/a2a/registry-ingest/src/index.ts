@@ -79,9 +79,18 @@ function reportAuditListenerFailure(): void {
   }
 }
 
+/** Physical storage identity for one organization-owned Registry aggregate. */
+export interface RegistryIngestStorageScope {
+  /** Stable backend unit name. Multi-tenant runtimes use a server-generated organization hash. */
+  readonly domainName?: string
+  /** Opaque backend tenant scope used by PostgreSQL RLS-capable storage. */
+  readonly tenantId?: string
+}
+
 function specification(organizationId: OrganizationId, limits: RegistryIngestLimits, journal?: RegistryAuditConfig,
-  directory?: RegistryDirectoryConfig, bindings?: RegistryBindingConfig) {
-  return defineDomain({ name: 'a2a_registry_ingest', version: 10, layout: 'single', tables: {
+  directory?: RegistryDirectoryConfig, bindings?: RegistryBindingConfig, storage?: RegistryIngestStorageScope) {
+  return defineDomain({ name: storage?.domainName ?? 'a2a_registry_ingest', version: 10, layout: 'single',
+    ...(storage?.tenantId === undefined ? {} : { tenantId: storage.tenantId }), tables: {
     bindings: domainTable<string, RegistryBindingRecord>(z.unknown().transform((value) => {
       requireIngest(bindings !== undefined, 'invalid-storage')
       return parseBinding(value, bindings)
@@ -150,13 +159,14 @@ function exactPristineRegistration(record: IngestRecord, candidate: LiveRecord):
  * @param organizationId - Explicit immutable organization binding, including when no disclosures remain.
  * @param limits - Explicit byte, event, checkpoint, disclosure and recent-audit limits.
  * @param journal - Explicit block-all audit policy and bounds; omission records no operations and refuses a nonempty journal.
- * @param directory - Optional explicit directory limits and first-open owner; a retained directory requires it on reopen.
+ * @param directory - Optional explicit directory limits. A bootstrap owner provisions an empty domain; omission requires retained state.
  * @param bindings - Optional enrollment limits and fixed audience; requires the current member directory and atomic batches.
  * @returns An owner that must close before the same domain can reopen.
  * @throws RegistryIngestError if limits or persisted records fail validation.
  */
 export async function openRegistryIngest(facility: DomainFacility, organizationId: OrganizationId, limits: RegistryIngestLimits,
-  journal?: RegistryAuditConfig, directory?: RegistryDirectoryConfig, bindings?: RegistryBindingConfig): Promise<RegistryIngest> {
+  journal?: RegistryAuditConfig, directory?: RegistryDirectoryConfig, bindings?: RegistryBindingConfig,
+  storage?: RegistryIngestStorageScope): Promise<RegistryIngest> {
   const resolvedLimits = Object.freeze({ ...limits })
   validateLimits(resolvedLimits)
   const resolvedJournal = journal === undefined ? undefined : Object.freeze({ ...journal })
@@ -174,7 +184,8 @@ export async function openRegistryIngest(facility: DomainFacility, organizationI
   }
   let domain: Domain<ReturnType<typeof specification>>
   try {
-    domain = await facility.open(specification(organizationId, resolvedLimits, resolvedJournal, resolvedDirectory, resolvedBindings))
+    domain = await facility.open(specification(organizationId, resolvedLimits, resolvedJournal, resolvedDirectory,
+      resolvedBindings, storage))
   } catch {
     // Storage validation errors can include persisted fields; only the category crosses this API.
     throw new RegistryIngestError('invalid-storage')

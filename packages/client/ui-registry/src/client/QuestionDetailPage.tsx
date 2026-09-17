@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import type { RegistryPageProps } from './contract.ts'
+import type { RegistryOrganizationPageProps } from './contract.ts'
+import { disclosureHref } from './navigation.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryQuestionResult, type RegistryQuestionStatus } from './registry-api.ts'
 import css from './Registry.module.css'
 
-type QuestionDetailProps = Pick<RegistryPageProps, 't' | 'readQuestion' | 'cancelQuestion'> & {
+type QuestionDetailProps = Pick<RegistryOrganizationPageProps, 't' | 'readQuestion' | 'cancelQuestion'> & {
+  readonly organizationId: string
   readonly disclosureId: string
   readonly requestId: string
 }
@@ -38,7 +40,7 @@ function failureState(error: unknown): 'unconfigured' | 'accessLoss' | 'retry' {
 }
 
 /** Durable question deep-link; every refresh and cancellation is reauthorized by the Host. */
-export function QuestionDetailPage({ disclosureId, requestId, t, readQuestion, cancelQuestion }: QuestionDetailProps) {
+export function QuestionDetailPage({ organizationId, disclosureId, requestId, t, readQuestion, cancelQuestion }: QuestionDetailProps) {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<QuestionState>({ kind: 'loading' })
   const [cancelling, setCancelling] = useState(false)
@@ -76,10 +78,10 @@ export function QuestionDetailPage({ disclosureId, requestId, t, readQuestion, c
   }
 
   if (state.kind === 'accessLoss') return <AccessLossPage t={t} />
-  const disclosureHref = `#/disclosures/${encodeURIComponent(disclosureId)}`
+  const disclosureLink = disclosureHref(organizationId, disclosureId)
   return <section>
     <div className={css.pageHeading}>
-      <a className={css.backLink} href={disclosureHref}>← {t('backToDisclosure')}</a>
+      <a className={css.backLink} href={disclosureLink}>← {t('backToDisclosure')}</a>
       <h1>{t('questionDetail')}</h1>
       <p>{t('questionDetailDescription')}</p>
     </div>

@@ -1,6 +1,6 @@
 # DSH A2A Registry
 
-面向 DeepSeek Harness 的独立披露注册站。包含注册站前后端、组织成员与设备绑定、披露读取、导入与提问接口、审计、OIDC 登录及持久化组件。
+面向 DeepSeek Harness 的自助多租户披露注册站。包含 OIDC 登录、账号与组织创建／切换、成员与设备管理、披露读取／导入／提问、审计及 PostgreSQL 租户隔离。
 
 本仓库可以独立安装、构建和运行，不依赖原来的 Felix 工作目录，也不包含 Harness 的聊天应用、Agent 执行器、模型提供方或终端工具。Harness 作为外部客户端通过 Registry Sync WebSocket 协议连接。
 
@@ -33,16 +33,16 @@ npm test
 
 ## 登录与部署
 
-标准 OIDC Authorization Code + PKCE 已实现。正式环境需提供 Issuer、Client ID、客户端 Secret、会话 Secret、HTTPS 公共地址，并将成员 claim 映射到已存在的 Registry 成员。未配置的服务不会降级为测试身份。
+标准 OIDC Authorization Code + PKCE 已实现。首次登录按 Issuer 与 Subject 建立账号，用户可以自助创建并切换组织；组织访问还必须通过有效成员关系和组织内目录授权。正式环境需提供 Issuer、Client ID、客户端 Secret、会话 Secret 和 HTTPS 公共地址。未配置的服务不会降级为测试身份。
 
 - [独立部署说明](deploy/README.md)
 - [中文 PRD 与剩余 P 项](design/a2a-registry/SSOT.md)
 - [原始设计输入](design/a2a-registry/sources/dsh-a2a-disclosure-registry-design.source.txt)
 - [提取的源包清单](docs/source-packages.json)
 
-本地 Keycloak 示例保留在 `deploy/registry/`，通过 Docker Desktop 启动固定版本容器，并在第一次运行时生成独立的本地测试凭据。本仓库不提供真实密码、设备私钥、生产数据库或本地运行快照。
+本地 Keycloak 示例保留在 `deploy/registry/`，通过 Docker Desktop 启动固定版本容器，并在第一次运行时生成独立的本地测试凭据；本地 SaaS 控制面使用独立 PostgreSQL schema。本仓库不提供真实密码、设备私钥、生产数据库或本地运行快照。
 
-公网生产尚需完成正式 IdP 租户、设备凭据签发、KMS、披露操作/刷新 provider，以及真实域名与部署验收。已提供的配置模板不能替代这些外部服务。
+多租户控制面、按组织运行时路由和 PostgreSQL 强制 RLS 已实现。公网生产尚需完成正式身份服务、组织邀请、旧数据迁移、设备凭据签发、KMS、披露操作／刷新提供方、真实域名与部署验收。已提供的配置模板不能替代这些外部服务。
 
 ## 结构
 
@@ -53,7 +53,7 @@ npm test
 | `packages/client/ui-registry` | 注册站页面及交互 |
 | `packages/bundle/registry-app` | HTTP API、OIDC、WSS、审计与维护 |
 | `packages/a2a` | Registry 所需的 A2A 协议与领域实现 |
-| `packages/storage` | JSON / SQLite 存储 |
+| `packages/storage` | JSON / SQLite / PostgreSQL 存储；PostgreSQL 支持显式租户键与强制 RLS |
 | `vendor` | 固定来源的 Cordis 基础组件 |
 | `deploy` | Caddy、systemd、备份恢复、OIDC 示例 |
 

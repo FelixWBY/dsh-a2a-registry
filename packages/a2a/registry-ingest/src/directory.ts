@@ -29,13 +29,14 @@ export function validateDirectoryConfig(config: RegistryDirectoryConfig): void {
   for (const value of [config.maxMembers, config.maxTeams, config.maxTeamMembers, config.maxNameBytes, config.maxBytes]) {
     requireIngest(Number.isSafeInteger(value) && value > 0, 'limit')
   }
-  initialDirectory(config)
+  if (config.bootstrapOwner !== undefined) initialDirectory(config)
 }
 
 /** Provision only an empty domain; this is trusted configuration, not account authentication.
  * @param config - Validated explicit owner and limits.
  * @returns A detached initial directory with one active owner and no teams. */
 export function initialDirectory(config: RegistryDirectoryConfig): RegistryDirectoryState {
+  requireIngest(config.bootstrapOwner !== undefined, 'invalid-storage')
   return parseDirectory({ revision: 0, members: [{ ...config.bootstrapOwner, role: 'owner', state: 'active' }], teams: [] }, config)
 }
 

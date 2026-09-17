@@ -23,8 +23,12 @@ import {
   type CustomFetch,
   type Configuration,
 } from 'openid-client'
-import { RegistryAccountAuthenticator, type RegistryAuthenticatedAccount } from './account-auth.ts'
+import { RegistryAccountAuthenticator, type RegistryAuthenticatedAccount,
+  type RegistryAuthenticatedIdentity } from './account-auth.ts'
 import type { RegistryDirectory } from './directory.ts'
+import type { RegistryTenantRuntime } from './ingest-runtime.ts'
+import type { RegistryAccount, RegistryAccountId } from './tenancy.ts'
+import type { RegistryTenantRuntimeLease } from './tenant-runtime-router.ts'
 
 const AUTH_BASE = '/registry-auth/v1'
 const START_PATH = `${AUTH_BASE}/start`
@@ -52,6 +56,8 @@ export interface RegistryOidcAccountAuthConfig {
   readonly organizationId: OrganizationId
   /** Immutable ID-token claim whose string value equals one Registry directory member ID. */
   readonly memberIdClaim: string
+  /** Optional exact OIDC `sub` allowed to claim the pre-SaaS bootstrap owner during migration. */
+  readonly legacyOwnerSubject?: string
   /** Space-delimited OIDC scopes; `openid` is mandatory. */
   readonly scopes: string
   /** Maximum browser session lifetime after a successful callback. */
@@ -81,6 +87,7 @@ const rawSchema: z<RegistryOidcAccountAuthConfig> = z.object({
   organizationId: z.transform(z.string().pattern(IDENTIFIER).required(),
     value => brandString<OrganizationId>(value)).required(),
   memberIdClaim: z.string().pattern(CLAIM_NAME).required(),
+  legacyOwnerSubject: z.string(),
   scopes: z.string().required(),
   sessionTtlMs: positive(),
   transactionTtlMs: positive(),
@@ -127,6 +134,10 @@ export const RegistryOidcAccountAuthConfigSchema: z<RegistryOidcAccountAuthConfi
   }
   if (Buffer.byteLength(value.clientId, 'utf8') > 256 || value.clientId.trim() !== value.clientId
     || value.clientId.length === 0) throw new z.ValidationError('OIDC clientId is invalid', {})
+  if (value.legacyOwnerSubject !== undefined && (value.legacyOwnerSubject.length === 0
+    || Buffer.byteLength(value.legacyOwnerSubject, 'utf8') > 512 || !value.legacyOwnerSubject.isWellFormed())) {
+    throw new z.ValidationError('OIDC legacyOwnerSubject is invalid', {})
+  }
   if (value.transactionTtlMs > 10 * 60_000 || value.sessionTtlMs > 24 * 60 * 60_000
     || value.requestTimeoutMs > 60_000 || value.maxAuthenticationAgeSeconds > 24 * 60 * 60
     || value.maxCookieBytes > 65_536 || value.maxDirectoryBytes > 256 * 1024 * 1024) {
@@ -144,13 +155,26 @@ interface TransactionCookie {
   readonly expiresAt: number
 }
 
-interface SessionCookie {
+interface LegacySessionCookie {
   readonly version: 1
   readonly issuer: string
   readonly memberId: string
   readonly issuedAt: number
   readonly expiresAt: number
 }
+
+interface TenantSessionCookie {
+  readonly version: 2
+  readonly issuer: string
+  readonly subject: string
+  readonly accountId: string
+  readonly memberId: string
+  readonly displayName: string
+  readonly issuedAt: number
+  readonly expiresAt: number
+}
+
+type SessionCookie = LegacySessionCookie | TenantSessionCookie
 
 class OidcUnavailable extends Error {}
 
@@ -176,11 +200,22 @@ function transactionCookie(value: unknown): TransactionCookie | null {
 }
 
 function sessionCookie(value: unknown): SessionCookie | null {
-  const record = exactRecord(value, ['version', 'issuer', 'memberId', 'issuedAt', 'expiresAt'])
-  if (record === null || record.version !== 1 || typeof record.issuer !== 'string'
+  const keys = value !== null && typeof value === 'object' && !Array.isArray(value)
+    && (value as Record<string, unknown>).version === 2
+    ? ['version', 'issuer', 'subject', 'accountId', 'memberId', 'displayName', 'issuedAt', 'expiresAt']
+    : ['version', 'issuer', 'memberId', 'issuedAt', 'expiresAt']
+  const record = exactRecord(value, keys)
+  if (record === null || (record.version !== 1 && record.version !== 2) || typeof record.issuer !== 'string'
     || typeof record.memberId !== 'string' || !IDENTIFIER.test(record.memberId)
     || !finiteTime(record.issuedAt) || !finiteTime(record.expiresAt)
     || record.expiresAt <= record.issuedAt) return null
+  if (record.version === 2 && (typeof record.subject !== 'string' || record.subject.length === 0
+    || Buffer.byteLength(record.subject, 'utf8') > 512 || !record.subject.isWellFormed()
+    || typeof record.accountId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(record.accountId)
+    || typeof record.displayName !== 'string' || record.displayName.length === 0
+    || Buffer.byteLength(record.displayName, 'utf8') > 256 || !record.displayName.isWellFormed()
+    || /[\u0000-\u001f\u007f]/u.test(record.displayName))) return null
   return record as unknown as SessionCookie
 }
 
@@ -268,6 +303,10 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
   private readonly transactionName: string
   private readonly requestAccounts = new WeakMap<IncomingMessage,
     Promise<RegistryAuthenticatedAccount | null>>()
+  private readonly requestIdentities = new WeakMap<IncomingMessage,
+    Promise<RegistryAuthenticatedIdentity | null>>()
+  private readonly requestOrganizationAccounts = new WeakMap<IncomingMessage,
+    Map<string, Promise<RegistryAuthenticatedAccount | null>>>()
 
   /** @param ctx - Registry runtime with Credentials, WebServer and the persisted directory.
    * @param config - Validated relying-party, session and response bounds. */
@@ -295,10 +334,83 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     }
   }
 
+  override async authenticateIdentity(request: IncomingMessage,
+    signal: AbortSignal): Promise<RegistryAuthenticatedIdentity | null> {
+    signal.throwIfAborted()
+    const cached = this.requestIdentities.get(request)
+    if (cached !== undefined) return cached
+    const pending = this.identityFresh(request, signal)
+    this.requestIdentities.set(request, pending)
+    try { return await pending } catch (error) {
+      this.requestIdentities.delete(request)
+      throw error
+    }
+  }
+
+  override async authenticateOrganization(request: IncomingMessage, organizationId: OrganizationId,
+    signal: AbortSignal): Promise<RegistryAuthenticatedAccount | null> {
+    signal.throwIfAborted()
+    let accounts = this.requestOrganizationAccounts.get(request)
+    if (accounts === undefined) {
+      accounts = new Map()
+      this.requestOrganizationAccounts.set(request, accounts)
+    }
+    const cached = accounts.get(organizationId)
+    if (cached !== undefined) return cached
+    const pending = this.organizationAccountFresh(request, organizationId, signal)
+    accounts.set(organizationId, pending)
+    try { return await pending } catch (error) {
+      accounts.delete(organizationId)
+      throw error
+    }
+  }
+
   /** Resolve one signed session and one current directory snapshot per HTTP request.
    * Re-entrant authorization callbacks share this request-local result so a directory read cannot lock itself. */
   private async authenticateFresh(request: IncomingMessage,
     signal: AbortSignal): Promise<RegistryAuthenticatedAccount | null> {
+    const session = await this.readSession(request)
+    if (session === null) return null
+    if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
+    try { return await this.currentAccount(session.memberId, signal) } catch (error) {
+      if (error instanceof RegistryIngestError && error.code === 'not-found') return null
+      throw error
+    }
+  }
+
+  private async identityFresh(request: IncomingMessage,
+    signal: AbortSignal): Promise<RegistryAuthenticatedIdentity | null> {
+    const session = await this.readSession(request)
+    if (session === null) return null
+    if (session.version === 1) {
+      if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
+      return { accountId: session.memberId, issuer: session.issuer, subject: session.memberId,
+        memberId: session.memberId, displayName: session.memberId }
+    }
+    return { accountId: session.accountId, issuer: session.issuer, subject: session.subject,
+      memberId: session.memberId, displayName: session.displayName }
+  }
+
+  private async organizationAccountFresh(request: IncomingMessage, organizationId: OrganizationId,
+    signal: AbortSignal): Promise<RegistryAuthenticatedAccount | null> {
+    const session = await this.readSession(request)
+    if (session === null) return null
+    if (session.version === 1) {
+      if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
+      if (organizationId !== this.config.organizationId) return null
+      return this.currentAccount(session.memberId, signal)
+    }
+    const router = this.runtimeCtx.get('registryTenantRouter')
+    if (router === undefined) return organizationId === this.config.organizationId
+      ? this.currentAccount(session.memberId, signal) : null
+    const selected = await router.runtimeForAccount(brandString<RegistryAccountId>(session.accountId), organizationId)
+    if (selected === null || selected.access.membership.memberId !== session.memberId) return null
+    try {
+      return await this.accountFromRuntime(selected.lease.runtime, organizationId, session.memberId, signal)
+    } finally { selected.lease.release() }
+  }
+
+  private async readSession(request: IncomingMessage): Promise<SessionCookie | null> {
     const encoded = cookieValue(request, this.sessionName, this.config.maxCookieBytes)
     if (encoded === null) return null
     const secret = await this.secret(this.config.sessionSecretEnv)
@@ -308,10 +420,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     const now = Date.now()
     if (session === null || session.issuer !== this.config.issuer || session.issuedAt > now
       || session.expiresAt <= now || session.expiresAt - session.issuedAt > this.config.sessionTtlMs) return null
-    try { return await this.currentAccount(session.memberId, signal) } catch (error) {
-      if (error instanceof RegistryIngestError && error.code === 'not-found') return null
-      throw error
-    }
+    return session
   }
 
   private installRoutes(): void {
@@ -401,11 +510,48 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       maxAge: this.config.maxAuthenticationAgeSeconds,
     })
     const claims = tokens.claims()
+    const externalSubject = claims?.sub
     const externalMemberId = claims?.[this.config.memberIdClaim]
-    if (typeof externalMemberId !== 'string' || !IDENTIFIER.test(externalMemberId)) {
+    if (typeof externalSubject !== 'string' || externalSubject.length === 0
+      || Buffer.byteLength(externalSubject, 'utf8') > 512 || !externalSubject.isWellFormed()
+      || typeof externalMemberId !== 'string' || !IDENTIFIER.test(externalMemberId)) {
       throw new OidcUnavailable('OIDC member mapping unavailable')
     }
-    await this.currentAccount(externalMemberId, signal)
+    const displayNameClaim = typeof claims?.name === 'string' ? claims.name
+      : typeof claims?.preferred_username === 'string' ? claims.preferred_username : externalMemberId
+    const displayName = displayNameClaim.trim()
+    if (displayName.length === 0 || Buffer.byteLength(displayName, 'utf8') > 256
+      || !displayName.isWellFormed() || /[\u0000-\u001f\u007f]/u.test(displayName)) {
+      throw new OidcUnavailable('OIDC display name unavailable')
+    }
+    const router = this.runtimeCtx.get('registryTenantRouter')
+    let tenantAccount: RegistryAccount | undefined
+    if (router === undefined) await this.currentAccount(externalMemberId, signal)
+    else {
+      tenantAccount = await router.tenancy.resolveOrCreateAccount({
+        issuer: this.config.issuer,
+        subject: externalSubject,
+        memberId: brandString<MemberId>(externalMemberId),
+        displayName,
+      })
+      // Existing single-organization owners are claimed only after the retained directory independently proves ownership.
+      const existing = await router.tenancy.getOrganizationForAccount(tenantAccount.accountId,
+        this.config.organizationId)
+      if (existing === null && this.config.legacyOwnerSubject !== undefined
+        && externalSubject === this.config.legacyOwnerSubject) {
+        let legacyLease: RegistryTenantRuntimeLease | undefined
+        try {
+          legacyLease = await router.acquireRuntime(this.config.organizationId)
+          const legacy = await this.accountFromRuntime(legacyLease.runtime, this.config.organizationId,
+            externalMemberId, signal)
+          if (legacy.subject.role === 'owner') {
+            await router.tenancy.claimLegacyOwner(tenantAccount, this.config.organizationId)
+          }
+        } catch {
+          // A new SaaS account is valid without a legacy organization; onboarding remains available.
+        } finally { legacyLease?.release() }
+      }
+    }
     const now = Date.now()
     const tokenExpiry = typeof claims?.exp === 'number' && Number.isSafeInteger(claims.exp)
       ? claims.exp * 1000 : now + this.config.sessionTtlMs
@@ -414,12 +560,20 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     const secret = await this.secret(this.config.sessionSecretEnv)
     let session: string
     try {
-      session = seal(secret, { version: 1, issuer: this.config.issuer, memberId: externalMemberId,
-        issuedAt: now, expiresAt } satisfies SessionCookie, this.config.maxCookieBytes)
+      session = seal(secret, tenantAccount === undefined
+        ? { version: 1, issuer: this.config.issuer, memberId: externalMemberId,
+          issuedAt: now, expiresAt } satisfies LegacySessionCookie
+        : { version: 2, issuer: this.config.issuer, subject: externalSubject,
+          accountId: tenantAccount.accountId, memberId: tenantAccount.memberId,
+          displayName: tenantAccount.displayName, issuedAt: now, expiresAt } satisfies TenantSessionCookie,
+      this.config.maxCookieBytes)
     } finally { secret.fill(0) }
     clearCookies(response, [this.transactionName], this.secureCookies)
     response.appendHeader('set-cookie', `${this.sessionName}=${session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${String(Math.ceil((expiresAt - now) / 1000))}${this.secureCookies ? '; Secure' : ''}`)
-    redirect(response, transaction.returnTo)
+    const returnTo = tenantAccount !== undefined
+      && (await router!.listOrganizations(tenantAccount.accountId)).length === 0
+      ? '/#/new-organization' : transaction.returnTo
+    redirect(response, returnTo)
   }
 
   private async client(signal: AbortSignal): Promise<Configuration> {
@@ -453,10 +607,23 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     signal.throwIfAborted()
     const directory: RegistryDirectory | undefined = this.runtimeCtx.get('registryDirectory')
     if (directory === undefined) throw new OidcUnavailable('Registry directory unavailable')
+    return this.accountFromDirectory(directory, this.config.organizationId, memberId, signal)
+  }
+
+  private accountFromRuntime(runtime: RegistryTenantRuntime, organizationId: OrganizationId,
+    memberId: string, signal: AbortSignal): Promise<RegistryAuthenticatedAccount> {
+    if (runtime.directory === undefined || runtime.organizationId !== organizationId) {
+      return Promise.reject(new OidcUnavailable('Registry directory unavailable'))
+    }
+    return this.accountFromDirectory(runtime.directory, organizationId, memberId, signal)
+  }
+
+  private async accountFromDirectory(directory: RegistryDirectory, organizationId: OrganizationId,
+    memberId: string, signal: AbortSignal): Promise<RegistryAuthenticatedAccount> {
     const brandedMemberId = brandString<MemberId>(memberId)
     const value = await directory.read(() => {
       signal.throwIfAborted()
-      return { subject: { organizationId: this.config.organizationId,
+      return { subject: { organizationId,
         memberId: brandedMemberId, authenticated: true }, now: Date.now() }
     }, 'audience', this.config.maxDirectoryBytes)
     signal.throwIfAborted()
@@ -464,7 +631,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     if (member === undefined || member.state !== 'active') throw new RegistryIngestError('not-found')
     return {
       subject: {
-        organizationId: this.config.organizationId,
+        organizationId,
         memberId: brandedMemberId,
         authenticated: true,
         membership: member.state,

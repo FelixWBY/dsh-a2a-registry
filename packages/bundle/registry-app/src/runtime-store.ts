@@ -3,6 +3,7 @@ import type { Context, FiberState } from '@deepseek-ai/cordis'
 import type { DisclosureId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { openRegistryIngest, RegistryIngestError, type RegistryAuditConfig, type RegistryDisclosureInvalidation,
   type RegistryBindingConfig, type RegistryBindingInvalidation, type RegistryDirectoryConfig, type RegistryIngest, type RegistryIngestLimits } from '@deepseek-ai/dsh-a2a-registry-ingest'
+import type { RegistryIngestStorageScope } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import type { RegistryOperationalAlertExporter } from './operational-alerts.ts'
 import { RegistryTransportObservations } from './transport-observation.ts'
@@ -50,7 +51,8 @@ export class RegistryRuntimeStore {
     private readonly limits: RegistryIngestLimits, private readonly abort: AbortController,
     private readonly audit?: RegistryAuditConfig, private readonly directory?: RegistryDirectoryConfig,
     private readonly bindings?: RegistryBindingConfig,
-    private readonly alerts?: RegistryOperationalAlertExporter) {}
+    private readonly alerts?: RegistryOperationalAlertExporter,
+    private readonly storage?: RegistryIngestStorageScope) {}
 
   /** Detect disposal or silent provider replacement before the next owned operation.
    * @returns Whether this exact runtime can admit another operation. */
@@ -83,7 +85,7 @@ export class RegistryRuntimeStore {
         if (this.store === undefined) {
           try {
             const ingest = await openRegistryIngest(this.facility, this.organizationId, this.limits,
-              this.audit, this.directory, this.bindings)
+              this.audit, this.directory, this.bindings, this.storage)
             const unsubscribe = ingest.subscribeInvalidation((change) => {
               this.publish(Object.freeze({ kind: 'authorization', change }))
             })

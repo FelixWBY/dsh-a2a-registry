@@ -5,6 +5,7 @@ import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RegistryPage } from './navigation.ts'
 import type { RegistryKey } from './locales.ts'
 import type {
+  RegistryAccountContext,
   RegistryAuditPage,
   RegistryA2aRequestPage,
   RegistryBindingReview,
@@ -23,6 +24,8 @@ import type {
   RegistryQuestionRequest,
   RegistryQuestionResult,
   RegistryRuntimeStatus,
+  RegistryOrganizationCreateRequest,
+  RegistryOrganizationSummary,
 } from './registry-api.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -44,6 +47,8 @@ export interface RegistryInjected {
   setLocale: (id: 'zh' | 'en') => void
   /** Explicit browser configuration; true only for a locally composed non-production identity. */
   localTestIdentityBanner: boolean
+  /** Read the signed-in account and every organization currently visible to it. */
+  readAccount: (signal: AbortSignal) => Promise<RegistryAccountContext>
 }
 
 /** Root inputs derive from the registered child, locale and injection declarations. */
@@ -59,48 +64,95 @@ export interface RegistryPageInjected {
   localTestIdentityBanner: boolean
   /** Read explicit Registry startup configuration facts without inferring liveness. */
   readStatus: (signal: AbortSignal) => Promise<RegistryRuntimeStatus>
+  /** Create one organization and its owner membership as an idempotent server transaction. */
+  createOrganization: (request: RegistryOrganizationCreateRequest,
+    signal: AbortSignal) => Promise<RegistryOrganizationSummary>
   /** Read the current administrator-visible organization member and team directory. */
-  readDirectory: (signal: AbortSignal) => Promise<RegistryDirectoryPage>
+  readDirectory: (organizationId: string, signal: AbortSignal) => Promise<RegistryDirectoryPage>
   /** Apply one optimistic owner/admin directory mutation. */
-  changeDirectory: (expectedRevision: number, change: RegistryDirectoryChange,
+  changeDirectory: (organizationId: string, expectedRevision: number, change: RegistryDirectoryChange,
     signal: AbortSignal) => Promise<RegistryDirectoryChangeReceipt>
   /** Read current account-owned instance bindings and ephemeral observations. */
-  listInstances: (signal: AbortSignal) => Promise<RegistryInstancePage>
+  listInstances: (organizationId: string, signal: AbortSignal) => Promise<RegistryInstancePage>
   /** Rename one currently confirmed binding owned by the authenticated account. */
-  renameInstance: (bindingId: string, instanceName: string, signal: AbortSignal) => Promise<RegistryInstance>
+  renameInstance: (organizationId: string, bindingId: string, instanceName: string,
+    signal: AbortSignal) => Promise<RegistryInstance>
   /** Revoke one currently confirmed binding owned by the authenticated account. */
-  revokeInstance: (bindingId: string, signal: AbortSignal) => Promise<RegistryInstance>
+  revokeInstance: (organizationId: string, bindingId: string, signal: AbortSignal) => Promise<RegistryInstance>
   /** Review one device-started binding with the signed-in member's one-time code. */
-  reviewBinding: (bindingId: string, code: string, signal: AbortSignal) => Promise<RegistryBindingReview>
+  reviewBinding: (organizationId: string, bindingId: string, code: string,
+    signal: AbortSignal) => Promise<RegistryBindingReview>
   /** Approve one reviewed binding after fresh account authorization. */
-  approveBinding: (bindingId: string, code: string, instanceName: string,
+  approveBinding: (organizationId: string, bindingId: string, code: string, instanceName: string,
     signal: AbortSignal) => Promise<RegistryBindingReview>
   /** Reject one reviewed binding after fresh account authorization. */
-  rejectBinding: (bindingId: string, code: string, signal: AbortSignal) => Promise<RegistryBindingReview>
+  rejectBinding: (organizationId: string, bindingId: string, code: string,
+    signal: AbortSignal) => Promise<RegistryBindingReview>
   /** Read one authorized page of structured Registry audit metadata. */
-  listAudit: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryAuditPage>
+  listAudit: (organizationId: string, request: RegistryListRequest,
+    signal: AbortSignal) => Promise<RegistryAuditPage>
   /** Read one authorized page of durable A2A question metadata without question or reply text. */
-  listBranches: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryA2aRequestPage>
+  listBranches: (organizationId: string, request: RegistryListRequest,
+    signal: AbortSignal) => Promise<RegistryA2aRequestPage>
   /** Read only the current caller's authorized Registry metadata page. */
-  listDisclosures: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryDisclosurePage>
+  listDisclosures: (organizationId: string, request: RegistryListRequest,
+    signal: AbortSignal) => Promise<RegistryDisclosurePage>
   /** Read one authorized metadata record; nonexistent and unauthorized resources share one failure. */
-  readDisclosure: (disclosureId: string, signal: AbortSignal) => Promise<RegistryDisclosureDetail>
+  readDisclosure: (organizationId: string, disclosureId: string,
+    signal: AbortSignal) => Promise<RegistryDisclosureDetail>
   /** Read one immutable checkpoint's authorized plain-text events without retaining a browser cache. */
-  readDisclosureContent: (disclosureId: string, checkpointHash: string,
+  readDisclosureContent: (organizationId: string, disclosureId: string, checkpointHash: string,
     signal: AbortSignal) => Promise<RegistryDisclosureContent>
   /** List provider-confirmed target bindings for the currently authorized import. */
-  listImportTargets: (disclosureId: string, signal: AbortSignal) => Promise<RegistryImportTargetPage>
+  listImportTargets: (organizationId: string, disclosureId: string,
+    signal: AbortSignal) => Promise<RegistryImportTargetPage>
   /** Ask the Host to import the currently authorized checkpoint into one selected bound DSH. */
-  importDisclosure: (disclosureId: string, request: RegistryImportRequest, signal: AbortSignal) => Promise<RegistryImportResult>
+  importDisclosure: (organizationId: string, disclosureId: string, request: RegistryImportRequest,
+    signal: AbortSignal) => Promise<RegistryImportResult>
   /** Reauthorize and read one durable context-import operation. */
-  readImport: (disclosureId: string, operationId: string, signal: AbortSignal) => Promise<RegistryImportResult>
+  readImport: (organizationId: string, disclosureId: string, operationId: string,
+    signal: AbortSignal) => Promise<RegistryImportResult>
   /** Ask the Host to deliver one pure-text question to the source DSH. */
-  askDisclosure: (disclosureId: string, request: RegistryQuestionRequest, signal: AbortSignal) => Promise<RegistryQuestionResult>
+  askDisclosure: (organizationId: string, disclosureId: string, request: RegistryQuestionRequest,
+    signal: AbortSignal) => Promise<RegistryQuestionResult>
   /** Reauthorize and read one durable question status and completed plain-text reply. */
-  readQuestion: (disclosureId: string, requestId: string, signal: AbortSignal) => Promise<RegistryQuestionResult>
+  readQuestion: (organizationId: string, disclosureId: string, requestId: string,
+    signal: AbortSignal) => Promise<RegistryQuestionResult>
   /** Reauthorize and cancel one question while it remains queued. */
-  cancelQuestion: (disclosureId: string, requestId: string, signal: AbortSignal) => Promise<RegistryQuestionResult>
+  cancelQuestion: (organizationId: string, disclosureId: string, requestId: string,
+    signal: AbortSignal) => Promise<RegistryQuestionResult>
 }
 
 /** Page inputs derive from the public route, locale and theme injection declarations. */
 export type RegistryPageProps = PropsRuntime<'registry.page'> & PropsLocale<'registry'> & InjectFace<RegistryPageInjected>
+
+/** Stable organization-bound callbacks passed from the route owner to existing page components. */
+export interface RegistryOrganizationPageActions {
+  readDirectory: (signal: AbortSignal) => Promise<RegistryDirectoryPage>
+  changeDirectory: (expectedRevision: number, change: RegistryDirectoryChange,
+    signal: AbortSignal) => Promise<RegistryDirectoryChangeReceipt>
+  listInstances: (signal: AbortSignal) => Promise<RegistryInstancePage>
+  renameInstance: (bindingId: string, instanceName: string, signal: AbortSignal) => Promise<RegistryInstance>
+  revokeInstance: (bindingId: string, signal: AbortSignal) => Promise<RegistryInstance>
+  reviewBinding: (bindingId: string, code: string, signal: AbortSignal) => Promise<RegistryBindingReview>
+  approveBinding: (bindingId: string, code: string, instanceName: string,
+    signal: AbortSignal) => Promise<RegistryBindingReview>
+  rejectBinding: (bindingId: string, code: string, signal: AbortSignal) => Promise<RegistryBindingReview>
+  listAudit: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryAuditPage>
+  listBranches: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryA2aRequestPage>
+  listDisclosures: (request: RegistryListRequest, signal: AbortSignal) => Promise<RegistryDisclosurePage>
+  readDisclosure: (disclosureId: string, signal: AbortSignal) => Promise<RegistryDisclosureDetail>
+  readDisclosureContent: (disclosureId: string, checkpointHash: string,
+    signal: AbortSignal) => Promise<RegistryDisclosureContent>
+  listImportTargets: (disclosureId: string, signal: AbortSignal) => Promise<RegistryImportTargetPage>
+  importDisclosure: (disclosureId: string, request: RegistryImportRequest,
+    signal: AbortSignal) => Promise<RegistryImportResult>
+  readImport: (disclosureId: string, operationId: string, signal: AbortSignal) => Promise<RegistryImportResult>
+  askDisclosure: (disclosureId: string, request: RegistryQuestionRequest,
+    signal: AbortSignal) => Promise<RegistryQuestionResult>
+  readQuestion: (disclosureId: string, requestId: string, signal: AbortSignal) => Promise<RegistryQuestionResult>
+  cancelQuestion: (disclosureId: string, requestId: string, signal: AbortSignal) => Promise<RegistryQuestionResult>
+}
+
+export type RegistryOrganizationPageProps = Pick<RegistryPageProps,
+  't' | 'useTheme' | 'setTheme' | 'localTestIdentityBanner' | 'readStatus'> & RegistryOrganizationPageActions

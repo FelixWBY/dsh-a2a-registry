@@ -13,15 +13,19 @@
     - id: registry-local-oidc-storage
       name: '@deepseek-ai/dsh-storage'
 
-    - id: registry-local-oidc-storage-json
-      name: '@deepseek-ai/dsh-storage-json'
+    - id: registry-local-oidc-storage-postgres
+      name: '@deepseek-ai/dsh-storage-postgres'
       config:
-        root: !!js process.env.DSH_LOCAL_REGISTRY_STORAGE
+        connectionString: !!js process.env.DSH_REGISTRY_POSTGRES_URL
+        schema: registry_saas_local
+        maxConnections: 4
+        idleTimeoutMs: 30000
+        statementTimeoutMs: 15000
 
     - id: registry-local-oidc-storage-domain
       name: '@deepseek-ai/dsh-storage-domain'
       config:
-        backend: json
+        backend: postgres
 
     - id: registry-local-oidc-credentials
       name: '@deepseek-ai/dsh-credentials-local'
@@ -32,6 +36,15 @@
   inject: [storageDomain, credentials]
   config:
     printUrl: true
+    saas:
+      databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
+      schema: registry_saas_local
+      legacyOrganizationName: 本地迁移组织
+      maxConnections: 2
+      maxOrganizationsPerAccount: 5
+      maxActiveOrganizations: 64
+      idleTimeoutMs: 30000
+      statementTimeoutMs: 15000
     oidc:
       mode: loopback-development
       issuer: http://127.0.0.1:3182/realms/dsh-local

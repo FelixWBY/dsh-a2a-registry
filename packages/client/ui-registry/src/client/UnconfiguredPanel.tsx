@@ -14,7 +14,7 @@ export function UnconfiguredPanel({ t, icon = 'emptyNodes', headingLevel = 2 }: 
       <RegistryIcon name={icon} size={96} />
       {headingLevel === 3 ? <h3>{t('unconfigured')}</h3> : <h2>{t('unconfigured')}</h2>}
       <div><p>{t('identityMissing')}</p><p>{t('noLocalData')}</p></div>
-      <a className={css.primaryAction} href="#/settings">{t('requirements')}</a>
+      <a className={css.primaryAction} href="#/">{t('requirements')}</a>
     </div>
   )
 }
