@@ -1,9 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { verifyRuntimeConfigurationValue } from '../deploy/registry/verify-public-registry.mjs'
+import { verifyHttpRedirectValue, verifyRuntimeConfigurationValue } from '../deploy/registry/verify-public-registry.mjs'
 
 const registryVariables = /^(?:DSH_|REGISTRY_DOMAIN$|REGISTRY_BACKUP_PASSWORD$)/u
 
@@ -71,4 +72,39 @@ test('public production status requires the live SaaS tenant-router marker', () 
   assert.doesNotThrow(() => verifyRuntimeConfigurationValue({
     deploymentMode: 'standard', tenancy: 'saas', ...configured,
   }))
+})
+
+test('public HTTP entry redirects permanently to the exact same HTTPS request target', () => {
+  const expected = new URL('https://registry.acme.dev/')
+  const requested = new URL('http://registry.acme.dev/.well-known/dsh-registry-http-redirect-check?verification=public-entry')
+  const valid = 'https://registry.acme.dev/.well-known/dsh-registry-http-redirect-check?verification=public-entry'
+  assert.doesNotThrow(() => verifyHttpRedirectValue(expected, requested, 301, valid))
+  assert.doesNotThrow(() => verifyHttpRedirectValue(expected, requested, 308, valid))
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 302, valid), /permanent redirect/u)
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 308,
+    'https://other.acme.dev/.well-known/dsh-registry-http-redirect-check?verification=public-entry'),
+    /leaves the public Registry origin/u)
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 308,
+    'https://user:secret@registry.acme.dev/.well-known/dsh-registry-http-redirect-check?verification=public-entry'),
+    /contains credentials/u)
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 308,
+    'http://registry.acme.dev/.well-known/dsh-registry-http-redirect-check?verification=public-entry'),
+    /HTTPS on port 443/u)
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 308,
+    'https://registry.acme.dev:444/.well-known/dsh-registry-http-redirect-check?verification=public-entry'),
+    /HTTPS on port 443/u)
+  assert.throws(() => verifyHttpRedirectValue(expected, requested, 308,
+    'https://registry.acme.dev/wrong?verification=public-entry'), /does not preserve/u)
+})
+
+test('systemd production examples disable core dumps and private device access', () => {
+  for (const relativePath of [
+    'deploy/registry/dsh-registry.service.example',
+    'deploy/registry/dsh-harness.service.example',
+    'deploy/registry/caddy-registry.service.conf.example',
+  ]) {
+    const unit = readFileSync(new URL(`../${relativePath}`, import.meta.url), 'utf8')
+    assert.match(unit, /^LimitCORE=0$/mu, `${relativePath} must disable core dumps`)
+    assert.match(unit, /^PrivateDevices=true$/mu, `${relativePath} must hide host devices`)
+  }
 })

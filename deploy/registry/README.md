@@ -83,7 +83,7 @@ pwsh -NoProfile -File 'C:\dsh-runtime\dsh-a2a-registry\deploy\registry\start-bou
 
 PostgreSQL 必须在停服后按 `deploy/postgres/split-registry-runtime-role.sql`、独立 `registry_migrator` 的 `migrate-postgres-schemas.mjs`、同一权限脚本的顺序执行完整 `split → migrate → split`。在线 Registry 只注入 `registry_app` URL，并以 `schemaMode: validate` 做只读启动校验；迁移 URL 不得进入服务环境。
 
-生产探针分为两层：`/healthz` 只报告进程存活；SaaS `/readyz` 会同时通过实际 storage pool 与 tenancy pool 读取权威 schema 版本标记，并拒绝任何非 PostgreSQL 的 domain 路由。数据库失联、任一标记缺失或应用尚未加载完成时 readiness 返回 503，恢复后无需重启即可回到 200。读取使用单飞、2 秒 HTTP 有界等待、1.5 秒查询超时和 1 秒结果缓存；新建连接仍受连接池 10 秒硬上限约束，避免网络半开时永久占住探针。不要把 `/healthz` 改成 Caddy 的流量就绪门禁。
+生产探针分为两层：`/healthz` 只报告进程存活；SaaS `/readyz` 会同时通过实际 storage pool 与 tenancy pool 读取权威 schema 版本标记，并拒绝任何非 PostgreSQL 的 domain 路由。数据库失联、任一标记缺失或应用尚未加载完成时 readiness 返回 503，恢复后无需重启即可回到 200。读取使用单飞、2 秒 HTTP 有界等待、1.5 秒查询超时和 1 秒结果缓存；新建连接仍受连接池 10 秒硬上限约束，避免网络半开时永久占住探针。不要把 `/healthz` 改成 Caddy 的流量就绪门禁。公网验证还会以不跟随跳转的方式直连 HTTP 80，只接受同域、同路径与查询、无凭据的 HTTPS 443 永久跳转；端口 80 不得代理 Registry 业务响应。
 
 本地开发先启动仓库提供的 PostgreSQL 容器。首次初始化或结构升级时，先停止 3081／3181 两个 Registry，再显式运行 `start-local-keycloak.ps1 -UpgradeDatabase`；它执行一次 `split → migrate → split` 后启动站点。日常运行只执行 `start-local-keycloak.ps1`，不会改数据库结构，只由在线进程做只读校验。脚本启动固定版本 Keycloak、打开用户自助注册，并用固定版本 Caddy 在 `wss://localhost:3183/a2a/v1/sync` 提供本地 TLS 设备同步入口；内部 CA 根证书路径会随启动结果返回。Harness 连接此本地地址时须把返回路径设为该进程的 `NODE_EXTRA_CA_CERTS`，不能关闭 TLS 校验。生成的凭据和 CA 数据只写入 Git 忽略且限制当前用户访问的 `.artifacts`。`-RegistryOnly` 不启动或停止现有 Keycloak／Caddy，只复用已经就绪的本地容器。本地 Keycloak 与内部 CA 均不得用于生产。
 

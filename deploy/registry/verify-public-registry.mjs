@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url'
 const TIMEOUT_MS = 10_000
 const MAX_FRAME_BYTES = 1_048_576
 const MAX_STATUS_BYTES = 8_192
+const HTTP_REDIRECT_PROBE_PATH = '/.well-known/dsh-registry-http-redirect-check'
+const HTTP_REDIRECT_PROBE_SEARCH = '?verification=public-entry'
 const REQUIRED_RUNTIME_CAPABILITIES = [
   'identity', 'registry', 'disclosureOperations', 'deviceBinding',
   'audit', 'rateLimits', 'disclosureCleanup', 'mailboxCleanup',
@@ -77,6 +79,56 @@ function verifySecurityHeaders(response) {
   requireHeader(response, 'cross-origin-resource-policy', value => value.toLowerCase() === 'same-origin')
   requireHeader(response, 'permissions-policy', value => value.includes('camera=()') && value.includes('microphone=()'))
   if (response.headers.has('server')) fail('the public edge still exposes a Server response header')
+}
+
+/** Validate one manually observed port-80 redirect without following it. */
+export function verifyHttpRedirectValue(expectedOrigin, requestedUrl, status, locationValue) {
+  if (status !== 301 && status !== 308) {
+    fail(`HTTP port 80 returned ${String(status)} instead of a permanent redirect`)
+  }
+  if (typeof locationValue !== 'string' || locationValue.length === 0) {
+    fail('the HTTP redirect Location header is missing')
+  }
+  let target
+  try {
+    target = new URL(locationValue, requestedUrl)
+  } catch {
+    fail('the HTTP redirect Location header is invalid')
+  }
+  if (target.username.length > 0 || target.password.length > 0) {
+    fail('the HTTP redirect target contains credentials')
+  }
+  if (target.protocol !== 'https:' || target.port.length > 0) {
+    fail('the HTTP redirect must target HTTPS on port 443')
+  }
+  if (target.origin !== expectedOrigin.origin) {
+    fail('the HTTP redirect leaves the public Registry origin')
+  }
+  if (target.pathname !== requestedUrl.pathname || target.search !== requestedUrl.search
+    || target.hash.length > 0) {
+    fail('the HTTP redirect does not preserve the requested path and query')
+  }
+}
+
+async function verifyHttpRedirect() {
+  const requestedUrl = new URL(origin)
+  requestedUrl.protocol = 'http:'
+  requestedUrl.pathname = HTTP_REDIRECT_PROBE_PATH
+  requestedUrl.search = HTTP_REDIRECT_PROBE_SEARCH
+  let response
+  try {
+    response = await fetch(requestedUrl, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch {
+    fail('HTTP port 80 could not be reached for the HTTPS redirect check')
+  }
+  try {
+    verifyHttpRedirectValue(origin, requestedUrl, response.status, response.headers.get('location'))
+  } finally {
+    await response.body?.cancel().catch(() => undefined)
+  }
 }
 
 async function read(path) {
@@ -219,6 +271,7 @@ async function main() {
   try {
     origin = publicOrigin(rawOrigin)
     checkNodeRuntime()
+    await verifyHttpRedirect()
     await verifyProbe('/healthz')
     await verifyProbe('/readyz')
     await verifyRuntimeConfiguration()
@@ -227,6 +280,7 @@ async function main() {
     process.stdout.write([
       'registry-public-verification: passed',
       `- origin: ${origin.origin}`,
+      '- HTTP port 80: permanent same-origin HTTPS redirect preserves the request target',
       '- HTTPS shell, HSTS and browser security headers: valid',
       '- liveness and shell readiness: ready',
       '- tenancy: SaaS tenant router loaded; deployment mode: standard',

@@ -28,6 +28,8 @@ npm start -- --patch /etc/dsh/registry-production.patch.yml
 
 把代码安装到 `/opt/dsh-a2a-registry`，Registry 只监听回环 3081；使用 `registry/Caddyfile.example` 在正式域名提供 HTTPS/WSS。`registry/dsh-registry.service.example` 已指向独立启动器。确保服务用户可以写入自己的 DSH_HOME 与三套数据库目录，不能读取 Harness 设备私钥。
 
+三个 systemd 示例都用 `LimitCORE=0` 禁止生成可能含会话、设备或数据库凭据的 core dump，并用 `PrivateDevices=true` 隐藏主机设备节点。这两项不会关闭 Registry、Harness 或 Caddy 需要的普通网络与工作目录访问。不要盲目追加 `MemoryDenyWriteExecute=true`、`PrivateNetwork=true` 或未验证的系统调用过滤：它们可能破坏 Node.js JIT、公网 WSS／OIDC 或 Harness 工作区。
+
 不要将本地 Keycloak 的 `start-dev`、测试身份或回环 HTTP 配置直接作为公网生产配置。
 
 ```sh
@@ -37,6 +39,8 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 ```
 
 `registry` 范围是公网 SaaS 门禁：必须显式提供使用 `registry_app` 角色的 PostgreSQL URL 和 SaaS 初始化信息，单组织 SQLite 配置不能通过。公网验证还会从服务端状态接口确认实时 `registryTenantRouter` 已加载，不以浏览器缓存或单纯的 `standard` 部署标签代替。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
+
+公网验证器会先直接访问正式域名的 HTTP 80 端口，并以 `manual` 模式检查跳转而不自动跟随。只接受 301／308 永久跳转，`Location` 必须是不含用户名或密码的同域 HTTPS 443 地址，并完整保留探测请求的路径与查询；跨域、非 HTTPS、非 443、相对跳转、错误路径或附加片段都会失败。端口 80 只能承担该跳转，Registry 页面、API 与 WSS 均只由 443 提供。
 
 `/healthz` 只用于判断 Registry 进程是否存活。`/readyz` 还会等待应用加载完成，并在 SaaS 模式分别通过实际 storage pool 与 tenancy pool 核对 PostgreSQL 权威版本标记；非 PostgreSQL domain 路由、数据库中断或标记缺失时返回 503，数据库恢复后会自动恢复为 200。该数据库探针按进程单飞、短暂缓存，HTTP 决策在 2 秒内失败关闭，底层查询与新建连接也分别受 1.5 秒和 10 秒硬上限约束。Caddy 的上游健康检查使用 `/readyz`。
 

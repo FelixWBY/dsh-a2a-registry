@@ -5,3 +5,5 @@ After=dsh-registry.service
 [Service]
 EnvironmentFile=/etc/dsh/registry-edge.env
 ExecStartPre=/usr/bin/node /opt/dsh-a2a-registry/deploy/registry/check-production-environment.mjs edge
+LimitCORE=0
+PrivateDevices=true
