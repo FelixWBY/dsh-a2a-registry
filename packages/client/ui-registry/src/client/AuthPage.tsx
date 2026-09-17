@@ -10,16 +10,11 @@ type ProviderState = 'loading' | 'oidc' | 'unavailable'
 /** Render account entry from runtime-confirmed identity configuration without offering a fake password flow. */
 export function AuthPage({ mode, t, readStatus }:
   { mode: AuthenticationMode; t: Translate; readStatus: RegistryPageProps['readStatus'] }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [passwordVisible, setPasswordVisible] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
   const [provider, setProvider] = useState<ProviderState>('loading')
   const headingId = useId()
   const statusId = useId()
-  const passwordInputId = useId()
   const isSignIn = mode === 'signIn'
-  const canSubmit = email.trim().length > 0 && password.length >= 8
   const showUnavailable = (): void => { setStatus(t('authProviderUnavailable')) }
 
   useEffect(() => {
@@ -52,29 +47,7 @@ export function AuthPage({ mode, t, readStatus }:
               </button>}
           </div>
 
-          <div className={css.authDivider}><span>{t('authOr')}</span></div>
-
-          <form className={css.authForm} onSubmit={(event) => { event.preventDefault(); showUnavailable() }}>
-            <label className={css.authField}>
-              <span>{t('emailLabel')}</span>
-              <span className={css.authInput}>
-                <RegistryIcon name="email" size={18} />
-                <input type="email" value={email} autoComplete="email" placeholder={t('emailPlaceholder')} onChange={(event) => { setEmail(event.currentTarget.value); setStatus(null) }} />
-              </span>
-            </label>
-            <div className={css.authField}>
-              <span className={css.passwordLabel}><label htmlFor={passwordInputId}>{t('passwordLabel')}</label>{isSignIn ? <button type="button" onClick={showUnavailable}>{t('forgotPassword')}</button> : null}</span>
-              <span className={css.passwordInput}>
-                <RegistryIcon name="lock" size={18} />
-                <input id={passwordInputId} type={passwordVisible ? 'text' : 'password'} value={password} minLength={8} autoComplete={isSignIn ? 'current-password' : 'new-password'} placeholder={t('passwordPlaceholder')} onChange={(event) => { setPassword(event.currentTarget.value); setStatus(null) }} />
-                <button type="button" aria-label={t(passwordVisible ? 'hidePassword' : 'showPassword')} onClick={() => { setPasswordVisible(value => !value) }}><RegistryIcon name={passwordVisible ? 'eyeOff' : 'eye'} size={17} /></button>
-              </span>
-            </div>
-            <button className={css.authSubmit} type="submit" disabled={!canSubmit}>{t(isSignIn ? 'signInAction' : 'signUpAction')}</button>
-          </form>
-
           <p className={css.authSwitch}>{t(isSignIn ? 'noAccount' : 'haveAccount')} <a href={isSignIn ? '#/sign-up' : '#/sign-in'}>{t(isSignIn ? 'signUpAction' : 'signInAction')}</a></p>
-          {!isSignIn ? <p className={css.authOrganizationLink}><a href="#/new-organization">{t('organizationPreview')}</a></p> : null}
           <div id={statusId} className={css.authStatus} role="status">
             <RegistryIcon name="info" size={18} />
             <div><strong>{t(provider === 'oidc' ? 'authProviderReadyTitle' : 'authUnconfiguredTitle')}</strong><p>{status ?? t(provider === 'oidc' ? 'authProviderReadyDescription' : provider === 'loading' ? 'authCheckingProviderDescription' : 'authProviderUnavailable')}</p></div>
