@@ -1284,6 +1284,31 @@ function operationSelection(reader: RegistryDisclosureReader, enrollment: Regist
   return {
     subject: selectedSubject,
     disclosure,
+    listAuthorizedTargets: async (operationSignal: AbortSignal) => {
+      requireOperationActive(operationSignal)
+      if (enrollment === undefined) throw new RegistryIngestError('closed')
+      const pinnedAuthority: FreshRegistryDirectoryAuthority = async () => {
+        const current = await authority()
+        if (current.subject.organizationId !== selectedSubject.organizationId
+          || current.subject.memberId !== selectedSubject.memberId) throw new RegistryIngestError('not-found')
+        return { subject: {
+          organizationId: current.subject.organizationId,
+          memberId: current.subject.memberId,
+          authenticated: current.subject.authenticated,
+        }, now: current.now }
+      }
+      const bindings = await enrollment.list(pinnedAuthority, maxResponseBytes)
+      requireOperationActive(operationSignal)
+      return bindings.filter(binding => binding.organizationId === selectedSubject.organizationId
+        && binding.phase === 'confirmed' && binding.requestedScopes.includes('a2a.receive')).map(binding => {
+        const transport = binding.transport
+        return transport.kind === 'connected' && transport.report !== undefined
+          ? { instanceId: binding.instanceId, transport: 'connected' as const,
+            acceptingA2A: transport.report.acceptingA2A, activeRequests: transport.report.activeRequests }
+          : { instanceId: binding.instanceId, transport: transport.kind,
+            acceptingA2A: null, activeRequests: null }
+      })
+    },
     authorizeTarget: async (targetInstanceId: DshInstanceId, operationSignal: AbortSignal) => {
       requireOperationActive(operationSignal)
       if (enrollment === undefined) throw new RegistryIngestError('closed')
@@ -1642,7 +1667,7 @@ function mapFailure(error: unknown): ApiFailure {
   }
   if (error instanceof RegistryIngestError) {
     if (error.code === 'not-found') return new ApiFailure(404, 'not-found')
-    if (error.code === 'version-conflict') return new ApiFailure(409, 'conflict')
+    if (error.code === 'conflict' || error.code === 'version-conflict') return new ApiFailure(409, 'conflict')
     if (error.code === 'invalid-input' || error.code === 'limit') return new ApiFailure(400, 'invalid-input')
     return new ApiFailure(503, 'unavailable')
   }

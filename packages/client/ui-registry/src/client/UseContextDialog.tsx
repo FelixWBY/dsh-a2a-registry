@@ -31,7 +31,7 @@ const IMPORT_STATUS_KEYS: Record<RegistryImportStatus, 'operationQueued' | 'oper
 }
 
 function targetAvailable(target: RegistryImportTarget): boolean {
-  return target.transport === 'connected' && target.acceptingA2A === true
+  return target.transport === 'not-observed' || target.acceptingA2A === true
 }
 
 /** Select one provider-confirmed target before requesting a fixed-policy context import. */

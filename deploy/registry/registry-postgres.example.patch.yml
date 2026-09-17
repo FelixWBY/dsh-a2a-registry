@@ -29,3 +29,10 @@
       maxActiveOrganizations: 256
       idleTimeoutMs: 30000
       statementTimeoutMs: 15000
+    ingest:
+      imports:
+        maxOperations: 10000
+        maxRecordBytes: 4096
+        maxAuthorizationResponseBytes: 262144
+        maxDeliveryBytes: 1047552
+        deliveryTimeoutMs: 15000

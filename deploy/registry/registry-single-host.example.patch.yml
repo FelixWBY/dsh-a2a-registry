@@ -1,8 +1,9 @@
-# Single-host production foundation. It deliberately declares external service
-# injections that this repository cannot invent. Loader readiness therefore
-# fails closed until the deployment adds real Credentials, device-key/KMS,
-# and disclosure-operation providers. SaaS producer authentication is derived
-# from confirmed v5 bindings and does not use a deployment-wide bearer token.
+# Single-host production foundation. It deliberately requires the external
+# Credentials service that this repository cannot invent. SaaS producer
+# authentication and tenant import operations are built in; producer authentication
+# does not use a deployment-wide bearer token. Disclosure decryption and questions
+# remain unconfigured and their HTTP capabilities return 501 until providers are added;
+# unfinished P-KMS does not by itself prevent Registry startup.
 # Never add localHarness or a test-only identity to this file.
 
 - insert:
@@ -32,7 +33,6 @@
   inject:
     - storageDomain
     - credentials
-    - registryDisclosureOperations
   config:
     printUrl: false
     oidc:

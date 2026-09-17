@@ -13,7 +13,8 @@ import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type Disclos
   type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { decodeRegistryClientFrame, encodeRegistryServerFrame, RegistrySyncProtocolError,
   type RegistryClientFrame, type RegistryInstanceReport, type RegistryProducerAccessUpdate,
-  type RegistryProducerRegistration, type RegistryServerFrame, type RegistrySyncErrorCode } from '@deepseek-ai/dsh-a2a-registry-sync'
+  type RegistryImportDelivery, type RegistryProducerRegistration, type RegistryServerFrame,
+  type RegistrySyncErrorCode } from '@deepseek-ai/dsh-a2a-registry-sync'
 import type { RegistryRuntimeStore } from './runtime-store.ts'
 import type { RegistrySyncConfig } from './sync-config.ts'
 import type { RegistrySyncAdmission } from './sync-admission.ts'
@@ -86,6 +87,21 @@ function questionError(error: MailboxError): RegistrySyncErrorCode {
   if (error.code === 'invalid-storage' || error.code === 'codec-failed') return 'invalid-storage'
   if (error.code === 'closed') return 'closed'
   return 'storage-unavailable'
+}
+
+/** Reject a broken broker boundary before any untrusted receiver observes cross-tenant or mismatched content. */
+function requireImportDelivery(delivery: RegistryImportDelivery, target: RegistryConnectionAuthority): void {
+  const checkpoint = delivery.prefix.checkpoint
+  if (delivery.organizationId !== target.connection.organizationId
+    || delivery.targetInstanceId !== target.connection.instanceId
+    || delivery.organizationId !== target.history.organizationId
+    || delivery.targetInstanceId !== target.history.instanceId
+    || checkpoint.organizationId !== delivery.organizationId
+    || checkpoint.instanceId !== delivery.sourceInstanceId
+    || checkpoint.disclosureId !== delivery.disclosureId
+    || checkpoint.checkpointHash !== delivery.checkpointHash) {
+    throw new RegistryIngestError('invalid-storage')
+  }
 }
 
 /** Recover only a valid outer resource selection whose nested signed record failed strict decoding. */
@@ -557,6 +573,7 @@ export class RegistrySyncConnection {
       await this.verifyReceiver(checked)
       const target = await checked()
       const delivered = await broker.dispatch(target, async (delivery) => {
+        requireImportDelivery(delivery, target)
         this.disclosures.add(delivery.disclosureId)
         const waiting = this.waitForImportRelease(frame.requestId)
         try { await this.send({ ...base, type: 'import-dispatch', delivery }) }

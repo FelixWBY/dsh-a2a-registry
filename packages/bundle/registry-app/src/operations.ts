@@ -27,6 +27,9 @@ export interface RegistryDisclosureOperationSelection {
    * @throws RegistryIngestError `not-found` when the target is not currently authorized. */
   readonly authorizeTarget: (targetInstanceId: DshInstanceId,
     signal: AbortSignal) => Promise<RegistryTransportObservation>
+  /** Reauthenticate the browser account and list only its currently confirmed receive-capable bindings.
+   * Absence of a live transport observation does not remove an otherwise eligible offline target. */
+  readonly listAuthorizedTargets: (signal: AbortSignal) => Promise<readonly RegistryDisclosureImportTarget[]>
   /** Reauthenticate the browser account and source keys before reading an explicitly retained checkpoint.
    * @param expected - Provider-owned source and checkpoint recovered from durable operation state.
    * @param signal - Execution lifetime; an aborted operation does not begin another authority lookup.

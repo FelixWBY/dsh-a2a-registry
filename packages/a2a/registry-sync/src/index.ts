@@ -223,11 +223,12 @@ function questionDelivery(input: unknown): RegistryQuestionDelivery {
 }
 
 function importDelivery(input: unknown): RegistryImportDelivery {
-  const value = exact(input, ['operationId', 'targetInstanceId', 'organizationId', 'disclosureId',
+  const value = exact(input, ['operationId', 'expectedSessionId', 'targetInstanceId', 'organizationId', 'disclosureId',
     'sourceInstanceId', 'checkpointHash', 'prefix', 'source'])
   const prefix = confirmedPrefix(value.prefix)
   const source = exact(value.source, ['instanceName', 'conversationTitle'])
   const operationId = opaqueIdentifier(value.operationId)
+  const expectedSessionId = opaqueIdentifier(value.expectedSessionId)
   const targetInstanceId = brandString<RegistryImportDelivery['targetInstanceId']>(opaqueIdentifier(value.targetInstanceId))
   const organizationId = brandString<RegistryImportDelivery['organizationId']>(opaqueIdentifier(value.organizationId))
   const disclosureId = identifier(value.disclosureId)
@@ -237,7 +238,7 @@ function importDelivery(input: unknown): RegistryImportDelivery {
     && prefix.checkpoint.instanceId === sourceInstanceId
     && prefix.checkpoint.disclosureId === disclosureId
     && prefix.checkpoint.checkpointHash === checkpointHash)
-  return { operationId, targetInstanceId, organizationId, disclosureId, sourceInstanceId, checkpointHash, prefix,
+  return { operationId, expectedSessionId, targetInstanceId, organizationId, disclosureId, sourceInstanceId, checkpointHash, prefix,
     source: { instanceName: displayText(source.instanceName), conversationTitle: displayText(source.conversationTitle) } }
 }
 

@@ -20,7 +20,7 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 npm start -- --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证由已确认的 v5 绑定内建提供；披露操作与 KMS 提供方仍须按实际部署提供，生产模板会在缺失时失败关闭。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证和按租户持久导入队列均由 Registry 内建提供。该模板尚未配置披露解密和提问提供方，相应接口返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
 
 ## 公网入口
 

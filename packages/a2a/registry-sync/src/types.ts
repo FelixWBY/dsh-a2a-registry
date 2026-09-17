@@ -56,6 +56,8 @@ export interface RegistryQuestionDelivery {
 /** One checkpoint-pinned context import released only to its authenticated target instance. */
 export interface RegistryImportDelivery {
   readonly operationId: string
+  /** Deterministic target Session identity; retries must create or return exactly this Session. */
+  readonly expectedSessionId: string
   readonly targetInstanceId: DshInstanceId
   readonly organizationId: OrganizationId
   readonly disclosureId: DisclosureId

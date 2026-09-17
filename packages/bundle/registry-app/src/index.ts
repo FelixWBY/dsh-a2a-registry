@@ -24,6 +24,7 @@ import { PostgresRegistryTenancy, type PostgresRegistryTenancyConfig } from './t
 import { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 import { installRegistrySync } from './sync.ts'
 import { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
+import { RegistrySaasImportRouter } from './saas-import-queue.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
@@ -77,6 +78,8 @@ export type { RegistryOperationalAlertClaim, RegistryOperationalAlertOutboxConfi
   RegistryOperationalAlertOutboxPolicy } from './operational-alert-outbox-sqlite.ts'
 export { LocalHarnessOperations } from './local-harness-operations.ts'
 export type { LocalHarnessOperationsConfig } from './local-harness-operations.ts'
+export { RegistrySaasImportQueue, RegistrySaasImportRouter } from './saas-import-queue.ts'
+export type { RegistrySaasImportQueueConfig } from './saas-import-queue.ts'
 export { A2A_LOOPBACK_QUESTIONS_PATH, LocalHarnessQuestionOperations } from './local-harness-question-operations.ts'
 export type { LocalHarnessQuestionOperationsConfig } from './local-harness-question-operations.ts'
 export { A2A_LOOPBACK_DISCLOSURES_PATH, A2A_LOOPBACK_DISCLOSURE_KEYS_PATH,
@@ -149,6 +152,12 @@ export const Config: z<Config> = z.transform(schema, (value) => {
   }
   if (value.saas !== undefined && (value.localHarness !== undefined || value.mailboxMaintenance !== undefined)) {
     throw new z.ValidationError('Registry SaaS cannot use fixed-organization Local Harness or mailbox owners', {})
+  }
+  if (value.saas !== undefined && value.ingest?.imports === undefined) {
+    throw new z.ValidationError('Registry SaaS requires the durable tenant import queue', {})
+  }
+  if (value.saas === undefined && value.ingest?.imports !== undefined) {
+    throw new z.ValidationError('Registry tenant imports require SaaS runtime routing', {})
   }
   if (value.ingest !== undefined && value.mailboxMaintenance !== undefined
     && value.ingest.organizationId !== value.mailboxMaintenance.organizationId) {
@@ -252,6 +261,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const syncAbort = new AbortController()
       let router: DefaultRegistryTenantRuntimeRouter | undefined
       let withdrawRouter: (() => void) | undefined
+      let withdrawOperations: (() => void) | undefined
+      let withdrawImportBroker: (() => void) | undefined
       let authenticator: RegistryBindingProducerAuthenticator | undefined
       let withdrawAuthenticator: (() => void) | undefined
       let stopSync: (() => Promise<void>) | undefined
@@ -262,6 +273,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           config.ingest.organizationId, config.saas.maxActiveOrganizations)
         const activeRouter = router
         withdrawRouter = ctx.provide('registryTenantRouter', activeRouter)
+        if (ctx.get('registryDisclosureOperations') !== undefined || ctx.get('registryImportBroker') !== undefined) {
+          throw new Error('Registry SaaS imports cannot replace another operations provider')
+        }
+        const importRouter = new RegistrySaasImportRouter(activeRouter)
+        withdrawOperations = ctx.provide('registryDisclosureOperations', importRouter)
+        withdrawImportBroker = ctx.provide('registryImportBroker', importRouter)
         const resolveRuntime = async (organizationId: Parameters<typeof activeRouter.acquireRuntime>[0]) => {
           const lease = await activeRouter.acquireRuntime(organizationId)
           return { store: lease.runtime.store, release: lease.release }
@@ -293,6 +310,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               ? undefined : Promise.resolve().then(ownedWithdrawAuthenticator),
           ]))
           outcomes.push(...await Promise.allSettled([ownedAuthenticator?.close()]))
+          outcomes.push(...await Promise.allSettled([
+            withdrawImportBroker === undefined ? undefined : Promise.resolve().then(withdrawImportBroker),
+            withdrawOperations === undefined ? undefined : Promise.resolve().then(withdrawOperations),
+          ]))
           outcomes.push(...await Promise.allSettled([Promise.resolve().then(ownedWithdrawRouter)]))
           outcomes.push(...await Promise.allSettled([ownedRouter.close()]))
           if (outcomes.some(outcome => outcome.status === 'rejected')) ctx.logger.error('Registry SaaS cleanup failed')
@@ -303,6 +324,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         await Promise.allSettled([withdrawAuthenticator === undefined
           ? undefined : Promise.resolve().then(withdrawAuthenticator)])
         await Promise.allSettled([authenticator?.close()])
+        await Promise.allSettled([
+          withdrawImportBroker === undefined ? undefined : Promise.resolve().then(withdrawImportBroker),
+          withdrawOperations === undefined ? undefined : Promise.resolve().then(withdrawOperations),
+        ])
         await Promise.allSettled([withdrawRouter === undefined ? undefined : Promise.resolve().then(withdrawRouter)])
         await Promise.allSettled([router?.close() ?? tenancy.close()])
         throw error

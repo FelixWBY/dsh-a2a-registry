@@ -83,6 +83,12 @@
           maxEntries: 4096
     ingest:
       organizationId: local-oidc-org
+      imports:
+        maxOperations: 2000
+        maxRecordBytes: 4096
+        maxAuthorizationResponseBytes: 262144
+        maxDeliveryBytes: 261120
+        deliveryTimeoutMs: 15000
       limits:
         maxInputBytes: 65536
         maxAggregateBytes: 1048576

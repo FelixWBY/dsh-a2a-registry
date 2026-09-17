@@ -391,6 +391,7 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
           }
           const delivery: RegistryImportDelivery = {
             operationId: record.operationId,
+            expectedSessionId: stableSessionId(record.targetInstanceId, record.operationId),
             targetInstanceId: brandString<DshInstanceId>(record.targetInstanceId),
             organizationId: identity.organizationId,
             disclosureId: brandString<DisclosureId>(record.disclosureId),
