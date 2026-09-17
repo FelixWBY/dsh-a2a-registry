@@ -34,7 +34,7 @@ try {
   await pool.end()
 
   const units = sqlite.prepare('select name, version from units order by name').all()
-  const physicalTables = sqlite.prepare("select name from sqlite_master where type = 'table' and name like 'u_%' order by name").all()
+  const physicalTables = sqlite.prepare("select name from sqlite_master where type = 'table' and name like 'u\\_%' escape '\\' order by name").all()
   const globals = new Map(sqlite.prepare('select unit, value from unit_globals').all().map(row => [row.unit, JSON.parse(row.value)]))
   const tableNames = new Map(units.map(unit => [unit.name, []]))
   for (const row of physicalTables) {

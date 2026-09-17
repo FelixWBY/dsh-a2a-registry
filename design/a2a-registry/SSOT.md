@@ -77,7 +77,7 @@
 
 | 优先级 | P | 剩余工作 | 完成标准 |
 | --- | --- | --- | --- |
-| P0 | P-DB | Windows 已完成组件修复和重启，但“虚拟机平台”仍需一次管理员 UAC 启用；Docker Linux 引擎与 PostgreSQL 容器尚未成功启动。启动后执行 SQLite→PostgreSQL 空目标迁移、持久化、备份和隔离恢复验证。 | 应用账号连接成功；注册站实际从 PostgreSQL 重启恢复数据；容器重建不丢数据；备份可恢复；原 SQLite 留作只读回滚点。 |
+| P0 | P-DB | Docker Linux 引擎和 PostgreSQL 18 已在本机启动，数据库只监听 `127.0.0.1`；应用账号、后端重启持久化、`pg_dump`、隔离恢复及 SQLite→PostgreSQL 空目标迁移演练均已通过。当前没有历史 SQLite 数据源；待正式身份和 Harness provider 就绪后执行一次真实 Registry 业务切换并保留切换前介质。 | 注册站以正式配置从 PostgreSQL 重启恢复同一成员、节点、披露和请求；容器重建不丢数据；原介质和异机备份可用于恢复。 |
 | P0 | P-ID | 选择正式 IdP，建立公网 OIDC 应用、回调地址和稳定成员 claim；确定成员预配、停用和初始 Owner 流程。 | 正式域名登录／退出成功；成员映射唯一；停用后下一请求失效；本地 Keycloak 和测试身份不进入生产。 |
 | P0 | P-HARNESS | 给真实 DeepSeek Harness 签发独立设备身份，配置 `disclosure.sync`／`a2a.receive` 最小 scope、Registry WSS、公钥登记和可靠进程托管。 | 真实 Harness 完成绑定、发布、导入、文本提问、离线排队、重连恢复和幂等重试全流程。 |
 | P0 | P-KMS | 选择生产密钥管理方案，提供披露数据密钥的生成、按作用域分发、轮换、恢复与销毁。 | Registry/Harness 不依赖仓库或普通 `.env` 中的明文私钥；失败或不确定时不推进披露。 |

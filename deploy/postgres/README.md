@@ -31,7 +31,7 @@ npm start -- --patch deploy/registry/registry-single-host.example.patch.yml --pa
 
 ```powershell
 $env:DSH_REGISTRY_POSTGRES_URL = '<从本机私密 connection.env 读取，不要提交>'
-node deploy/registry/migrate-sqlite-storage-to-postgres.mjs --sqlite <源数据库绝对路径> --confirm-empty-target
+node --import tsx/esm deploy/registry/migrate-sqlite-storage-to-postgres.mjs --sqlite <源数据库绝对路径> --confirm-empty-target
 ```
 
 迁移工具要求源库 `quick_check=ok`、目标 `units` 为空，按单事务批次写入每个领域；不会覆盖已有目标数据。完成后先用隔离 Registry 验证，再切换正式进程。回滚方式是停止新进程并恢复切换前 SQLite 介质；切换后产生的新写入不会自动反向同步。
