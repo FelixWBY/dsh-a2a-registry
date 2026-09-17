@@ -17,7 +17,9 @@ function usage(message) {
 const args = process.argv.slice(2)
 if (args.length !== 2 || args[0] !== '--harness-root' || args[1].trim().length === 0) usage()
 const harnessRoot = resolve(args[1])
-for (const relative of ['package.json', 'packages/a2a/registry-sync/src/index.ts']) {
+for (const relative of ['package.json', 'apps/cli/lib/bin.js',
+  'packages/a2a/registry-sync/package.json', 'packages/a2a/registry-sync/src/index.ts',
+  'packages/a2a/registry-sync/lib/index.js']) {
   try { accessSync(join(harnessRoot, relative), constants.R_OK) } catch {
     usage(`Harness checkout is missing ${relative}: ${harnessRoot}`)
   }
@@ -74,8 +76,8 @@ const encoded = encodeRegistryServerFrame({
   },
 }, 1_048_576)
 
-const decoder = String.raw`
-  import { decodeRegistryServerFrame } from './packages/a2a/registry-sync/src/index.ts'
+const decoder = (specifier) => String.raw`
+  import { decodeRegistryServerFrame } from ${JSON.stringify(specifier)}
   const chunks = []
   for await (const chunk of process.stdin) chunks.push(chunk)
   const body = Buffer.concat(chunks).toString('utf8')
@@ -92,28 +94,37 @@ const childEnvironment = Object.fromEntries(inheritedSystemVariables.flatMap((na
   const value = process.env[name]
   return value === undefined ? [] : [[name, value]]
 }))
-const result = spawnSync(process.execPath,
-  ['--import', 'tsx/esm', '--input-type=module', '--eval', decoder], {
-    cwd: harnessRoot,
-    input: encoded,
-    env: childEnvironment,
-    encoding: 'utf8',
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  })
-if (result.error !== undefined) {
-  process.stderr.write(`registry-harness-compatibility: failed to run Harness decoder: ${result.error.message}\n`)
-  process.exit(1)
-}
-if (result.status !== 0 || result.stdout.trim() !== 'compatible') {
-  process.stderr.write('registry-harness-compatibility: current Harness rejects the Registry import wire frame\n')
-  if (result.stderr.trim().length > 0) process.stderr.write(`${result.stderr.trim()}\n`)
-  process.exit(1)
+const targets = [
+  { label: 'source', cwd: harnessRoot,
+    specifier: './packages/a2a/registry-sync/src/index.ts', preload: ['--import', 'tsx/esm'] },
+  { label: 'built runtime', cwd: join(harnessRoot, 'packages/a2a/registry-sync'),
+    specifier: '@deepseek-ai/dsh-a2a-registry-sync', preload: [] },
+]
+for (const target of targets) {
+  const result = spawnSync(process.execPath,
+    [...target.preload, '--input-type=module', '--eval', decoder(target.specifier)], {
+      cwd: target.cwd,
+      input: encoded,
+      env: childEnvironment,
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    })
+  if (result.error !== undefined) {
+    process.stderr.write(`registry-harness-compatibility: failed to run Harness ${target.label} decoder: ${result.error.message}\n`)
+    process.exit(1)
+  }
+  if (result.status !== 0 || result.stdout.trim() !== 'compatible') {
+    process.stderr.write(`registry-harness-compatibility: Harness ${target.label} decoder rejects the Registry import wire frame\n`)
+    if (result.stderr.trim().length > 0) process.stderr.write(`${result.stderr.trim()}\n`)
+    process.exit(1)
+  }
 }
 
 process.stdout.write([
   'registry-harness-compatibility: passed',
-  '- Harness Registry Sync v1 decoder accepts the current import delivery',
+  '- Harness Registry Sync v1 source decoder accepts the current import delivery',
+  '- built package export used by the Harness CLI accepts the same delivery',
   '- target Session identity remains deterministically computed and verified by Registry',
   '',
 ].join('\n'))

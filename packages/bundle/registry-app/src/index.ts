@@ -26,6 +26,7 @@ import { installRegistrySync } from './sync.ts'
 import { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
 import { RegistrySaasImportRouter } from './saas-import-queue.ts'
 import { RegistrySaasQuestionRouter, validateRegistrySaasMailboxCredential } from './saas-question-mailbox.ts'
+import { RegistryReadinessProbe } from './readiness.ts'
 import type { RegistryDisclosureOperations } from './operations.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
@@ -213,6 +214,7 @@ export const Config: z<Config> = z.transform(schema, (value) => {
  * @returns Startup after any configured durable Registry owner has initialized.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  let saasReadiness: RegistryReadinessProbe | undefined
   if (config.sharedAdmission !== undefined) {
     if (ctx.get('credentials') === undefined) {
       throw new Error('Registry shared admission requires registry-runtime inject: [credentials]')
@@ -265,6 +267,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ...(config.saas.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: config.saas.statementTimeoutMs }),
         ...(config.saas.maxOrganizationsPerAccount === undefined ? {}
           : { maxOrganizationsPerAccount: config.saas.maxOrganizationsPerAccount }),
+      })
+      saasReadiness = new RegistryReadinessProbe(async () => {
+        const [tenancyReady, storageReady] = await Promise.all([
+          tenancy.checkReadiness(), ctx.storageDomain.checkReadiness('postgres'),
+        ])
+        return tenancyReady && storageReady
       })
       const syncAbort = new AbortController()
       let router: DefaultRegistryTenantRuntimeRouter | undefined
@@ -406,7 +414,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   ctx.effect(() => () => { active = false }, 'registry-app: readiness lifetime')
   const preferences = installRegistryPreferences(ctx, announce)
-  installRegistryStatic(ctx, distIndex, preferences)
+  installRegistryStatic(ctx, distIndex, preferences, async () => {
+    if (!active || !loaderReady) return false
+    if (saasReadiness !== undefined && !await saasReadiness.ready()) return false
+    return active && loaderReady
+  })
   void ctx.loader.await().then(() => {
     loaderReady = true
     announce()

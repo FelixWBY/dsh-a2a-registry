@@ -47,9 +47,43 @@ node deploy/registry/enroll-registry-device.mjs export-env `
 npm run verify:harness-compatibility -- --harness-root C:\path\to\deepseek-harness
 ```
 
-检查会由当前 Registry 编码一个带签名事件和固定检查点的 v1 导入帧，再调用目标 Harness 的严格解码器读取；失败时不得启动真实接入。v1 帧只携带稳定操作标识，目标 Harness 以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立计算并核对完成回执中的 Session 标识。检查器不读取设备凭据，并把子进程环境缩减为运行 Node 所需的系统变量，但它会执行目标源码，因此只能指向可信 checkout，且不应从带生产秘密的交互 shell 运行。该检查不代替 WSS 握手、披露密钥分发、模型执行和离线恢复验收。
+检查会由当前 Registry 编码一个带签名事件和固定检查点的 v1 导入帧，再分别调用目标 Harness 的源码解码器与已构建 CLI 实际解析的 package export 读取；任一缺失、过期或拒绝时都不得启动真实接入。v1 帧只携带稳定操作标识，目标 Harness 以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立计算并核对完成回执中的 Session 标识。检查器不读取设备凭据，并把子进程环境缩减为运行 Node 所需的系统变量，但它会执行目标 checkout，因此只能指向可信目录，且不应从带生产秘密的交互 shell 运行。该检查不代替 WSS 握手、披露密钥分发、模型执行和离线恢复验收。
+
+Windows 本地验收可在 `export-env` 后用 `start-bound-harness.ps1` 从独立的 Harness 源码 checkout 启动上述连接专用 overlay。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程，也不会修改 Harness 源码；CLI 从源码的已构建 `apps/cli/lib/bin.js` 读取，工作目录、DSH_HOME 和日志均在外部私有目录。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
+
+先在真实 Harness 服务账号下创建三个私有目录，并在写入 enrollment 状态／环境文件前关闭继承。启动器会再次检查目录与环境文件的实际 ACL：Allow 条目只可属于当前账号、`SYSTEM` 或本机管理员，私有目录本身必须已关闭继承。日志可能包含一次性 Web 启动 URL，也按凭据处理。以下示例只授权当前账号与 `SYSTEM`；如确需管理员恢复权限，可另外授予 `*S-1-5-32-544`：
+
+```powershell
+$privateRoot = 'C:\dsh-private'
+$dshHome = Join-Path $privateRoot 'home'
+$logDir = Join-Path $privateRoot 'logs'
+$currentPrincipal = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+foreach ($directory in @($privateRoot, $dshHome, $logDir)) {
+  New-Item -ItemType Directory -Path $directory -Force | Out-Null
+  & icacls.exe $directory '/inheritance:r' '/grant:r' "${currentPrincipal}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F'
+  if ($LASTEXITCODE -ne 0) { throw "无法限制目录 ACL：$directory" }
+}
+```
+
+Harness checkout、Node.js 可执行文件、启动器、overlay 与 CA 证书同样是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录和 CA 父目录还必须关闭 ACL 继承。普通 `D:\Felix` 或 Registry 开发 checkout 若继承了 `Authenticated Users: Modify`，就不能承载真实设备凭据；应先在本地固定磁盘的全新私有根目录中安装可信副本，再关闭这些根目录的继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此优先使用未占用的新路径，并以启动器的 ACL 检查结果为准。
+
+确认 `apps/cli/lib/bin.js` 已由对应 Harness checkout 构建、线协议检查通过、3080 空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行：
+
+```powershell
+pwsh -NoProfile -File 'C:\dsh-runtime\dsh-a2a-registry\deploy\registry\start-bound-harness.ps1' `
+  -HarnessRoot 'C:\dsh-runtime\deepseek-harness' `
+  -NodePath 'C:\path\to\node.exe' `
+  -EnvFile 'C:\dsh-private\harness-registry.env' `
+  -CaCertificate 'C:\dsh-private\registry-ca.pem' `
+  -DshHome 'C:\dsh-private\home' `
+  -LogDirectory 'C:\dsh-private\logs'
+```
+
+启动器最多等待 30 秒，只有新 PID 真正拥有 `127.0.0.1:3080` 监听时才报告成功；失败清理也只针对该新 PID。成功输出包含 PID、overlay、DSH_HOME 与 stdout／stderr 路径，但“本地监听就绪”不等于 Registry Presence 已完成 WSS 认证；还必须在注册站节点页确认该实例在线。停止时按该 PID 精确结束 Harness；不要按进程名批量终止，也不要把日志或私有目录提交到 Git。
 
 PostgreSQL 必须在停服后按 `deploy/postgres/split-registry-runtime-role.sql`、独立 `registry_migrator` 的 `migrate-postgres-schemas.mjs`、同一权限脚本的顺序执行完整 `split → migrate → split`。在线 Registry 只注入 `registry_app` URL，并以 `schemaMode: validate` 做只读启动校验；迁移 URL 不得进入服务环境。
+
+生产探针分为两层：`/healthz` 只报告进程存活；SaaS `/readyz` 会同时通过实际 storage pool 与 tenancy pool 读取权威 schema 版本标记，并拒绝任何非 PostgreSQL 的 domain 路由。数据库失联、任一标记缺失或应用尚未加载完成时 readiness 返回 503，恢复后无需重启即可回到 200。读取使用单飞、2 秒 HTTP 有界等待、1.5 秒查询超时和 1 秒结果缓存；新建连接仍受连接池 10 秒硬上限约束，避免网络半开时永久占住探针。不要把 `/healthz` 改成 Caddy 的流量就绪门禁。
 
 本地开发先启动仓库提供的 PostgreSQL 容器。首次初始化或结构升级时，先停止 3081／3181 两个 Registry，再显式运行 `start-local-keycloak.ps1 -UpgradeDatabase`；它执行一次 `split → migrate → split` 后启动站点。日常运行只执行 `start-local-keycloak.ps1`，不会改数据库结构，只由在线进程做只读校验。脚本启动固定版本 Keycloak、打开用户自助注册，并用固定版本 Caddy 在 `wss://localhost:3183/a2a/v1/sync` 提供本地 TLS 设备同步入口；内部 CA 根证书路径会随启动结果返回。Harness 连接此本地地址时须把返回路径设为该进程的 `NODE_EXTRA_CA_CERTS`，不能关闭 TLS 校验。生成的凭据和 CA 数据只写入 Git 忽略且限制当前用户访问的 `.artifacts`。`-RegistryOnly` 不启动或停止现有 Keycloak／Caddy，只复用已经就绪的本地容器。本地 Keycloak 与内部 CA 均不得用于生产。
 

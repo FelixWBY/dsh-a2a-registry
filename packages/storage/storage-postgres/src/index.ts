@@ -8,6 +8,7 @@ import type { KvFacet, KvRecordWrite, KvUnit, KvUnitDescriptor, StorageBackend }
 export const name = 'storage-postgres'
 export const inject = ['storage']
 export const STORAGE_POSTGRES_SCHEMA_VERSION = 2
+const READINESS_QUERY_TIMEOUT_MS = 1_500
 
 const GLOBAL_TENANT_ID = ''
 const TENANT_POLICY = 'tenant_isolation'
@@ -97,6 +98,7 @@ function createPostgresPool(config: Pick<Config, 'connectionString' | 'maxConnec
     max: maxConnections,
     idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
     connectionTimeoutMillis: 10_000,
+    query_timeout: config.statementTimeoutMs ?? 15_000,
     statement_timeout: config.statementTimeoutMs ?? 15_000,
     idle_in_transaction_session_timeout: 30_000,
     application_name: applicationName,
@@ -990,6 +992,23 @@ export class PostgresStorageBackend implements StorageBackend {
       ? validatePostgresSchema(this.pool, schemaName, config.allowUnsafeSharedDatabase ?? false)
       : migratePostgresSchema(this.pool, schemaName, config.legacyTenantId)
     this.ready.catch(() => {})
+  }
+
+  /** Live read through the actual storage pool; the client-side timeout also
+   * evicts a stuck pooled connection instead of leaving readiness wedged. */
+  async checkReadiness(): Promise<boolean> {
+    if (this.closing !== undefined) return false
+    try {
+      await this.ready
+      const result = await this.pool.query<{ readonly schema_version: number }>({
+        text: `select schema_version from ${this.schema}.storage_meta where singleton = true`,
+        query_timeout: READINESS_QUERY_TIMEOUT_MS,
+      } as { readonly text: string; readonly query_timeout: number })
+      return result.rows.length === 1
+        && result.rows[0]?.schema_version === STORAGE_POSTGRES_SCHEMA_VERSION
+    } catch {
+      return false
+    }
   }
 
   private openUnit(descriptor: KvUnitDescriptor): Promise<KvUnit> {

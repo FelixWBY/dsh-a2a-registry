@@ -21,6 +21,7 @@
     "@deepseek-ai/dsh-credentials": "*",
     "zod": "^4.4.3",
     "@deepseek-ai/dsh-storage-domain": "*",
+    "@deepseek-ai/dsh-storage-postgres": "*",
     "@deepseek-ai/dsh-a2a-mailbox": "*",
     "openid-client": "6.8.8",
     "pg": "^8.16.3",

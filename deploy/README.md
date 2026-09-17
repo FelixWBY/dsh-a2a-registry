@@ -38,6 +38,8 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 
 `registry` 范围是公网 SaaS 门禁：必须显式提供使用 `registry_app` 角色的 PostgreSQL URL 和 SaaS 初始化信息，单组织 SQLite 配置不能通过。公网验证还会从服务端状态接口确认实时 `registryTenantRouter` 已加载，不以浏览器缓存或单纯的 `standard` 部署标签代替。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
 
+`/healthz` 只用于判断 Registry 进程是否存活。`/readyz` 还会等待应用加载完成，并在 SaaS 模式分别通过实际 storage pool 与 tenancy pool 核对 PostgreSQL 权威版本标记；非 PostgreSQL domain 路由、数据库中断或标记缺失时返回 503，数据库恢复后会自动恢复为 200。该数据库探针按进程单飞、短暂缓存，HTTP 决策在 2 秒内失败关闭，底层查询与新建连接也分别受 1.5 秒和 10 秒硬上限约束。Caddy 的上游健康检查使用 `/readyz`。
+
 ## Harness 接入
 
 Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 Harness 自身的安装路径，不是 Registry 的构建依赖。

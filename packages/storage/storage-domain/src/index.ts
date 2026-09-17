@@ -82,6 +82,26 @@ export class DomainFacility {
   ) {}
 
   /**
+   * Probe every backend this facility can route to. `requiredBackend` also
+   * makes a production composition fail closed when any domain is routed to a
+   * different medium.
+   */
+  async checkReadiness(requiredBackend?: string): Promise<boolean> {
+    const backendNames = [...new Set([this.config.backend, ...Object.values(this.config.routes ?? {})])]
+    if (requiredBackend !== undefined && backendNames.some(name => name !== requiredBackend)) return false
+    try {
+      const decisions = await Promise.all(backendNames.map(async (name) => {
+        const backend = this.ctx.storage.backend.get(name)
+        const probe = backend.checkReadiness
+        return probe === undefined ? false : await probe.call(backend)
+      }))
+      return decisions.every(ready => ready === true)
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Open one declared domain. Steps, each failing the whole call: reject a
    * name that is already open (`already-open`); resolve the backend route
    * (`backend-not-found` passes through from the hub); require its `kv` facet

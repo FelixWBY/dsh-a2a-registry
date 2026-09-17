@@ -19,6 +19,13 @@ export interface StorageBackend {
   readonly kv?: KvFacet
 
   /**
+   * Optional live dependency probe. Internet-facing runtimes that require a
+   * durable backend fail closed when the selected backend does not implement
+   * this contract.
+   */
+  checkReadiness?(): Promise<boolean>
+
+  /**
    * Drain in-flight writes across all open units and release the medium.
    * Idempotent; concurrent and repeated calls resolve once teardown finishes.
    * @returns resolution after the medium is released.

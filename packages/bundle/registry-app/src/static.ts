@@ -59,12 +59,18 @@ function writeProbe(req: IncomingMessage, res: ServerResponse, ready: boolean): 
  * @param ctx - Owning plugin context with the HTTP service.
  * @param distIndex - Trusted package-resolved index file, never a request or deployment path.
  * @param available - Whether the required public browser configuration is currently contributed.
+ * @param runtimeReady - Bounded live dependency check; failures remain readiness failures.
  */
-export function installRegistryStatic(ctx: Context, distIndex: string, available: () => boolean): void {
+export function installRegistryStatic(ctx: Context, distIndex: string, available: () => boolean,
+  runtimeReady: () => boolean | Promise<boolean> = available): void {
   const distRoot = dirname(distIndex)
   const ready = async (): Promise<boolean> => {
     if (!available()) return false
     try { await access(distIndex) } catch { return false }
+    if (!available()) return false
+    try {
+      if (!await runtimeReady()) return false
+    } catch { return false }
     return available()
   }
   const render = async (): Promise<string> => {

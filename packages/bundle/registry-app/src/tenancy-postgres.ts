@@ -24,8 +24,10 @@ import {
   type RegistryOrganizationState,
   type RegistryTenancyStore,
 } from './tenancy.ts'
+import { STORAGE_POSTGRES_SCHEMA_VERSION } from '@deepseek-ai/dsh-storage-postgres'
 
 const SCHEMA_VERSION = 2
+const READINESS_QUERY_TIMEOUT_MS = 1_500
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
@@ -726,6 +728,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       max: maximum,
       idleTimeoutMillis: idle,
       connectionTimeoutMillis: 10_000,
+      query_timeout: statement,
       statement_timeout: statement,
       idle_in_transaction_session_timeout: 30_000,
       application_name: 'dsh-a2a-registry-tenancy',
@@ -756,6 +759,34 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       throw new RegistryTenancyError('unavailable')
     } finally {
       await store.pool.end().catch(() => {})
+    }
+  }
+
+  /**
+   * Check the live authoritative database through the online pool without
+   * changing state. Both metadata rows are required so readiness cannot report
+   * success for a reachable PostgreSQL server that has lost either Registry
+   * authority.
+   */
+  async checkReadiness(): Promise<boolean> {
+    if (this.closed) return false
+    try {
+      const result = await this.pool.query<{
+        readonly storage_version: number
+        readonly tenancy_version: number
+      }>({
+        text: `select storage.schema_version as storage_version,
+            tenancy.schema_version as tenancy_version
+          from ${this.schema}.storage_meta as storage
+          cross join ${this.schema}.tenancy_meta as tenancy
+          where storage.singleton = true and tenancy.singleton = true`,
+        query_timeout: READINESS_QUERY_TIMEOUT_MS,
+      } as { readonly text: string; readonly query_timeout: number })
+      return result.rows.length === 1
+        && result.rows[0]?.storage_version === STORAGE_POSTGRES_SCHEMA_VERSION
+        && result.rows[0]?.tenancy_version === SCHEMA_VERSION
+    } catch {
+      return false
     }
   }
 
