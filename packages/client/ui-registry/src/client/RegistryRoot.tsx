@@ -29,7 +29,7 @@ export function RegistryRoot(props: RegistryRootProps) {
   const page = props.usePage(value => value)
   const pageKey = registryPageKey(page)
   const organizationId = registryOrganizationId(page)
-  const organizationPage = typeof page === 'object' ? page.page : null
+  const organizationPage = typeof page === 'object' && page.kind === 'organization' ? page.page : null
   const primaryPage = typeof organizationPage === 'string'
     ? organizationPage
     : organizationPage?.kind === 'nodeDetail' ? 'nodes' : 'disclosures'
@@ -61,11 +61,13 @@ export function RegistryRoot(props: RegistryRootProps) {
 
   useEffect(() => {
     if (accountState.kind === 'unauthenticated') {
-      if (page !== 'signIn' && page !== 'signUp') replaceHash('#/sign-in')
+      if (page !== 'signIn' && page !== 'signUp' && !(typeof page === 'object' && page.kind === 'join')) {
+        replaceHash('#/sign-in')
+      }
       return
     }
     if (accountState.kind !== 'ready' || accountState.loadedForOrganizationId !== organizationId
-      || page === 'newOrganization') return
+      || page === 'newOrganization' || typeof page === 'object' && page.kind === 'join') return
     const organizations = activeOrganizations(accountState.account)
     if (typeof page === 'object' && organizations.some(item => item.organizationId === page.organizationId)) return
     if (organizations[0] === undefined) replaceHash('#/new-organization')
@@ -123,6 +125,10 @@ export function RegistryRoot(props: RegistryRootProps) {
   }
 
   if (page === 'newOrganization' && accountState.kind === 'ready') {
+    return <div className={css.standaloneShell}>{identityBanner}<main className={css.standaloneMain}>{props.renderSlot('registry.page', { page })}</main></div>
+  }
+
+  if (typeof page === 'object' && page.kind === 'join') {
     return <div className={css.standaloneShell}>{identityBanner}<main className={css.standaloneMain}>{props.renderSlot('registry.page', { page })}</main></div>
   }
 

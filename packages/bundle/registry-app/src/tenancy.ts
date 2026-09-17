@@ -27,6 +27,8 @@ export interface RegistryOidcAccountInput {
 export type RegistryOrganizationState = 'provisioning' | 'active' | 'failed'
 export type RegistryOrganizationRole = 'owner' | 'admin' | 'member'
 export type RegistryOrganizationMembershipState = 'active' | 'suspended' | 'removed'
+export type RegistryInvitationState = 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired'
+export type RegistryInvitationRole = Exclude<RegistryOrganizationRole, 'owner'>
 
 /** Public organization metadata; IDs are immutable while names and slugs are presentation fields. */
 export interface RegistryOrganization {
@@ -53,6 +55,47 @@ export interface RegistryOrganizationMembership {
 export interface RegistryOrganizationAccess {
   readonly organization: RegistryOrganization
   readonly membership: RegistryOrganizationMembership
+}
+
+/** One bounded organization invitation. The bearer token is deliberately not retained on this record. */
+export interface RegistryInvitation {
+  readonly invitationId: string
+  readonly organizationId: OrganizationId
+  readonly role: RegistryInvitationRole
+  readonly displayName: string | null
+  readonly status: RegistryInvitationState
+  readonly expiresAt: number
+  readonly createdAt: number
+  readonly createdByMemberId: MemberId
+}
+
+/** Invitation metadata visible only to a signed-in account possessing the bearer token. */
+export interface RegistryInvitationPreview {
+  readonly invitationId: string
+  readonly organizationId: OrganizationId
+  readonly organizationDisplayName: string
+  readonly role: RegistryInvitationRole
+  readonly displayName: string | null
+  readonly status: RegistryInvitationState
+  readonly expiresAt: number
+}
+
+export interface RegistryInvitationCreationInput {
+  readonly role: RegistryInvitationRole
+  readonly displayName?: string
+  readonly expiresInSeconds?: number
+}
+
+/** Raw token is returned exactly once and is never persisted. */
+export interface RegistryInvitationCreation {
+  readonly invitation: RegistryInvitation
+  readonly token: string
+}
+
+/** Short-lived claim used while the directory and control plane converge. */
+export interface RegistryInvitationClaim {
+  readonly invitation: RegistryInvitation
+  readonly account: RegistryAccount
 }
 
 export interface RegistryOrganizationCreationInput {
@@ -93,5 +136,18 @@ export interface RegistryTenancyStore {
   /** Link a pre-SaaS bootstrap owner after the caller has independently verified that legacy ownership. */
   claimLegacyOwner(account: RegistryAccount,
     organizationId: OrganizationId): Promise<RegistryOrganizationAccess>
+  listInvitations(accountId: RegistryAccountId, memberId: MemberId, actorRole: RegistryOrganizationRole,
+    organizationId: OrganizationId): Promise<readonly RegistryInvitation[]>
+  createInvitation(accountId: RegistryAccountId, memberId: MemberId, actorRole: RegistryOrganizationRole,
+    organizationId: OrganizationId, input: RegistryInvitationCreationInput): Promise<RegistryInvitationCreation>
+  revokeInvitation(accountId: RegistryAccountId, memberId: MemberId, actorRole: RegistryOrganizationRole,
+    organizationId: OrganizationId, invitationId: string): Promise<RegistryInvitation>
+  previewInvitation(accountId: RegistryAccountId, token: string): Promise<RegistryInvitationPreview>
+  claimInvitation(account: RegistryAccount, token: string): Promise<RegistryInvitationClaim>
+  activateInvitation(account: RegistryAccount, invitationId: string): Promise<RegistryOrganizationAccess>
+  declineInvitation(account: RegistryAccount, token: string): Promise<RegistryInvitationPreview>
+  /** Mirror an already committed directory member change when that member is linked to an account. */
+  syncMembershipFromDirectory(organizationId: OrganizationId, memberId: MemberId,
+    role: RegistryOrganizationRole, state: RegistryOrganizationMembershipState): Promise<void>
   close(): Promise<void>
 }

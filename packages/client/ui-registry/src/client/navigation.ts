@@ -1,6 +1,6 @@
 /** Public pages, organization pages and opaque authorized object addresses. */
 export type RegistryStaticPage = 'overview' | 'members' | 'nodes' | 'disclosures' | 'branches' | 'audit' | 'settings'
-  | 'signIn' | 'signUp' | 'newOrganization' | 'binding' | 'notFound'
+  | 'signIn' | 'signUp' | 'newOrganization' | 'joinOrganization' | 'binding' | 'notFound'
 export type RegistryOrganizationStaticPage = 'overview' | 'members' | 'nodes' | 'disclosures' | 'branches' | 'audit'
   | 'settings' | 'binding'
 export type RegistryOrganizationPage = RegistryOrganizationStaticPage
@@ -8,12 +8,14 @@ export type RegistryOrganizationPage = RegistryOrganizationStaticPage
   | { readonly kind: 'disclosureDetail'; readonly disclosureId: string }
   | { readonly kind: 'questionDetail'; readonly disclosureId: string; readonly requestId: string }
 export type RegistryPage = 'bootstrap' | 'signIn' | 'signUp' | 'newOrganization' | 'notFound'
+  | { readonly kind: 'join'; readonly token: string | null }
   | { readonly kind: 'organization'; readonly organizationId: string; readonly page: RegistryOrganizationPage }
 
 /** Primary navigation shared by the shell and its route tests. */
 export const PRIMARY_PAGES = ['overview', 'members', 'nodes', 'disclosures', 'branches', 'audit', 'settings'] as const
 
 const OPAQUE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
+const INVITATION_TOKEN = /^[A-Za-z0-9_-]{43}$/u
 
 function decodeIdentifier(value: string): string | null {
   let decoded: string
@@ -25,12 +27,18 @@ function decodeIdentifier(value: string): string | null {
 export function registryPageKey(route: RegistryPage): RegistryStaticPage | 'nodeDetail' | 'disclosureDetail' | 'questionDetail' {
   if (route === 'bootstrap') return 'overview'
   if (typeof route === 'string') return route
+  if (route.kind === 'join') return 'joinOrganization'
   return typeof route.page === 'string' ? route.page : route.page.kind
 }
 
 /** The selected organization ID is carried only by the URL and every scoped request. */
 export function registryOrganizationId(route: RegistryPage): string | null {
   return typeof route === 'object' && route.kind === 'organization' ? route.organizationId : null
+}
+
+/** Build a join address without retaining the single-use token outside the browser address. */
+export function invitationHref(token: string): string {
+  return `#/join/${encodeURIComponent(token)}`
 }
 
 /** Create one organization-scoped hash without relying on browser storage or a selected-tenant cookie. */
@@ -57,7 +65,14 @@ export function parseRegistryPage(hash: string): RegistryPage {
     case '#/sign-in': return 'signIn'
     case '#/sign-up': return 'signUp'
     case '#/new-organization': return 'newOrganization'
+    case '#/join': return { kind: 'join', token: null }
     default: {
+      const joinMatch = /^#\/join\/([^/?#]+)$/u.exec(hash)
+      if (joinMatch?.[1] !== undefined) {
+        let token: string
+        try { token = decodeURIComponent(joinMatch[1]) } catch { return 'notFound' }
+        return { kind: 'join', token: INVITATION_TOKEN.test(token) ? token : '' }
+      }
       const match = /^#\/organizations\/([^/?#]+)(?:\/(.*))?$/u.exec(hash)
       if (match?.[1] === undefined) return 'notFound'
       const organizationId = decodeIdentifier(match[1])

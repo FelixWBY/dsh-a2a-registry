@@ -293,7 +293,9 @@ function routeUrl(request: IncomingMessage): URL {
 function returnPath(url: URL): string {
   if ([...url.searchParams.keys()].some(key => key !== 'returnTo')) return '/#/overview'
   const values = url.searchParams.getAll('returnTo')
-  return values.length === 1 && RETURN_PATH.test(values[0]!) ? values[0]! : '/#/overview'
+  if (values.length !== 1 || !RETURN_PATH.test(values[0]!)) return '/#/overview'
+  // Compatibility links may contain a bearer token in the fragment; never copy it into the signed transaction cookie.
+  return values[0]!.startsWith('/#/join/') ? '/#/join' : values[0]!
 }
 
 /** Real OIDC browser authenticator; Registry storage remains authoritative for membership, roles and teams. */
@@ -570,9 +572,11 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     } finally { secret.fill(0) }
     clearCookies(response, [this.transactionName], this.secureCookies)
     response.appendHeader('set-cookie', `${this.sessionName}=${session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${String(Math.ceil((expiresAt - now) / 1000))}${this.secureCookies ? '; Secure' : ''}`)
-    const returnTo = tenantAccount !== undefined
+    const hasNoOrganization = tenantAccount !== undefined
       && (await router!.listOrganizations(tenantAccount.accountId)).length === 0
-      ? '/#/new-organization' : transaction.returnTo
+    // Invitation bearer tokens remain in sessionStorage; never preserve them in the OIDC query/cookie.
+    const invitationReturn = transaction.returnTo === '/#/join'
+    const returnTo = hasNoOrganization && !invitationReturn ? '/#/new-organization' : transaction.returnTo
     redirect(response, returnTo)
   }
 

@@ -177,6 +177,47 @@ export interface RegistryDirectoryChangeReceipt {
   readonly invalidatedDisclosures: number
 }
 
+export type RegistryInvitationRole = 'admin' | 'member'
+export type RegistryInvitationStatus = 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired'
+
+/** Administrator-visible invitation metadata. The raw token is deliberately absent. */
+export interface RegistryInvitation {
+  readonly invitationId: string
+  readonly organizationId: string
+  readonly role: RegistryInvitationRole
+  readonly displayName: string | null
+  readonly status: RegistryInvitationStatus
+  readonly expiresAt: number
+  readonly createdAt: number
+  readonly createdByMemberId: string
+}
+
+export interface RegistryInvitationPage {
+  readonly items: readonly RegistryInvitation[]
+}
+
+export interface RegistryInvitationCreateRequest {
+  readonly role: RegistryInvitationRole
+  readonly displayName?: string
+}
+
+/** The raw token exists only in the one successful creation response. */
+export interface RegistryInvitationCreated {
+  readonly invitation: RegistryInvitation
+  readonly token: string
+}
+
+/** Signed-in join preview: no member identifier or raw token is returned in its body. */
+export interface RegistryInvitationPreview {
+  readonly invitationId: string
+  readonly organizationId: string
+  readonly organizationDisplayName: string
+  readonly role: RegistryInvitationRole
+  readonly displayName: string | null
+  readonly status: RegistryInvitationStatus
+  readonly expiresAt: number
+}
+
 export type RegistryConfigurationState = 'configured' | 'unconfigured'
 export type RegistryDeploymentMode = 'standard' | 'test-only'
 export type RegistryIdentityProvider = 'oidc' | 'external' | 'local-test' | 'unconfigured'
@@ -300,6 +341,14 @@ export interface RegistryApi {
   readDirectory(organizationId: string, signal: AbortSignal): Promise<RegistryDirectoryPage>
   changeDirectory(organizationId: string, expectedRevision: number, change: RegistryDirectoryChange,
     signal: AbortSignal): Promise<RegistryDirectoryChangeReceipt>
+  listInvitations(organizationId: string, signal: AbortSignal): Promise<RegistryInvitationPage>
+  createInvitation(organizationId: string, request: RegistryInvitationCreateRequest,
+    signal: AbortSignal): Promise<RegistryInvitationCreated>
+  revokeInvitation(organizationId: string, invitationId: string,
+    signal: AbortSignal): Promise<RegistryInvitation>
+  readInvitation(token: string, signal: AbortSignal): Promise<RegistryInvitationPreview>
+  acceptInvitation(token: string, signal: AbortSignal): Promise<RegistryOrganizationSummary>
+  declineInvitation(token: string, signal: AbortSignal): Promise<RegistryInvitationPreview>
   listInstances(organizationId: string, signal: AbortSignal): Promise<RegistryInstancePage>
   renameInstance(organizationId: string, bindingId: string, instanceName: string,
     signal: AbortSignal): Promise<RegistryInstance>
@@ -350,6 +399,8 @@ const INSTANCE_TRANSPORTS: readonly RegistryInstanceTransport[] = ['connected', 
 const INSTANCE_REPORT_STATES: readonly RegistryInstanceReportState[] = ['online', 'busy', 'paused', 'degraded']
 const DIRECTORY_ROLES: readonly RegistryDirectoryRole[] = ['owner', 'admin', 'member']
 const DIRECTORY_MEMBER_STATES: readonly RegistryDirectoryMemberState[] = ['active', 'suspended', 'removed']
+const INVITATION_ROLES: readonly RegistryInvitationRole[] = ['admin', 'member']
+const INVITATION_STATUSES: readonly RegistryInvitationStatus[] = ['pending', 'accepted', 'declined', 'revoked', 'expired']
 const ORGANIZATION_STATES: readonly RegistryOrganizationState[] = ['provisioning', 'active', 'failed']
 const ORGANIZATION_ROLES: readonly RegistryOrganizationRole[] = ['owner', 'admin', 'member']
 const ORGANIZATION_MEMBERSHIP_STATES: readonly RegistryOrganizationMembershipState[] = ['active', 'suspended', 'removed']
@@ -378,6 +429,7 @@ const AUDIT_ACTIONS: readonly RegistryAuditAction[] = [
 ]
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const CHECKPOINT_HASH = /^sha256:[0-9a-f]{64}$/u
+const INVITATION_TOKEN = /^[A-Za-z0-9_-]{43}$/u
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -744,6 +796,90 @@ function directoryReceipt(value: unknown): RegistryDirectoryChangeReceipt {
   return { revision, invalidatedDisclosures }
 }
 
+function nullableDisplayName(value: unknown): string | null {
+  if (value === null) return null
+  if (!validDisplayName(value)) throw new RegistryApiError('unavailable')
+  return value
+}
+
+function invitation(value: unknown): RegistryInvitation {
+  const source = record(value)
+  const role = member(source?.role, INVITATION_ROLES)
+  const status = member(source?.status, INVITATION_STATUSES)
+  const expiresAt = safeInteger(source?.expiresAt, 0)
+  const createdAt = safeInteger(source?.createdAt, 0)
+  if (source === null || typeof source.invitationId !== 'string' || !IDENTIFIER.test(source.invitationId)
+    || typeof source.organizationId !== 'string' || !IDENTIFIER.test(source.organizationId)
+    || typeof source.createdByMemberId !== 'string' || !IDENTIFIER.test(source.createdByMemberId)
+    || role === null || status === null || expiresAt === null || createdAt === null) {
+    throw new RegistryApiError('unavailable')
+  }
+  return {
+    invitationId: source.invitationId,
+    organizationId: source.organizationId,
+    role,
+    displayName: nullableDisplayName(source.displayName),
+    status,
+    expiresAt,
+    createdAt,
+    createdByMemberId: source.createdByMemberId,
+  }
+}
+
+function invitationPage(value: unknown): RegistryInvitationPage {
+  const source = record(value)
+  if (source === null || !Array.isArray(source.items)) throw new RegistryApiError('unavailable')
+  const ids = new Set<string>()
+  const items = source.items.map((value) => {
+    const decoded = invitation(value)
+    if (ids.has(decoded.invitationId)) throw new RegistryApiError('unavailable')
+    ids.add(decoded.invitationId)
+    return decoded
+  })
+  return { items }
+}
+
+function createdInvitation(value: unknown): RegistryInvitationCreated {
+  const source = record(value)
+  if (source === null || typeof source.token !== 'string' || !INVITATION_TOKEN.test(source.token)) {
+    throw new RegistryApiError('unavailable')
+  }
+  return { invitation: invitation(source.invitation), token: source.token }
+}
+
+function revokedInvitation(value: unknown): RegistryInvitation {
+  const source = record(value)
+  if (source === null) throw new RegistryApiError('unavailable')
+  return invitation(source.invitation)
+}
+
+function invitationPreviewRecord(value: unknown): RegistryInvitationPreview {
+  const source = record(value)
+  const role = member(source?.role, INVITATION_ROLES)
+  const status = member(source?.status, INVITATION_STATUSES)
+  const expiresAt = safeInteger(source?.expiresAt, 0)
+  if (source === null || typeof source.invitationId !== 'string' || !IDENTIFIER.test(source.invitationId)
+    || typeof source.organizationId !== 'string' || !IDENTIFIER.test(source.organizationId)
+    || !validDisplayName(source.organizationDisplayName) || role === null || status === null || expiresAt === null) {
+    throw new RegistryApiError('unavailable')
+  }
+  return {
+    invitationId: source.invitationId,
+    organizationId: source.organizationId,
+    organizationDisplayName: source.organizationDisplayName,
+    role,
+    displayName: nullableDisplayName(source.displayName),
+    status,
+    expiresAt,
+  }
+}
+
+function invitationPreview(value: unknown): RegistryInvitationPreview {
+  const source = record(value)
+  if (source === null) throw new RegistryApiError('unavailable')
+  return invitationPreviewRecord(source.invitation)
+}
+
 function runtimeStatus(value: unknown): RegistryRuntimeStatus {
   const source = record(value)
   const deploymentMode = member(source?.deploymentMode, ['standard', 'test-only'] as const)
@@ -912,6 +1048,33 @@ export function createRegistryApi(): RegistryApi {
       { method: 'POST', signal, headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ expectedRevision, change }) },
       directoryReceipt,
+    ),
+    listInvitations: (organizationId, signal) => request(
+      `${organizationBase(organizationId)}/invitations`, { method: 'GET', signal }, invitationPage),
+    createInvitation: (organizationId, input, signal) => request(
+      `${organizationBase(organizationId)}/invitations`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) },
+      createdInvitation,
+    ),
+    revokeInvitation: (organizationId, invitationId, signal) => request(
+      `${organizationBase(organizationId)}/invitations/${encodeURIComponent(invitationId)}/revoke`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: '{}' },
+      revokedInvitation,
+    ),
+    readInvitation: (token, signal) => request(
+      `${API_BASE}/invitations/preview`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) },
+      invitationPreview,
+    ),
+    acceptInvitation: (token, signal) => request(
+      `${API_BASE}/invitations/accept`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) },
+      organizationSummary,
+    ),
+    declineInvitation: (token, signal) => request(
+      `${API_BASE}/invitations/decline`,
+      { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) },
+      invitationPreview,
     ),
     listInstances: (organizationId, signal) => request(
       `${organizationBase(organizationId)}/instances`, { method: 'GET', signal }, instances),

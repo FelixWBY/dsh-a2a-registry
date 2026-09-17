@@ -12,7 +12,7 @@
 pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node.exe
 ```
 
-脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。服务只绑定回环地址，Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织。
+脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。服务只绑定回环地址，Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织，也可通过 Owner／Admin 生成的一次性链接加入已有组织。
 
 普通服务器或已有身份服务可以直接使用 OIDC patch：
 

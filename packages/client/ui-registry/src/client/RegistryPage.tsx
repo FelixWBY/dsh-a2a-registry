@@ -12,6 +12,7 @@ import { OrganizationPage } from './OrganizationPage.tsx'
 import { QuestionDetailPage } from './QuestionDetailPage.tsx'
 import { NodesPage } from './NodesPage.tsx'
 import { MembersPage } from './MembersPage.tsx'
+import { JoinOrganizationPage } from './JoinOrganizationPage.tsx'
 import { NodeDetailPage } from './NodeDetailPage.tsx'
 import { OverviewPage } from './OverviewPage.tsx'
 import { SettingsPage } from './SettingsPage.tsx'
@@ -22,6 +23,9 @@ function OrganizationRegistryPage({ organizationId, page, props }:
     readDirectory: signal => props.readDirectory(organizationId, signal),
     changeDirectory: (expectedRevision, change, signal) =>
       props.changeDirectory(organizationId, expectedRevision, change, signal),
+    listInvitations: signal => props.listInvitations(organizationId, signal),
+    createInvitation: (request, signal) => props.createInvitation(organizationId, request, signal),
+    revokeInvitation: (invitationId, signal) => props.revokeInvitation(organizationId, invitationId, signal),
     listInstances: signal => props.listInstances(organizationId, signal),
     renameInstance: (bindingId, instanceName, signal) =>
       props.renameInstance(organizationId, bindingId, instanceName, signal),
@@ -48,9 +52,10 @@ function OrganizationRegistryPage({ organizationId, page, props }:
     cancelQuestion: (disclosureId, requestId, signal) =>
       props.cancelQuestion(organizationId, disclosureId, requestId, signal),
   }), [organizationId, props.approveBinding, props.askDisclosure, props.cancelQuestion, props.changeDirectory,
-    props.importDisclosure, props.listAudit, props.listBranches, props.listDisclosures, props.listImportTargets,
+    props.createInvitation, props.importDisclosure, props.listAudit, props.listBranches, props.listDisclosures, props.listInvitations, props.listImportTargets,
     props.listInstances, props.readDirectory, props.readDisclosure, props.readDisclosureContent, props.readImport,
-    props.readQuestion, props.rejectBinding, props.renameInstance, props.reviewBinding, props.revokeInstance])
+    props.readQuestion, props.rejectBinding, props.renameInstance, props.reviewBinding, props.revokeInstance,
+    props.revokeInvitation])
 
   const { t, useTheme, setTheme } = props
   if (typeof page !== 'string') {
@@ -90,7 +95,8 @@ function OrganizationRegistryPage({ organizationId, page, props }:
   if (page === 'overview') return <OverviewPage organizationId={organizationId} t={t} localTestIdentityBanner={props.localTestIdentityBanner}
     readStatus={props.readStatus} />
   if (page === 'members') return <MembersPage t={t} readDirectory={api.readDirectory}
-    changeDirectory={api.changeDirectory} />
+    changeDirectory={api.changeDirectory} listInvitations={api.listInvitations}
+    createInvitation={api.createInvitation} revokeInvitation={api.revokeInvitation} />
   if (page === 'nodes') return <NodesPage organizationId={organizationId} t={t} listInstances={api.listInstances}
     renameInstance={api.renameInstance} revokeInstance={api.revokeInstance} />
   if (page === 'binding') return <BindingPage organizationId={organizationId} t={t} listInstances={api.listInstances}
@@ -104,6 +110,9 @@ export function RegistryPage(props: RegistryPageProps) {
   const { page, t } = props
   if (page === 'signIn' || page === 'signUp') return <AuthPage mode={page} t={t} readStatus={props.readStatus} />
   if (page === 'newOrganization') return <OrganizationPage t={t} createOrganization={props.createOrganization} />
+  if (typeof page === 'object' && page.kind === 'join') return <JoinOrganizationPage token={page.token} t={t}
+    readAccount={props.readAccount} readInvitation={props.readInvitation}
+    acceptInvitation={props.acceptInvitation} declineInvitation={props.declineInvitation} />
   if (typeof page !== 'object') return <AccessLossPage t={t} />
   return <OrganizationRegistryPage organizationId={page.organizationId} page={page.page} props={props} />
 }

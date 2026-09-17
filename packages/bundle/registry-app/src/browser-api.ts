@@ -40,12 +40,15 @@ const AUDIT_PATH = `${API_BASE}/audit`
 const STATUS_PATH = `${API_BASE}/status`
 const ACCOUNT_PATH = `${API_BASE}/account`
 const ORGANIZATIONS_PATH = `${API_BASE}/organizations`
+const INVITATIONS_PATH = `${API_BASE}/invitations`
 const BILLING_PATH = `${API_BASE}/billing`
 const TEST_ONLY_REVOKE_PATH = `${API_BASE}/test-only/revoke-seed`
 const TEST_ONLY_CONFIRM_HEADER = 'x-dsh-local-mvp-confirm'
 const TEST_ONLY_CONFIRM_VALUE = 'revoke-seed'
 const ACCOUNT_ADMISSION_ORGANIZATION = brandString<OrganizationId>('registry-account')
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+const INVITATION_TOKEN = /^[A-Za-z0-9_-]{43}$/u
 const AUDIT_ACTORS = ['enrollment', 'producer', 'member', 'maintenance', 'unattributed'] as const
 const AUDIT_RESULTS = ['pending', 'succeeded', 'rejected'] as const
 const AUDIT_ACTIONS = ['register', 'status', 'event', 'checkpoint', 'read', 'metadata-read', 'metadata-list',
@@ -123,6 +126,8 @@ type TenantApiRoute = TenantRoute & (
     readonly action: 'review' | 'approve' | 'reject'
   }
   | { readonly kind: 'directory' }
+  | { readonly kind: 'invitations' }
+  | { readonly kind: 'invitation-revoke'; readonly invitationId: string }
   | { readonly kind: 'billing-plans' }
   | { readonly kind: 'billing-checkout' }
   | { readonly kind: 'audit'; readonly cursor?: string }
@@ -139,6 +144,7 @@ type ApiRoute =
   | { readonly kind: 'status' }
   | { readonly kind: 'account' }
   | { readonly kind: 'organization-create' }
+  | { readonly kind: 'invitation-preview' | 'invitation-accept' | 'invitation-decline' }
   | { readonly kind: 'test-only-revoke' }
   | TenantApiRoute
 
@@ -159,6 +165,8 @@ type BindingInput =
 type DirectoryInput = { readonly expectedRevision: number; readonly change: RegistryDirectoryChange }
 type BillingInput = { readonly planId: string; readonly idempotencyKey: string; readonly returnPath: string }
 type OrganizationInput = { readonly displayName: string; readonly idempotencyKey: string }
+type InvitationInput = { readonly role: 'admin' | 'member'; readonly displayName?: string; readonly expiresInSeconds?: number }
+type InvitationTokenInput = { readonly token: string }
 
 class ApiFailure extends Error {
   constructor(readonly status: number, readonly code: ApiErrorCode, readonly allow?: string,
@@ -216,6 +224,13 @@ function bindingId(value: string): RegistryBindingId {
   try { decoded = decodeURIComponent(value) } catch { throw new ApiFailure(400, 'invalid-input') }
   if (!IDENTIFIER.test(decoded)) throw new ApiFailure(400, 'invalid-input')
   return brandString<RegistryBindingId>(decoded)
+}
+
+function invitationId(value: string): string {
+  let decoded: string
+  try { decoded = decodeURIComponent(value) } catch { throw new ApiFailure(404, 'not-found') }
+  if (!UUID.test(decoded)) throw new ApiFailure(404, 'not-found')
+  return decoded
 }
 
 function requestId(value: string): A2aRequestId {
@@ -901,6 +916,44 @@ async function organizationInput(request: IncomingMessage, config: RegistryBrows
   return { displayName: value.displayName, idempotencyKey: idempotencyKey(value.idempotencyKey) }
 }
 
+async function invitationInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<InvitationInput> {
+  const raw = await readJson(request, config.maxOperationInputBytes, signal)
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new ApiFailure(400, 'invalid-input')
+  const value = raw as Record<string, unknown>
+  const keys = Object.keys(value)
+  if (!keys.includes('role') || keys.some(key => key !== 'role' && key !== 'displayName'
+    && key !== 'expiresInSeconds') || (value.role !== 'admin' && value.role !== 'member')) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  if (value.displayName !== undefined && (typeof value.displayName !== 'string'
+    || !validInstanceName(value.displayName) || Buffer.byteLength(value.displayName, 'utf8') > 256)) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  if (value.expiresInSeconds !== undefined && (!Number.isSafeInteger(value.expiresInSeconds)
+    || (value.expiresInSeconds as number) < 300 || (value.expiresInSeconds as number) > 604_800
+    || Object.is(value.expiresInSeconds, -0))) throw new ApiFailure(400, 'invalid-input')
+  return {
+    role: value.role,
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName as string }),
+    ...(value.expiresInSeconds === undefined ? {} : { expiresInSeconds: value.expiresInSeconds as number }),
+  }
+}
+
+async function invitationTokenInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<InvitationTokenInput> {
+  const value = exactRecord(await readJson(request, config.maxOperationInputBytes, signal), ['token'])
+  if (typeof value.token !== 'string' || !INVITATION_TOKEN.test(value.token)) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  return { token: value.token }
+}
+
+async function emptyJsonInput(request: IncomingMessage, config: RegistryBrowserApiConfig,
+  signal: AbortSignal): Promise<void> {
+  exactRecord(await readJson(request, config.maxOperationInputBytes, signal), [])
+}
+
 function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig): ApiRoute {
   const url = new URL(request.url ?? '/', 'http://registry.invalid')
   if (url.pathname === TEST_ONLY_REVOKE_PATH) {
@@ -918,6 +971,13 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
   if (url.pathname === ORGANIZATIONS_PATH) {
     noQuery(url)
     return { kind: 'organization-create' }
+  }
+  if (url.pathname === `${INVITATIONS_PATH}/preview`
+    || url.pathname === `${INVITATIONS_PATH}/accept`
+    || url.pathname === `${INVITATIONS_PATH}/decline`) {
+    noQuery(url)
+    return { kind: url.pathname.endsWith('/preview') ? 'invitation-preview'
+      : url.pathname.endsWith('/accept') ? 'invitation-accept' : 'invitation-decline' }
   }
   let organizationId: OrganizationId | undefined
   if (url.pathname.startsWith(`${ORGANIZATIONS_PATH}/`)) {
@@ -967,6 +1027,20 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
   if (url.pathname === DIRECTORY_PATH) {
     noQuery(url)
     return scoped({ kind: 'directory' })
+  }
+  if (url.pathname === INVITATIONS_PATH) {
+    noQuery(url)
+    if (organizationId === undefined) throw new ApiFailure(404, 'not-found')
+    return scoped({ kind: 'invitations' })
+  }
+  if (url.pathname.startsWith(`${INVITATIONS_PATH}/`)) {
+    noQuery(url)
+    if (organizationId === undefined) throw new ApiFailure(404, 'not-found')
+    const segments = url.pathname.slice(INVITATIONS_PATH.length + 1).split('/')
+    if (segments.length === 2 && segments[0] !== undefined && segments[1] === 'revoke') {
+      return scoped({ kind: 'invitation-revoke', invitationId: invitationId(segments[0]) })
+    }
+    throw new ApiFailure(404, 'not-found')
   }
   if (url.pathname === `${BILLING_PATH}/plans`) {
     noQuery(url)
@@ -1043,7 +1117,9 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
 }
 
 function assertMethod(request: IncomingMessage, route: ApiRoute): void {
-  if (route.kind === 'account' || route.kind === 'organization-create') {
+  if (route.kind === 'account' || route.kind === 'organization-create'
+    || route.kind === 'invitation-preview' || route.kind === 'invitation-accept'
+    || route.kind === 'invitation-decline') {
     const allowed = route.kind === 'account' ? 'GET' : 'POST'
     if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
     return
@@ -1060,6 +1136,11 @@ function assertMethod(request: IncomingMessage, route: ApiRoute): void {
     if (request.method !== 'GET' && request.method !== 'POST') throw new ApiFailure(405, 'method-not-allowed', allowed)
     return
   }
+  if (route.kind === 'invitations') {
+    const allowed = 'GET, POST'
+    if (request.method !== 'GET' && request.method !== 'POST') throw new ApiFailure(405, 'method-not-allowed', allowed)
+    return
+  }
   if (route.kind === 'billing-plans' || route.kind === 'billing-checkout') {
     const allowed = route.kind === 'billing-plans' ? 'GET' : 'POST'
     if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
@@ -1067,7 +1148,8 @@ function assertMethod(request: IncomingMessage, route: ApiRoute): void {
   }
   const allowed = route.kind === 'operation' || route.kind === 'instance-action'
     || route.kind === 'binding-start' || route.kind === 'binding-confirm'
-    || route.kind === 'binding-account-action' || route.kind === 'test-only-revoke' ? 'POST' : 'GET'
+    || route.kind === 'binding-account-action' || route.kind === 'invitation-revoke'
+    || route.kind === 'test-only-revoke' ? 'POST' : 'GET'
   if (request.method !== allowed) throw new ApiFailure(405, 'method-not-allowed', allowed)
 }
 
@@ -1354,6 +1436,58 @@ function organizationAccessResult(access: RegistryOrganizationAccess): unknown {
   }
 }
 
+function invitationResult(value: {
+  readonly invitationId: string
+  readonly organizationId: OrganizationId
+  readonly role: 'admin' | 'member'
+  readonly displayName: string | null
+  readonly status: string
+  readonly expiresAt: number
+  readonly createdAt: number
+  readonly createdByMemberId: MemberId
+}): unknown {
+  return {
+    invitationId: value.invitationId,
+    organizationId: value.organizationId,
+    role: value.role,
+    displayName: value.displayName,
+    status: value.status,
+    expiresAt: value.expiresAt,
+    createdAt: value.createdAt,
+    createdByMemberId: value.createdByMemberId,
+  }
+}
+
+function invitationPreviewResult(value: {
+  readonly invitationId: string
+  readonly organizationId: OrganizationId
+  readonly organizationDisplayName: string
+  readonly role: 'admin' | 'member'
+  readonly displayName: string | null
+  readonly status: string
+  readonly expiresAt: number
+}): unknown {
+  return {
+    invitationId: value.invitationId,
+    organizationId: value.organizationId,
+    organizationDisplayName: value.organizationDisplayName,
+    role: value.role,
+    displayName: value.displayName,
+    status: value.status,
+    expiresAt: value.expiresAt,
+  }
+}
+
+function tenancyAccount(identity: RegistryAuthenticatedIdentity): RegistryAccount {
+  return {
+    accountId: brandString<RegistryAccountId>(identity.accountId),
+    memberId: brandString<MemberId>(identity.memberId),
+    displayName: identity.displayName,
+    createdAt: 0,
+    updatedAt: 0,
+  }
+}
+
 async function accountResult(ctx: Context, request: IncomingMessage, signal: AbortSignal): Promise<unknown> {
   const identity = await globalIdentity(ctx, request, signal)
   const router = ctx.get('registryTenantRouter')
@@ -1387,13 +1521,7 @@ async function createOrganization(ctx: Context, request: IncomingMessage, signal
   const identity = await globalIdentity(ctx, request, signal)
   const router = ctx.get('registryTenantRouter')
   if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
-  const account: RegistryAccount = {
-    accountId: brandString<RegistryAccountId>(identity.accountId),
-    memberId: brandString<MemberId>(identity.memberId),
-    displayName: identity.displayName,
-    createdAt: 0,
-    updatedAt: 0,
-  }
+  const account = tenancyAccount(identity)
   const created = await router.tenancy.createOrganization(account, input)
   const lease = created.organization.state === 'active' ? undefined : await router.provision(created, identity.displayName)
   try {
@@ -1402,6 +1530,100 @@ async function createOrganization(ctx: Context, request: IncomingMessage, signal
     if (current === null || current.organization.state !== 'active') throw new RegistryTenancyError('unavailable')
     return organizationAccessResult(current)
   } finally { lease?.release() }
+}
+
+async function invitationActor(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  organizationId: OrganizationId): Promise<{
+  readonly identity: RegistryAuthenticatedIdentity
+  readonly account: RegistryAuthenticatedAccount
+}> {
+  const authenticator = ctx.get('registryAccountAuthenticator')
+  if (authenticator === undefined) throw new ApiFailure(503, 'identity-not-configured')
+  const [identity, account] = await Promise.all([
+    globalIdentity(ctx, request, signal),
+    requireAuthenticatedAccount(authenticator, request, signal, organizationId),
+  ])
+  if (identity.memberId !== account.subject.memberId || account.subject.organizationId !== organizationId
+    || account.subject.membership !== 'active'
+    || (account.subject.role !== 'owner' && account.subject.role !== 'admin')) {
+    throw new ApiFailure(404, 'not-found')
+  }
+  return { identity, account }
+}
+
+async function acceptInvitation(ctx: Context, request: IncomingMessage, signal: AbortSignal,
+  token: string, maxValueBytes: number): Promise<unknown> {
+  const identity = await globalIdentity(ctx, request, signal)
+  const router = ctx.get('registryTenantRouter')
+  if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
+  const account = tenancyAccount(identity)
+  const claim = await router.tenancy.claimInvitation(account, token)
+  if (claim.invitation.status === 'accepted') {
+    return organizationAccessResult(await router.tenancy.activateInvitation(account,
+      claim.invitation.invitationId))
+  }
+  const lease = await router.acquireRuntime(claim.invitation.organizationId)
+  const directory = lease.runtime.directory
+  if (directory === undefined) {
+    lease.release()
+    throw new ApiFailure(503, 'registry-not-configured')
+  }
+  const authority: FreshRegistryDirectoryAuthority = async () => ({ subject: {
+    organizationId: claim.invitation.organizationId,
+    memberId: claim.invitation.createdByMemberId,
+    authenticated: true,
+  }, now: Date.now() })
+  let inserted = false
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const state = await directory.read(authority, 'administration', maxValueBytes)
+      const existing = state.members.find(member => member.memberId === account.memberId)
+      if (existing !== undefined) {
+        if (existing.role !== claim.invitation.role || existing.state !== 'active') {
+          throw new RegistryTenancyError('conflict')
+        }
+        break
+      }
+      try {
+        await directory.change(authority, { kind: 'put-member', member: {
+          memberId: account.memberId,
+          displayName: account.displayName,
+          role: claim.invitation.role,
+          state: 'active',
+        } }, state.revision)
+        inserted = true
+        break
+      } catch (error) {
+        if (!(error instanceof RegistryIngestError) || error.code !== 'version-conflict' || attempt === 2) throw error
+      }
+    }
+    try {
+      return organizationAccessResult(await router.tenancy.activateInvitation(account,
+        claim.invitation.invitationId))
+    } catch (error) {
+      // A transient/unknown control-plane failure must remain retryable: the suspended membership
+      // keeps an active directory orphan inaccessible. Tombstone only a confirmed terminal invite.
+      let terminal = error instanceof RegistryTenancyError && error.code === 'conflict'
+      if (!terminal) {
+        try {
+          const preview = await router.tenancy.previewInvitation(account.accountId, token)
+          terminal = preview.status === 'revoked' || preview.status === 'expired' || preview.status === 'declined'
+        } catch { /* Unknown availability is not proof that the invitation is terminal. */ }
+      }
+      if (inserted && terminal) {
+        try {
+          const state = await directory.read(authority, 'administration', maxValueBytes)
+          const existing = state.members.find(member => member.memberId === account.memberId)
+          if (existing?.role === claim.invitation.role && existing.state === 'active') {
+            await directory.change(authority, { kind: 'put-member', member: {
+              ...existing, state: 'removed',
+            } }, state.revision)
+          }
+        } catch { /* Control membership is still suspended/removed and therefore fail-closed. */ }
+      }
+      throw error
+    }
+  } finally { lease.release() }
 }
 
 function mapFailure(error: unknown): ApiFailure {
@@ -1451,7 +1673,9 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
       if ((route.kind === 'operation' || route.kind === 'instance-action' || route.kind === 'binding-start'
         || route.kind === 'binding-confirm' || route.kind === 'binding-account-action'
         || route.kind === 'directory' && request.method === 'POST' || route.kind === 'billing-checkout'
-        || route.kind === 'organization-create')
+        || route.kind === 'organization-create' || route.kind === 'invitations' && request.method === 'POST'
+        || route.kind === 'invitation-revoke' || route.kind === 'invitation-preview'
+        || route.kind === 'invitation-accept' || route.kind === 'invitation-decline')
         && admission !== undefined) {
         const address = request.socket.remoteAddress
         if (address === undefined) throw new ApiFailure(503, 'unavailable')
@@ -1472,6 +1696,14 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         ? await directoryInput(request, config, controller.signal) : undefined
       const organizationCreateInput = route.kind === 'organization-create'
         ? await organizationInput(request, config, controller.signal) : undefined
+      const invitationCreateInput = route.kind === 'invitations' && request.method === 'POST'
+        ? await invitationInput(request, config, controller.signal) : undefined
+      const invitationToken = route.kind === 'invitation-preview' || route.kind === 'invitation-accept'
+        || route.kind === 'invitation-decline'
+        ? await invitationTokenInput(request, config, controller.signal) : undefined
+      if (route.kind === 'invitation-revoke') {
+        await emptyJsonInput(request, config, controller.signal)
+      }
       const checkoutInput = route.kind === 'billing-checkout'
         ? await billingInput(request, config, controller.signal) : undefined
       const organizationId = 'organizationId' in route ? route.organizationId : undefined
@@ -1524,6 +1756,29 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         succeed(response, await createOrganization(ctx, request, controller.signal, organizationCreateInput))
         return
       }
+      if (route.kind === 'invitation-preview' || route.kind === 'invitation-accept'
+        || route.kind === 'invitation-decline') {
+        if (invitationToken === undefined) throw new ApiFailure(503, 'unavailable')
+        const identity = await globalIdentity(ctx, request, controller.signal)
+        if (admission !== undefined) {
+          requireAdmission(ctx, admission.admitAccount(ACCOUNT_ADMISSION_ORGANIZATION,
+            brandString<MemberId>(identity.memberId)), 'account')
+        }
+        const router = ctx.get('registryTenantRouter')
+        if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
+        if (route.kind === 'invitation-preview') {
+          const preview = await router.tenancy.previewInvitation(
+            brandString<RegistryAccountId>(identity.accountId), invitationToken.token)
+          succeed(response, { invitation: invitationPreviewResult(preview) })
+        } else if (route.kind === 'invitation-accept') {
+          succeed(response, await acceptInvitation(ctx, request, controller.signal,
+            invitationToken.token, config.maxValueBytes))
+        } else {
+          const declined = await router.tenancy.declineInvitation(tenancyAccount(identity), invitationToken.token)
+          succeed(response, { invitation: invitationPreviewResult(declined) })
+        }
+        return
+      }
       if (route.kind === 'test-only-revoke') {
         if (runtime.testOnlyRevoke === undefined) throw new ApiFailure(404, 'not-found')
         const address = request.socket.remoteAddress
@@ -1550,6 +1805,32 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           const receipt = await enrollment.confirm(route.bindingId, enrollmentInput.proof)
           requireOperationActive(controller.signal)
           succeed(response, bindingReceiptResult(receipt, { bindingId: route.bindingId, phase: 'confirmed' }))
+        }
+        return
+      }
+      if (route.kind === 'invitations' || route.kind === 'invitation-revoke') {
+        if (route.organizationId === undefined) throw new ApiFailure(404, 'not-found')
+        const { identity, account } = await invitationActor(ctx, request, controller.signal, route.organizationId)
+        if (admission !== undefined && (route.kind === 'invitation-revoke' || request.method === 'POST')) {
+          requireAdmission(ctx, admission.admitAccount(account.subject.organizationId,
+            account.subject.memberId), 'account')
+        }
+        const router = ctx.get('registryTenantRouter')
+        if (router === undefined) throw new ApiFailure(503, 'registry-not-configured')
+        const accountId = brandString<RegistryAccountId>(identity.accountId)
+        if (route.kind === 'invitation-revoke') {
+          const revoked = await router.tenancy.revokeInvitation(accountId, account.subject.memberId,
+            account.subject.role, route.organizationId, route.invitationId)
+          succeed(response, { invitation: invitationResult(revoked) })
+        } else if (request.method === 'POST') {
+          if (invitationCreateInput === undefined) throw new ApiFailure(503, 'unavailable')
+          const created = await router.tenancy.createInvitation(accountId, account.subject.memberId,
+            account.subject.role, route.organizationId, invitationCreateInput)
+          succeed(response, { invitation: invitationResult(created.invitation), token: created.token })
+        } else {
+          const items = await router.tenancy.listInvitations(accountId, account.subject.memberId,
+            account.subject.role, route.organizationId)
+          succeed(response, { items: items.map(invitationResult) })
         }
         return
       }
@@ -1617,6 +1898,15 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           const receipt = await directory.change(authority, directoryChangeInput.change,
             directoryChangeInput.expectedRevision)
           requireOperationActive(controller.signal)
+          if (directoryChangeInput.change.kind === 'put-member') {
+            const router = ctx.get('registryTenantRouter')
+            if (router !== undefined) {
+              const member = directoryChangeInput.change.member
+              await router.tenancy.syncMembershipFromDirectory(authenticatedSubject.organizationId,
+                member.memberId, member.role, member.state)
+              requireOperationActive(controller.signal)
+            }
+          }
           succeed(response, { revision: receipt.revision, invalidatedDisclosures: receipt.invalidatedDisclosures })
           return
         }

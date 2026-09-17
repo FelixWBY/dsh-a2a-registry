@@ -1,19 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { RegistryOrganizationPageProps } from './contract.ts'
 import { AccessLossPage } from './AccessLossPage.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import { UnconfiguredPanel } from './UnconfiguredPanel.tsx'
 import { RegistryApiError, type RegistryDirectoryChange,
-  type RegistryDirectoryMemberState, type RegistryDirectoryPage, type RegistryDirectoryRole } from './registry-api.ts'
+  type RegistryDirectoryMemberState, type RegistryDirectoryPage, type RegistryDirectoryRole,
+  type RegistryInvitation, type RegistryInvitationRole, type RegistryInvitationStatus } from './registry-api.ts'
+import { invitationHref } from './navigation.ts'
 import css from './Registry.module.css'
 
-type MembersProps = Pick<RegistryOrganizationPageProps, 't' | 'readDirectory' | 'changeDirectory'>
+type MembersProps = Pick<RegistryOrganizationPageProps, 't' | 'readDirectory' | 'changeDirectory'
+| 'listInvitations' | 'createInvitation' | 'revokeInvitation'>
 type MembersState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'unconfigured' }
   | { readonly kind: 'accessLoss' }
   | { readonly kind: 'retry' }
-  | { readonly kind: 'ready'; readonly directory: RegistryDirectoryPage }
+  | { readonly kind: 'ready'; readonly directory: RegistryDirectoryPage; readonly invitations: readonly RegistryInvitation[] }
 
 const ROLE_KEYS: Record<RegistryDirectoryRole, 'directoryRoleOwner' | 'directoryRoleAdmin' | 'directoryRoleMember'> = {
   owner: 'directoryRoleOwner', admin: 'directoryRoleAdmin', member: 'directoryRoleMember',
@@ -21,6 +24,19 @@ const ROLE_KEYS: Record<RegistryDirectoryRole, 'directoryRoleOwner' | 'directory
 const STATE_KEYS: Record<RegistryDirectoryMemberState,
 'directoryStateActive' | 'directoryStateSuspended' | 'directoryStateRemoved'> = {
   active: 'directoryStateActive', suspended: 'directoryStateSuspended', removed: 'directoryStateRemoved',
+}
+const INVITATION_STATUS_KEYS: Record<RegistryInvitationStatus,
+'invitationStatusPending' | 'invitationStatusAccepted' | 'invitationStatusDeclined' | 'invitationStatusRevoked' | 'invitationStatusExpired'> = {
+  pending: 'invitationStatusPending', accepted: 'invitationStatusAccepted', declined: 'invitationStatusDeclined',
+  revoked: 'invitationStatusRevoked', expired: 'invitationStatusExpired',
+}
+
+function effectiveInvitationStatus(invitation: RegistryInvitation): RegistryInvitationStatus {
+  return invitation.status === 'pending' && invitation.expiresAt <= Date.now() ? 'expired' : invitation.status
+}
+
+function invitationLink(token: string): string {
+  return `${window.location.origin}${window.location.pathname}${invitationHref(token)}`
 }
 
 function failureState(error: unknown): 'unconfigured' | 'accessLoss' | 'retry' {
@@ -31,7 +47,8 @@ function failureState(error: unknown): 'unconfigured' | 'accessLoss' | 'retry' {
 }
 
 /** Owner/admin organization directory with optimistic, server-authorized mutations. */
-export function MembersPage({ t, readDirectory, changeDirectory }: MembersProps) {
+export function MembersPage({ t, readDirectory, changeDirectory, listInvitations, createInvitation,
+  revokeInvitation }: MembersProps) {
   const [requestRevision, setRequestRevision] = useState(0)
   const [state, setState] = useState<MembersState>({ kind: 'loading' })
   const [memberId, setMemberId] = useState('')
@@ -42,14 +59,24 @@ export function MembersPage({ t, readDirectory, changeDirectory }: MembersProps)
   const [teamMembers, setTeamMembers] = useState('')
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const [inviteName, setInviteName] = useState('')
+  const [inviteRole, setInviteRole] = useState<RegistryInvitationRole>('member')
+  const [invitationSaving, setInvitationSaving] = useState(false)
+  const [revokingInvitationId, setRevokingInvitationId] = useState<string | null>(null)
+  const [createdLink, setCreatedLink] = useState<string | null>(null)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const createdLinkRef = useRef<HTMLInputElement>(null)
+  const invitationController = useRef<AbortController | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
     setState({ kind: 'loading' })
-    void readDirectory(controller.signal).then((directory) => {
+    void Promise.all([readDirectory(controller.signal), listInvitations(controller.signal)]).then(([directory, invitations]) => {
       if (!controller.signal.aborted) {
-        setState({ kind: 'ready', directory })
+        setState({ kind: 'ready', directory, invitations: invitations.items })
         setSaving(false)
+        setInvitationSaving(false)
+        setRevokingInvitationId(null)
       }
     }, (error: unknown) => {
       if (!controller.signal.aborted) {
@@ -58,7 +85,9 @@ export function MembersPage({ t, readDirectory, changeDirectory }: MembersProps)
       }
     })
     return () => { controller.abort() }
-  }, [readDirectory, requestRevision])
+  }, [listInvitations, readDirectory, requestRevision])
+
+  useEffect(() => () => { invitationController.current?.abort() }, [])
 
   const mutate = (change: RegistryDirectoryChange): void => {
     if (state.kind !== 'ready' || saving) return
@@ -76,6 +105,77 @@ export function MembersPage({ t, readDirectory, changeDirectory }: MembersProps)
     })
   }
 
+  const submitInvitation = (): void => {
+    if (state.kind !== 'ready' || state.directory.actorRole === 'member' || invitationSaving) return
+    invitationController.current?.abort()
+    const controller = new AbortController()
+    invitationController.current = controller
+    const displayName = inviteName.trim()
+    const role: RegistryInvitationRole = state.directory.actorRole === 'owner' ? inviteRole : 'member'
+    setInvitationSaving(true)
+    setMessage(null)
+    setCreatedLink(null)
+    setCopyState('idle')
+    void createInvitation({ role, ...(displayName === '' ? {} : { displayName }) }, controller.signal).then((created) => {
+      if (controller.signal.aborted) return
+      setState(current => current.kind === 'ready'
+        ? { ...current, invitations: [created.invitation,
+          ...current.invitations.filter(item => item.invitationId !== created.invitation.invitationId)] }
+        : current)
+      setCreatedLink(invitationLink(created.token))
+      setInviteName('')
+      setInviteRole('member')
+      setInvitationSaving(false)
+      setMessage(t('invitationCreated'))
+    }, (error: unknown) => {
+      if (controller.signal.aborted) return
+      const failure = failureState(error)
+      if (failure === 'accessLoss' || failure === 'unconfigured') setState({ kind: failure })
+      setInvitationSaving(false)
+      setMessage(t(error instanceof RegistryApiError && error.code === 'invalid-input'
+        ? 'invitationInvalidInput' : 'invitationCreateFailed'))
+    })
+  }
+
+  const revoke = (invitationId: string): void => {
+    if (state.kind !== 'ready' || revokingInvitationId !== null) return
+    invitationController.current?.abort()
+    const controller = new AbortController()
+    invitationController.current = controller
+    setRevokingInvitationId(invitationId)
+    setMessage(null)
+    void revokeInvitation(invitationId, controller.signal).then((updated) => {
+      if (controller.signal.aborted) return
+      setState(current => current.kind === 'ready' ? { ...current,
+        invitations: current.invitations.map(item => item.invitationId === updated.invitationId ? updated : item) } : current)
+      setRevokingInvitationId(null)
+      setMessage(t('invitationRevoked'))
+    }, (error: unknown) => {
+      if (controller.signal.aborted) return
+      const failure = failureState(error)
+      if (failure === 'accessLoss' || failure === 'unconfigured') setState({ kind: failure })
+      setRevokingInvitationId(null)
+      setMessage(t('invitationRevokeFailed'))
+    })
+  }
+
+  const copyCreatedLink = (): void => {
+    if (createdLink === null) return
+    if (navigator.clipboard === undefined) {
+      setCopyState('failed')
+      createdLinkRef.current?.focus()
+      createdLinkRef.current?.select()
+      return
+    }
+    void navigator.clipboard.writeText(createdLink).then(() => {
+      setCopyState('copied')
+    }, () => {
+      setCopyState('failed')
+      createdLinkRef.current?.focus()
+      createdLinkRef.current?.select()
+    })
+  }
+
   if (state.kind === 'accessLoss') return <AccessLossPage t={t} />
   return <section>
     <div className={css.pageHeading}><h1>{t('members')}</h1><p>{t('membersDescription')}</p></div>
@@ -85,6 +185,38 @@ export function MembersPage({ t, readDirectory, changeDirectory }: MembersProps)
     {state.kind === 'ready' && <>
       <div className={css.directoryMeta} role="status"><RegistryIcon name="info" /><p>{t('directoryRevision')} <strong>{state.directory.revision}</strong> · {t(state.directory.actorRole === 'owner' ? 'directoryOwnerAccess' : 'directoryAdminAccess')}</p></div>
       {message !== null && <p className={css.directoryMessage} role="status">{message}</p>}
+      <section className={css.directorySection} aria-labelledby="directory-invitations-heading">
+        <div className={css.cardHeading}><div><h2 id="directory-invitations-heading">{t('invitationsHeading')}</h2><p>{t('invitationsDescription')}</p></div></div>
+        {state.directory.actorRole === 'member' ? <p className={css.directoryMessage}>{t('directoryReadOnly')}</p> : <form className={css.invitationEditor} onSubmit={(event) => { event.preventDefault(); submitInvitation() }}>
+          <label><span>{t('invitationDisplayName')}</span><input value={inviteName} maxLength={80} disabled={invitationSaving} placeholder={t('invitationDisplayNamePlaceholder')} onChange={event => { setInviteName(event.currentTarget.value) }} /></label>
+          <label><span>{t('directoryMemberRole')}</span><select value={state.directory.actorRole === 'owner' ? inviteRole : 'member'} disabled={invitationSaving || state.directory.actorRole !== 'owner'} onChange={event => { setInviteRole(event.currentTarget.value as RegistryInvitationRole) }}><option value="member">{t('directoryRoleMember')}</option>{state.directory.actorRole === 'owner' ? <option value="admin">{t('directoryRoleAdmin')}</option> : null}</select></label>
+          <button className={css.primaryAction} type="submit" disabled={invitationSaving}>{t(invitationSaving ? 'invitationCreating' : 'invitationCreate')}</button>
+        </form>}
+        {createdLink !== null ? <div className={css.createdInvitation} role="status">
+          <div><strong>{t('invitationLinkReady')}</strong><p>{t('invitationLinkOnce')}</p></div>
+          <div className={css.invitationLinkRow}><input ref={createdLinkRef} readOnly value={createdLink} aria-label={t('invitationLink')} onFocus={event => { event.currentTarget.select() }} /><button className={css.secondaryAction} type="button" onClick={copyCreatedLink}>{t(copyState === 'copied' ? 'copied' : 'copyLink')}</button></div>
+          {copyState === 'failed' ? <p className={css.invitationCopyHelp}>{t('copyFailed')}</p> : null}
+        </div> : null}
+        {state.invitations.length === 0
+          ? <div className={css.statePanel}><RegistryIcon name="members" size={48} /><p>{t('invitationsEmpty')}</p></div>
+          : <div className={css.tableFrame}><div className={`${css.tableScroll} ${css.responsiveTableScroll}`} tabIndex={0} role="region" aria-label={t('invitationsHeading')}>
+            <table className={`${css.table} ${css.directoryTable} ${css.responsiveTable}`}>
+              <thead><tr>{(['invitationDisplayName', 'directoryMemberRole', 'directoryMemberState', 'expiry', 'actions'] as const).map(key => <th scope="col" key={key}>{t(key)}</th>)}</tr></thead>
+              <tbody>{state.invitations.map(invitation => {
+                const status = effectiveInvitationStatus(invitation)
+                return <tr key={invitation.invitationId}>
+                  <td data-label={t('invitationDisplayName')}>{invitation.displayName ?? t('invitationAnyoneWithLink')}</td>
+                  <td data-label={t('directoryMemberRole')}>{t(invitation.role === 'admin' ? 'directoryRoleAdmin' : 'directoryRoleMember')}</td>
+                  <td data-label={t('directoryMemberState')}><span className={status === 'pending' ? css.invitationPending : css.invitationClosed}>{t(INVITATION_STATUS_KEYS[status])}</span></td>
+                  <td data-label={t('expiry')}><time dateTime={new Date(invitation.expiresAt).toISOString()}>{new Date(invitation.expiresAt).toLocaleString()}</time></td>
+                  <td data-label={t('actions')}><div className={css.directoryRowActions}>{status === 'pending'
+                    ? <button type="button" disabled={revokingInvitationId !== null} onClick={() => { revoke(invitation.invitationId) }}>{t(revokingInvitationId === invitation.invitationId ? 'invitationRevoking' : 'invitationRevoke')}</button>
+                    : '—'}</div></td>
+                </tr>
+              })}</tbody>
+            </table>
+          </div></div>}
+      </section>
       <section className={css.directorySection} aria-labelledby="directory-members-heading">
         <div className={css.cardHeading}><div><h2 id="directory-members-heading">{t('directoryMembersHeading')}</h2><p>{t('directoryMembersDescription')}</p></div></div>
         <form className={css.directoryEditor} onSubmit={(event) => {

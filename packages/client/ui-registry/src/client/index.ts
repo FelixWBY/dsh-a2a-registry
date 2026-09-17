@@ -30,12 +30,22 @@ export function apply(ctx: Context, config: Config = Config({})): void {
   }
   const api = createRegistryApi()
   const readStatus: RegistryPageInjected['readStatus'] = signal => api.readStatus(signal)
+  const readAccount: RegistryPageInjected['readAccount'] = signal => api.readAccount(signal)
   const createOrganization: RegistryPageInjected['createOrganization'] = (request, signal) =>
     api.createOrganization(request, signal)
   const readDirectory: RegistryPageInjected['readDirectory'] = (organizationId, signal) =>
     api.readDirectory(organizationId, signal)
   const changeDirectory: RegistryPageInjected['changeDirectory'] = (organizationId, expectedRevision, change, signal) =>
     api.changeDirectory(organizationId, expectedRevision, change, signal)
+  const listInvitations: RegistryPageInjected['listInvitations'] = (organizationId, signal) =>
+    api.listInvitations(organizationId, signal)
+  const createInvitation: RegistryPageInjected['createInvitation'] = (organizationId, request, signal) =>
+    api.createInvitation(organizationId, request, signal)
+  const revokeInvitation: RegistryPageInjected['revokeInvitation'] = (organizationId, invitationId, signal) =>
+    api.revokeInvitation(organizationId, invitationId, signal)
+  const readInvitation: RegistryPageInjected['readInvitation'] = (token, signal) => api.readInvitation(token, signal)
+  const acceptInvitation: RegistryPageInjected['acceptInvitation'] = (token, signal) => api.acceptInvitation(token, signal)
+  const declineInvitation: RegistryPageInjected['declineInvitation'] = (token, signal) => api.declineInvitation(token, signal)
   const listInstances: RegistryPageInjected['listInstances'] = (organizationId, signal) =>
     api.listInstances(organizationId, signal)
   const renameInstance: RegistryPageInjected['renameInstance'] = (organizationId, bindingId, instanceName, signal) =>
@@ -98,9 +108,16 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       setTheme: (preference) => { ctx.theme.setTheme(preference) },
       localTestIdentityBanner: config.localTestIdentityBanner,
       readStatus,
+      readAccount,
       createOrganization,
       readDirectory,
       changeDirectory,
+      listInvitations,
+      createInvitation,
+      revokeInvitation,
+      readInvitation,
+      acceptInvitation,
+      declineInvitation,
       listInstances,
       renameInstance,
       revokeInstance,

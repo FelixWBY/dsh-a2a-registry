@@ -34,6 +34,9 @@ export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema }
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
 export { RegistryTenancyError } from './tenancy.ts'
 export type { RegistryAccount, RegistryAccountId, RegistryLegacyOrganizationInput,
+  RegistryInvitation, RegistryInvitationClaim, RegistryInvitationCreation,
+  RegistryInvitationCreationInput, RegistryInvitationPreview, RegistryInvitationRole,
+  RegistryInvitationState,
   RegistryOidcAccountInput, RegistryOrganization, RegistryOrganizationAccess,
   RegistryOrganizationCreationInput, RegistryOrganizationMembership,
   RegistryOrganizationMembershipState, RegistryOrganizationRole, RegistryOrganizationState,

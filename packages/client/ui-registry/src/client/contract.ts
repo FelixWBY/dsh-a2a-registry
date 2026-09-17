@@ -18,6 +18,11 @@ import type {
   RegistryDirectoryPage,
   RegistryDirectoryChange,
   RegistryDirectoryChangeReceipt,
+  RegistryInvitation,
+  RegistryInvitationCreateRequest,
+  RegistryInvitationCreated,
+  RegistryInvitationPage,
+  RegistryInvitationPreview,
   RegistryInstance,
   RegistryInstancePage,
   RegistryListRequest,
@@ -64,6 +69,8 @@ export interface RegistryPageInjected {
   localTestIdentityBanner: boolean
   /** Read explicit Registry startup configuration facts without inferring liveness. */
   readStatus: (signal: AbortSignal) => Promise<RegistryRuntimeStatus>
+  /** Read the signed-in account without selecting an organization. */
+  readAccount: (signal: AbortSignal) => Promise<RegistryAccountContext>
   /** Create one organization and its owner membership as an idempotent server transaction. */
   createOrganization: (request: RegistryOrganizationCreateRequest,
     signal: AbortSignal) => Promise<RegistryOrganizationSummary>
@@ -72,6 +79,17 @@ export interface RegistryPageInjected {
   /** Apply one optimistic owner/admin directory mutation. */
   changeDirectory: (organizationId: string, expectedRevision: number, change: RegistryDirectoryChange,
     signal: AbortSignal) => Promise<RegistryDirectoryChangeReceipt>
+  /** List invitation metadata; raw join tokens never appear in this response. */
+  listInvitations: (organizationId: string, signal: AbortSignal) => Promise<RegistryInvitationPage>
+  /** Create an invitation and return its raw token exactly once. */
+  createInvitation: (organizationId: string, request: RegistryInvitationCreateRequest,
+    signal: AbortSignal) => Promise<RegistryInvitationCreated>
+  revokeInvitation: (organizationId: string, invitationId: string,
+    signal: AbortSignal) => Promise<RegistryInvitation>
+  /** Preview and resolve one invitation directly from its URL token. */
+  readInvitation: (token: string, signal: AbortSignal) => Promise<RegistryInvitationPreview>
+  acceptInvitation: (token: string, signal: AbortSignal) => Promise<RegistryOrganizationSummary>
+  declineInvitation: (token: string, signal: AbortSignal) => Promise<RegistryInvitationPreview>
   /** Read current account-owned instance bindings and ephemeral observations. */
   listInstances: (organizationId: string, signal: AbortSignal) => Promise<RegistryInstancePage>
   /** Rename one currently confirmed binding owned by the authenticated account. */
@@ -131,6 +149,10 @@ export interface RegistryOrganizationPageActions {
   readDirectory: (signal: AbortSignal) => Promise<RegistryDirectoryPage>
   changeDirectory: (expectedRevision: number, change: RegistryDirectoryChange,
     signal: AbortSignal) => Promise<RegistryDirectoryChangeReceipt>
+  listInvitations: (signal: AbortSignal) => Promise<RegistryInvitationPage>
+  createInvitation: (request: RegistryInvitationCreateRequest,
+    signal: AbortSignal) => Promise<RegistryInvitationCreated>
+  revokeInvitation: (invitationId: string, signal: AbortSignal) => Promise<RegistryInvitation>
   listInstances: (signal: AbortSignal) => Promise<RegistryInstancePage>
   renameInstance: (bindingId: string, instanceName: string, signal: AbortSignal) => Promise<RegistryInstance>
   revokeInstance: (bindingId: string, signal: AbortSignal) => Promise<RegistryInstance>

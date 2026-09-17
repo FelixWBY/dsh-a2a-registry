@@ -2036,6 +2036,233 @@
   }
 }
 
+.invitationEditor {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, 220px) auto;
+  align-items: end;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--registry-border);
+  border-radius: 10px;
+  background: var(--registry-panel);
+}
+
+.invitationEditor label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--registry-muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.invitationEditor input, .invitationEditor select, .invitationLinkRow input {
+  min-width: 0;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--registry-border);
+  border-radius: 7px;
+  background: var(--registry-control);
+  color: var(--registry-text);
+  font: inherit;
+}
+
+.createdInvitation {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid var(--registry-accent-line);
+  border-radius: 10px;
+  background: var(--registry-accent-soft);
+}
+
+.createdInvitation strong {
+  color: var(--registry-text);
+  font-size: 14px;
+}
+
+.createdInvitation p {
+  margin: 4px 0 0;
+  color: var(--registry-muted);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.invitationLinkRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.invitationLinkRow input {
+  font-family: var(--dsw-font-family-mono);
+  font-size: 12px;
+}
+
+.invitationCopyHelp {
+  color: var(--registry-warning) !important;
+}
+
+.invitationPending, .invitationClosed {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.invitationPending {
+  background: var(--registry-accent-soft);
+  color: var(--registry-accent);
+}
+
+.invitationClosed {
+  background: var(--registry-control);
+  color: var(--registry-muted);
+}
+
+.invitationCanvas {
+  display: flex;
+  justify-content: center;
+  padding: clamp(48px, 9vh, 96px) 24px;
+}
+
+.invitationCard {
+  width: min(100%, 680px);
+  overflow: hidden;
+  border: 1px solid var(--registry-border);
+  border-radius: 12px;
+  background: var(--registry-panel);
+}
+
+.invitationIntro {
+  padding: 30px;
+  border-bottom: 1px solid var(--registry-border);
+}
+
+.invitationEyebrow {
+  color: var(--registry-accent);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.invitationIntro h1, .invitationState h1 {
+  margin: 10px 0 7px;
+  color: var(--registry-text);
+  font-size: 25px;
+  line-height: 34px;
+}
+
+.invitationIntro p, .invitationState p, .invitationDecision p {
+  margin: 0;
+  color: var(--registry-muted);
+  line-height: 22px;
+}
+
+.invitationDetails {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  padding: 8px 30px;
+}
+
+.invitationDetails > div {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--registry-border);
+}
+
+.invitationDetails > div:nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.invitationDetails dt {
+  margin-bottom: 6px;
+  color: var(--registry-muted);
+  font-size: 12px;
+}
+
+.invitationDetails dd {
+  margin: 0;
+  color: var(--registry-text);
+  overflow-wrap: anywhere;
+}
+
+.invitationDecision {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 20px 30px;
+  border-top: 1px solid var(--registry-border);
+  background: var(--registry-header);
+}
+
+.invitationDecision > div {
+  display: flex;
+  gap: 10px;
+}
+
+.invitationState {
+  display: flex;
+  min-height: 380px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  text-align: center;
+}
+
+.invitationState > svg {
+  color: var(--registry-accent);
+}
+
+.invitationState > .primaryAction, .invitationState > .secondaryAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 22px;
+  border: 0;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.invitationState > .secondaryAction {
+  border: 1px solid var(--registry-border-strong);
+}
+
+@media (max-width: 760px) {
+  .invitationEditor {
+    grid-template-columns: 1fr;
+  }
+  .invitationLinkRow {
+    grid-template-columns: 1fr;
+  }
+  .invitationDetails {
+    grid-template-columns: 1fr;
+  }
+  .invitationDetails > div:nth-last-child(2) {
+    border-bottom: 1px solid var(--registry-border);
+  }
+  .invitationDecision {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .invitationDecision > div {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .invitationState {
+    min-height: 330px;
+    padding: 36px 22px;
+  }
+}
+
 /* Multi-tenant account chrome reuses the approved dark Registry tokens. */
 .organizationSwitcher {
   position: relative;
