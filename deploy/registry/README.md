@@ -5,3 +5,5 @@
 生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时和 PostgreSQL RLS。所有 `.example` 文件均需替换为自己的环境配置，不包含真实凭据。
 
 本地开发先启动仓库提供的 PostgreSQL 容器，再运行 `start-local-keycloak.ps1`。脚本会创建隔离的本地 SaaS schema、启动固定版本 Keycloak、打开用户自助注册并启动 Registry；生成的凭据只写入 Git 忽略的本地文件。该 Keycloak 配置不得用于生产。
+
+已有单组织 PostgreSQL storage v1 上线前必须停写、备份并迁移。使用默认只读计划、显式 schema 和预期计数的 [v1 到 v2 迁移工具](migrate-postgres-storage-v1-to-v2.md)；不要把硬编码 `registry` 的旧 SQL 用到其他 schema。

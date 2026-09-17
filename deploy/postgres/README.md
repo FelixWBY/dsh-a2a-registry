@@ -25,25 +25,32 @@ powershell -ExecutionPolicy Bypass -File scripts/local-postgres.ps1 Backup
 
 先停止全部 Registry 进程并运行 `Backup`，在隔离数据库验证备份可恢复。已有 v1 数据不能靠 JSON 猜组织：第一次用新版后端启动时，必须在 PostgreSQL 插件配置中显式设置 `legacyTenantId`，而且它必须与旧站运行时的 `ingest.organizationId`（部署变量 `DSH_REGISTRY_ORGANIZATION_ID`）逐字一致。首次迁移只启动一个新版进程；不要生成新 ID，也不要让两个实例并发迁移。迁移在一个事务内增加租户列、回填旧行、替换复合主外键、启用并强制 RLS，最后才把 schema 版本写成 2；失败会回滚到 v1。
 
-需要运维人员离线执行时，可以使用：
+需要运维人员离线执行时，只使用带显式 schema、预期计数、停写检查和前后摘要验证的 [Registry v1 到 v2 迁移工具](../registry/migrate-postgres-storage-v1-to-v2.md)。原来硬编码 `registry` 的 `002-tenant-scope-rls.sql` 已移除，不能用历史副本代替这个工具。
 
 ```powershell
-$legacyTenant = '<旧数据唯一所属的租户 ID>'
-Get-Content -Raw deploy/postgres/migrations/002-tenant-scope-rls.sql | `
-  docker.exe --context desktop-linux compose -f deploy/postgres/compose.yaml exec -T postgres `
-  psql -U postgres -d registry -v ON_ERROR_STOP=1 "--set=legacy_tenant_id=$legacyTenant"
+$env:DSH_REGISTRY_POSTGRES_URL = '<从秘密管理注入>'
+node deploy/registry/migrate-postgres-storage-v1-to-v2.mjs --schema <实际schema> `
+  --legacy-tenant-id <旧组织ID> --expect-units <数量> --expect-globals <数量> --expect-records <数量>
 ```
+
+确认只读计划、备份恢复和停写状态后，使用相同参数追加 `--execute --confirm-quiesced --confirm-backup-verified`。
 
 脚本和应用内迁移二选一，不能并发执行。首次启动后至少确认：`storage_meta.schema_version = 2`；三张领域表都同时启用 `relrowsecurity` 与 `relforcerowsecurity`；`units` 中只有预期的旧组织 ID；应用账号既不是超级管理员也没有 `BYPASSRLS`；旧组织页面仍能读到原数据，并且新建第二个组织后双方数据互不可见。确认无误后可删除临时 `legacyTenantId` 配置。回滚必须停止新版进程并恢复升级前备份；不要手工删除租户列或降低 `storage_meta` 版本。
 
 ```sql
-select schema_version from registry.storage_meta where singleton = true;
-select tenant_id, count(*) from registry.units group by tenant_id order by tenant_id;
-select relname, relrowsecurity, relforcerowsecurity
-from pg_class where oid in ('registry.units'::regclass, 'registry.unit_globals'::regclass,
-  'registry.unit_records'::regclass) order by relname;
+\set target_schema registry_mvp
+select schema_version from :"target_schema".storage_meta where singleton = true;
+select tenant_id, count(*) from :"target_schema".units group by tenant_id order by tenant_id;
+select relation.relname, relation.relrowsecurity, relation.relforcerowsecurity
+from pg_class as relation
+join pg_namespace as namespace on namespace.oid = relation.relnamespace
+where namespace.nspname = :'target_schema'
+  and relation.relname in ('units', 'unit_globals', 'unit_records')
+order by relation.relname;
 select rolname, rolsuper, rolbypassrls from pg_roles where rolname = 'registry_app';
 ```
+
+上例的 `registry_mvp` 是当前旧站实际 schema；迁移其他部署时必须先改成该部署的真实值，不能用 `registry` 代替。
 
 ## 注册站接入与迁移
 

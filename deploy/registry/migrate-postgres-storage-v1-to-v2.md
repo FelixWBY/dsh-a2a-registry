@@ -1,0 +1,52 @@
+# 单组织 PostgreSQL 数据迁移
+
+这个工具把指定 schema 中的 Registry PostgreSQL storage 从 v1 原地升级到带租户边界和强制 RLS 的 v2。它不猜 schema 或组织 ID，不复制到另一个 schema，也不修改账号、OIDC 或目录成员。默认命令只做只读计划并回滚；只有显式 `--execute` 才会提交。
+
+## 迁移前
+
+1. 从旧部署配置确认唯一的 `ingest.organizationId`，不要生成新 ID。
+2. 停止所有连接同一数据库的 Registry 实例。工具执行时也会检查 `pg_stat_activity`，发现 Registry 连接就拒绝提交。空闲进程可能暂时没有数据库会话，因此这个检查只是附加保护，不能替代停服务。
+3. 对数据库执行 `pg_dump`，恢复到隔离数据库并验证可读。恢复时保留原对象所有者，或显式把目标 schema 和表交给迁移角色；不要用 `--no-owner` 意外改成超级用户所有。持久卷不是备份。
+4. 从备份或只读查询记录 v1 的 `units`、`unit_globals`、`unit_records` 精确行数。执行命令必须提供这三个预期值。
+5. 连接串只注入当前进程的 `DSH_REGISTRY_POSTGRES_URL`。不要把它写进命令参数、文档、聊天或 Git。
+
+工具要求非超级用户、没有 `BYPASSRLS` 且拥有目标 schema 迁移权限。它只接受小写字母、数字和下划线组成的显式 schema 名。历史版本中硬编码 `registry` 的 `002-tenant-scope-rls.sql` 已移除，不得从旧副本继续使用。
+
+## 先运行计划
+
+```powershell
+$env:DSH_REGISTRY_POSTGRES_URL = '<从秘密管理注入>'
+node deploy/registry/migrate-postgres-storage-v1-to-v2.mjs `
+  --schema <旧数据实际 schema> `
+  --legacy-tenant-id <旧组织 ID> `
+  --expect-units <单元数> `
+  --expect-globals <全局记录数> `
+  --expect-records <领域记录数>
+```
+
+计划在可重复读事务中验证版本、表布局、主外键、三个预期计数、持久化组织 ID，并生成不含原文的 SHA-256 摘要，最后回滚。输出只记录检测瞬间观察到的 Registry 数据库连接数，并始终保留 `operatorQuiescenceStillRequired: true`；计划成功不代表 Registry 进程已经停止，也不等于已经迁移。
+
+## 执行
+
+确认 Registry 已停、备份已通过隔离恢复、计划输出和人工记录一致后，在同一主机执行：
+
+```powershell
+node deploy/registry/migrate-postgres-storage-v1-to-v2.mjs `
+  --schema <旧数据实际 schema> `
+  --legacy-tenant-id <旧组织 ID> `
+  --expect-units <单元数> `
+  --expect-globals <全局记录数> `
+  --expect-records <领域记录数> `
+  --execute --confirm-quiesced --confirm-backup-verified
+```
+
+执行过程取得单进程事务级 advisory lock，以固定顺序独占锁定四张存储表，在一个事务内增加并回填 `tenant_id`、替换复合主外键、启用并强制 RLS、安装 `tenant_isolation` 策略，最后才把版本写为 2。提交前再次核对计数、约束、RLS 和前后摘要；任一步失败都会回滚整个事务。
+
+## 提交后验收与回滚
+
+- 只启动一个新版 Registry 实例，并把同一个组织 ID 配置为旧组织。
+- 使用已确认的 Owner 身份登录，核对目录、披露、请求状态和审计摘要。
+- 创建第二个测试组织，确认两个组织互相看不到数据。
+- 完成业务验收前保留旧版本程序和迁移前备份，不启动第二个业务副本。
+
+若工具在 `COMMIT` 前失败，数据库仍是 v1，可修复原因后重新运行计划。若终端在提交确认期间断开，先只读检查 `storage_meta.schema_version`，不要盲目重试。若已提交但业务验收失败，停止新版 Registry，从迁移前备份恢复到隔离数据库并验证后再切回；不要手工删除租户列、策略或降低版本号。

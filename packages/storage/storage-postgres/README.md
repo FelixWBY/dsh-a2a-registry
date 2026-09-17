@@ -24,6 +24,6 @@ config:
   legacyTenantId: !!js process.env.DSH_REGISTRY_LEGACY_TENANT_ID
 ```
 
-先停止旧 Registry 并验证 `pg_dump` 可以恢复，再启动新版本。升级确认完成后可以删除 `legacyTenantId` 配置；它不会参与 v2 的正常读写。运维人员也可以停写后运行 `deploy/postgres/migrations/002-tenant-scope-rls.sql`，但不能同时运行脚本和应用内迁移。
+先停止旧 Registry 并验证 `pg_dump` 可以恢复，再启动新版本。升级确认完成后可以删除 `legacyTenantId` 配置；它不会参与 v2 的正常读写。需要离线迁移时，只能使用 `deploy/registry/migrate-postgres-storage-v1-to-v2.mjs` 的默认只读计划和显式执行流程；不能同时运行工具和应用内迁移。
 
 空 v1 数据库无需配置，会迁入保留的全局作用域。未知 schema 版本、填充过但未指定旧租户的 v1 数据库，以及部分手工修改的表结构都会拒绝启动。
