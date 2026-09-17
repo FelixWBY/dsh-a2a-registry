@@ -176,7 +176,7 @@ interface TenancyTableRow {
   readonly reachable_maintain: boolean
 }
 
-interface TenancyPolicyRow {
+export interface TenancyPolicyRow {
   readonly table_name: string
   readonly policy_name: string
   readonly command: string
@@ -184,7 +184,7 @@ interface TenancyPolicyRow {
   readonly public_only: boolean
   readonly has_using: boolean
   readonly has_check: boolean
-  readonly role_ids: string
+  readonly roles_definition: string
   readonly using_definition: string | null
   readonly check_definition: string | null
 }
@@ -323,21 +323,57 @@ function postgresCode(error: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-function policyFingerprint(rows: readonly TenancyPolicyRow[]): string {
+/** Stable across dump/restore because policy expressions and roles contain no catalog object OIDs. */
+export function fingerprintTenancyPolicies(rows: readonly TenancyPolicyRow[]): string {
   const definitions = [...rows].sort((left, right) => {
-    const table = left.table_name.localeCompare(right.table_name)
-    return table === 0 ? left.policy_name.localeCompare(right.policy_name) : table
+    if (left.table_name !== right.table_name) return left.table_name < right.table_name ? -1 : 1
+    if (left.policy_name !== right.policy_name) return left.policy_name < right.policy_name ? -1 : 1
+    return 0
   }).map(row => JSON.stringify([
     row.table_name,
     row.policy_name,
     row.command,
     row.permissive,
-    row.role_ids,
+    row.public_only,
+    row.has_using,
+    row.has_check,
+    row.roles_definition,
     row.using_definition,
     row.check_definition,
   ])).join('\n')
-  return createHash('sha256').update('registry-tenancy-policy-v1\0', 'utf8').update(definitions, 'utf8').digest('hex')
+  return createHash('sha256').update('registry-tenancy-policy-v2\0', 'utf8').update(definitions, 'utf8').digest('hex')
 }
+
+export const TENANCY_POLICY_DEPARSE_SEARCH_PATH = 'pg_catalog'
+export const TENANCY_POLICY_DEPARSE_QUOTE_ALL_IDENTIFIERS = 'off'
+
+/** Session-local settings are part of the canonical deparse contract and must be verified before hashing. */
+export const TENANCY_POLICY_DEPARSE_SETTINGS_QUERY = `select
+       pg_catalog.set_config('search_path', $1, true) as search_path,
+       pg_catalog.set_config('quote_all_identifiers', $2, true) as quote_all_identifiers`
+
+/** Catalog query is exported only so the restore-stability contract can be covered without a live database. */
+export const TENANCY_POLICY_CATALOG_QUERY = `select c.relname as table_name,
+       p.polname as policy_name,
+       p.polcmd::text as command,
+       p.polpermissive as permissive,
+       (cardinality(p.polroles) = 1 and 0::oid = any(p.polroles)) as public_only,
+       p.polqual is not null as has_using,
+       p.polwithcheck is not null as has_check,
+       (
+         select coalesce(pg_catalog.jsonb_agg(role_name order by role_name), '[]'::jsonb)::text
+         from (
+           select case when selected_role.role_oid = 0 then 'PUBLIC' else role.rolname end as role_name
+           from pg_catalog.unnest(p.polroles) as selected_role(role_oid)
+           left join pg_catalog.pg_roles as role on role.oid = selected_role.role_oid
+         ) as policy_roles
+       ) as roles_definition,
+       pg_catalog.pg_get_expr(p.polqual, p.polrelid, false) as using_definition,
+       pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid, false) as check_definition
+from pg_catalog.pg_policy as p
+join pg_catalog.pg_class as c on c.oid = p.polrelid
+join pg_catalog.pg_namespace as n on n.oid = c.relnamespace
+where n.nspname = $1 and c.relname = any($2::text[])`
 
 async function requireExactRegistryBackupRole(client: PoolClient): Promise<number> {
   const state = await client.query<{ readonly oid: number; readonly unsafe: boolean }>(
@@ -1416,7 +1452,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       }
       const policies = await this.readPolicies(client)
       this.requireExpectedPolicies(policies)
-      if (policyFingerprint(policies) !== selectedVersion.policy_fingerprint) {
+      if (fingerprintTenancyPolicies(policies) !== selectedVersion.policy_fingerprint) {
         throw new RegistryTenancyError('unavailable')
       }
       await client.query('commit')
@@ -1563,7 +1599,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       this.requireExpectedPolicies(policies)
       await client.query(`update ${this.schema}.tenancy_meta
         set schema_version = $1, policy_fingerprint = $2 where singleton = true`,
-      [SCHEMA_VERSION, policyFingerprint(policies)])
+      [SCHEMA_VERSION, fingerprintTenancyPolicies(policies)])
       await client.query('commit')
       begun = false
     } catch (error) {
@@ -1616,21 +1652,21 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
   }
 
   private async readPolicies(client: PoolClient): Promise<readonly TenancyPolicyRow[]> {
-    const result = await client.query<TenancyPolicyRow>(
-      `select c.relname as table_name, p.polname as policy_name, p.polcmd::text as command,
-              p.polpermissive as permissive,
-              (cardinality(p.polroles) = 1 and 0::oid = any(p.polroles)) as public_only,
-              p.polqual is not null as has_using,
-              p.polwithcheck is not null as has_check,
-              p.polroles::text as role_ids,
-              p.polqual::text as using_definition,
-              p.polwithcheck::text as check_definition
-       from pg_policy as p
-       join pg_class as c on c.oid = p.polrelid
-       join pg_namespace as n on n.oid = c.relnamespace
-       where n.nspname = $1 and c.relname = any($2::text[])`,
-      [this.schemaName, [...TENANT_SCOPED_TABLES]],
-    )
+    // Rule deparsing uses search_path to decide whether object names need qualification and
+    // quote_all_identifiers to decide whether every identifier is quoted. Fix and verify both settings so
+    // migrator and runtime roles produce the same representation on every restored cluster.
+    const settings = await client.query<{
+      readonly quote_all_identifiers: string
+      readonly search_path: string
+    }>(TENANCY_POLICY_DEPARSE_SETTINGS_QUERY,
+      [TENANCY_POLICY_DEPARSE_SEARCH_PATH, TENANCY_POLICY_DEPARSE_QUOTE_ALL_IDENTIFIERS])
+    const selectedSettings = settings.rows[0]
+    if (settings.rows.length !== 1 || selectedSettings?.search_path !== TENANCY_POLICY_DEPARSE_SEARCH_PATH
+      || selectedSettings.quote_all_identifiers !== TENANCY_POLICY_DEPARSE_QUOTE_ALL_IDENTIFIERS) {
+      throw new RegistryTenancyError('unavailable')
+    }
+    const result = await client.query<TenancyPolicyRow>(TENANCY_POLICY_CATALOG_QUERY,
+      [this.schemaName, [...TENANT_SCOPED_TABLES]])
     return result.rows
   }
 

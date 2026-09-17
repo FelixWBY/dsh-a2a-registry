@@ -135,7 +135,16 @@ try {
 }
 ```
 
-archive 保留源 ACL；`--no-owner` 让所有对象由执行恢复的 `registry_migrator` 持有。恢复后仍须在停服状态依次运行 `split-registry-runtime-role.sql` 和 `provision-registry-backup-role.sql`，重新固化并验证 app/backup exact ACL。把两个 SQLite 文件复制到事先确认不存在的新路径，绝不能覆盖旧介质：
+恢复完成后继续保持停服，用目标集群的迁移账号运行幂等离线 schema 迁移，再拆分在线权限。租户策略指纹从规范化 `pg_get_expr` 表达式、策略结构和角色名生成，并在固定的 `pg_catalog` 搜索路径下反解析，因此不包含源集群对象 OID。旧备份可能仍保存基于 `pg_node_tree` 的集群局部指纹；它必须通过这一步在目标集群重算，不能跳过迁移直接启动 `schemaMode: validate`：
+
+```powershell
+$env:DSH_REGISTRY_POSTGRES_MIGRATOR_URL = '<由秘密管理注入的目标 registry_migrator URL>'
+node --import tsx/esm deploy/registry/migrate-postgres-schemas.mjs `
+  --schema registry_saas --execute --confirm-runtime-stopped
+Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL
+```
+
+archive 保留源 ACL；`--no-owner` 让所有对象由执行恢复的 `registry_migrator` 持有。离线迁移完成后，仍须在停服状态依次运行 `split-registry-runtime-role.sql` 和 `provision-registry-backup-role.sql`，重新固化并验证 app/backup exact ACL。把两个 SQLite 文件复制到事先确认不存在的新路径，绝不能覆盖旧介质：
 
 ```powershell
 $restoreRoot = 'D:\registry-restore'
