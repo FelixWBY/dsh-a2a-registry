@@ -1,5 +1,6 @@
 import { useEffect, useId, useState } from 'react'
 import type { RegistryPageProps } from './contract.ts'
+import { authenticationReturnTo } from './navigation.ts'
 import { RegistryIcon } from './RegistryIcon.tsx'
 import css from './Registry.module.css'
 
@@ -15,7 +16,8 @@ export function AuthPage({ mode, t, readStatus }:
   const headingId = useId()
   const statusId = useId()
   const isSignIn = mode === 'signIn'
-  const returnTo = encodeURIComponent(isSignIn ? '/#/' : '/#/new-organization')
+  const returnTo = encodeURIComponent(authenticationReturnTo(window.location.search,
+    isSignIn ? '/#/' : '/#/new-organization'))
   const showUnavailable = (): void => { setStatus(t('authProviderUnavailable')) }
 
   useEffect(() => {

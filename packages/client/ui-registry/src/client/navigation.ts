@@ -16,6 +16,7 @@ export const PRIMARY_PAGES = ['overview', 'members', 'nodes', 'disclosures', 'br
 
 const OPAQUE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const INVITATION_TOKEN = /^[A-Za-z0-9_-]{43}$/u
+const AUTH_RETURN_PATH = /^\/#\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/?%-]{0,240})$/u
 
 function decodeIdentifier(value: string): string | null {
   let decoded: string
@@ -56,6 +57,31 @@ export function disclosureHref(organizationId: string, disclosureId: string): st
 
 export function questionHref(organizationId: string, disclosureId: string, requestId: string): string {
   return `${disclosureHref(organizationId, disclosureId)}/questions/${encodeURIComponent(requestId)}`
+}
+
+/** Preserve one validated protected route through OIDC without browser storage or an open redirect. */
+export function authenticationEntryHref(route: RegistryPage): string {
+  let hash = '#/'
+  if (route === 'newOrganization') hash = '#/new-organization'
+  else if (typeof route === 'object' && route.kind === 'organization') {
+    hash = typeof route.page === 'string'
+      ? organizationHref(route.organizationId, route.page)
+      : route.page.kind === 'nodeDetail'
+        ? nodeHref(route.organizationId, route.page.instanceId)
+        : route.page.kind === 'disclosureDetail'
+          ? disclosureHref(route.organizationId, route.page.disclosureId)
+          : questionHref(route.organizationId, route.page.disclosureId, route.page.requestId)
+  }
+  const returnTo = `/${hash}`
+  return `/?returnTo=${encodeURIComponent(AUTH_RETURN_PATH.test(returnTo) ? returnTo : '/#/')}#/sign-in`
+}
+
+/** Read only the signed-OIDC-compatible continuation parameter used by the account entry page. */
+export function authenticationReturnTo(search: string, fallback: string): string {
+  const params = new URLSearchParams(search)
+  if ([...params.keys()].some(key => key !== 'returnTo')) return fallback
+  const values = params.getAll('returnTo')
+  return values.length === 1 && AUTH_RETURN_PATH.test(values[0]!) ? values[0]! : fallback
 }
 
 /** Decode an untrusted browser fragment into a public or explicitly organization-scoped route. */

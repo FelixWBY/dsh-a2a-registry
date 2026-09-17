@@ -2,7 +2,8 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import clsx from 'clsx'
 import { Button, IconCloseOutline16, IconGlobeOutline14, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { RegistryRootProps } from './contract.ts'
-import { organizationHref, PRIMARY_PAGES, registryOrganizationId, registryPageKey } from './navigation.ts'
+import { authenticationEntryHref, organizationHref, PRIMARY_PAGES, registryOrganizationId,
+  registryPageKey } from './navigation.ts'
 import { RegistryApiError, type RegistryAccountContext, type RegistryOrganizationSummary } from './registry-api.ts'
 import { OrganizationSwitcher } from './OrganizationSwitcher.tsx'
 import { RegistryIcon } from './RegistryIcon.tsx'
@@ -62,7 +63,7 @@ export function RegistryRoot(props: RegistryRootProps) {
   useEffect(() => {
     if (accountState.kind === 'unauthenticated') {
       if (page !== 'signIn' && page !== 'signUp' && !(typeof page === 'object' && page.kind === 'join')) {
-        replaceHash('#/sign-in')
+        window.location.replace(authenticationEntryHref(page))
       }
       return
     }
