@@ -9,13 +9,17 @@ import { backup, DatabaseSync } from 'node:sqlite'
 import { Pool } from 'pg'
 
 const FORMAT = 'dsh-registry-postgres-saas-backup-set'
-const VERSION = 1
+const VERSION = 2
 const MANIFEST = 'manifest.json'
 const ARCHIVE = 'registry.pgdump'
 const MAX_MANIFEST_BYTES = 64 * 1024
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 const COMMAND_TIMEOUT_MS = 30 * 60 * 1000
 const VERSION_TIMEOUT_MS = 30 * 1000
+const BILLING_DIGEST_FORMAT = 'dsh-registry-billing-digest'
+const BILLING_DIGEST_VERSION = 1
+const BILLING_PAGE_SIZE = 256
+const MAX_BILLING_CANONICAL_BYTES = 64 * 1024
 const SCHEMA_NAME = /^[a-z][a-z0-9_]*$/u
 const SHA256 = /^[0-9a-f]{64}$/u
 const REGISTRY_APPLICATIONS = ['dsh-a2a-registry', 'dsh-a2a-registry-tenancy']
@@ -24,6 +28,21 @@ const REGISTRY_TABLES = Object.freeze([
   'tenancy_meta', 'accounts', 'account_identities', 'organizations', 'organization_memberships',
   'organization_creations', 'organization_invitations', 'billing_orders', 'billing_provider_events',
 ])
+const BILLING_TABLES = Object.freeze({
+  billing_orders: Object.freeze([
+    ['order_id', 'uuid'], ['organization_id', 'text'], ['idempotency_key', 'text'],
+    ['request_hash', 'text'], ['provider', 'text'], ['plan_id', 'text'], ['currency', 'text'],
+    ['unit_amount', 'bigint'], ['interval', 'text'], ['state', 'text'], ['provider_checkout_id', 'text'],
+    ['checkout_expires_at', 'timestamptz'], ['paid_at', 'timestamptz'], ['refunded_at', 'timestamptz'],
+    ['disputed_at', 'timestamptz'], ['last_event_at', 'timestamptz'], ['created_at', 'timestamptz'],
+    ['updated_at', 'timestamptz'],
+  ].map(column => Object.freeze(column))),
+  billing_provider_events: Object.freeze([
+    ['provider', 'text'], ['event_id', 'text'], ['organization_id', 'text'], ['order_id', 'uuid'],
+    ['event_type', 'text'], ['payload_hash', 'text'], ['occurred_at', 'timestamptz'],
+    ['received_at', 'timestamptz'],
+  ].map(column => Object.freeze(column))),
+})
 const SQLITE_DATABASES = Object.freeze([
   { role: 'admission', environment: 'DSH_REGISTRY_ADMISSION_SQLITE_PATH', file: 'admission.sqlite' },
   { role: 'alertOutbox', environment: 'DSH_REGISTRY_ALERT_OUTBOX_SQLITE_PATH', file: 'alert-outbox.sqlite' },
@@ -336,6 +355,104 @@ async function lockSchemaTables(database, schema) {
   }
 }
 
+function canonicalTimestamp(column) {
+  return `case when ${column} is null then null else
+    to_char(${column} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') end`
+}
+
+const BILLING_TYPE_MARKERS = Object.freeze({ text: 1, uuid: 2, bigint: 3, timestamptz: 4 })
+
+function uint64(value, label) {
+  if (typeof value !== 'bigint' || value < 0n || value > 0xffff_ffff_ffff_ffffn) fail(`${label} is invalid`)
+  const encoded = Buffer.allocUnsafe(8)
+  encoded.writeBigUInt64BE(value)
+  return encoded
+}
+
+async function digestBillingTable(table, columns, readPage) {
+  const hash = createHash('sha256')
+  hash.update(`${BILLING_DIGEST_FORMAT}\0${String(BILLING_DIGEST_VERSION)}\0${table}\0`, 'utf8')
+  for (const [column, type] of columns) hash.update(`${column}\0${type}\0`, 'utf8')
+  let cursor
+  let rowCount = 0n
+  while (true) {
+    const page = await readPage(cursor)
+    if (!Array.isArray(page) || page.length > BILLING_PAGE_SIZE) fail(`${table} digest page is invalid`)
+    for (const row of page) {
+      hash.update(Buffer.from([0x52]))
+      for (const [column, type] of columns) {
+        const marker = BILLING_TYPE_MARKERS[type]
+        if (marker === undefined) fail(`${table} digest column type is invalid`)
+        const value = row?.[column]
+        hash.update(Buffer.from([marker, value === null ? 0 : 1]))
+        if (value === null) continue
+        if (typeof value !== 'string') fail(`${table} digest row is invalid`)
+        const bytes = Buffer.from(value, 'utf8')
+        if (bytes.length > MAX_BILLING_CANONICAL_BYTES) {
+          fail(`${table} contains a row field that cannot be safely summarized`)
+        }
+        hash.update(uint64(BigInt(bytes.length), `${table} field length`))
+        hash.update(bytes)
+      }
+      rowCount += 1n
+      if (rowCount > 0xffff_ffff_ffff_ffffn) fail(`${table} row count exceeds the safety limit`)
+    }
+    if (page.length < BILLING_PAGE_SIZE) break
+    const next = page.at(-1)?.cursor
+    if (!Array.isArray(next) || next.length === 0 || next.some(value => typeof value !== 'string')
+      || JSON.stringify(next) === JSON.stringify(cursor)) fail(`${table} digest cursor is invalid`)
+    cursor = next
+  }
+  hash.update(Buffer.from([0x45]))
+  hash.update(uint64(rowCount, `${table} row count`))
+  return Object.freeze({ columns: Object.freeze(columns.map(([column, type]) => `${column}:${type}`)),
+    rowCount: rowCount.toString(10), sha256: hash.digest('hex') })
+}
+
+export async function readBillingState(database, schema) {
+  if (typeof schema !== 'string' || !SCHEMA_NAME.test(schema)) fail('schema name is invalid')
+  const qualified = `"${schema}"`
+  const orderColumns = BILLING_TABLES.billing_orders
+  const eventColumns = BILLING_TABLES.billing_provider_events
+  const orders = await digestBillingTable('billing_orders', orderColumns, async cursor => {
+    const result = await database.query(
+      `select order_id::text as order_id, organization_id, idempotency_key, request_hash, provider, plan_id,
+         currency, unit_amount::text as unit_amount, interval, state, provider_checkout_id,
+         ${canonicalTimestamp('checkout_expires_at')} as checkout_expires_at,
+         ${canonicalTimestamp('paid_at')} as paid_at,
+         ${canonicalTimestamp('refunded_at')} as refunded_at,
+         ${canonicalTimestamp('disputed_at')} as disputed_at,
+         ${canonicalTimestamp('last_event_at')} as last_event_at,
+         ${canonicalTimestamp('created_at')} as created_at,
+         ${canonicalTimestamp('updated_at')} as updated_at
+       from ${qualified}.billing_orders
+       where $1::uuid is null or order_id > $1::uuid
+       order by order_id
+       limit $2`, [cursor?.[0] ?? null, BILLING_PAGE_SIZE])
+    return result.rows.map(row => ({ ...row, cursor: [row.order_id] }))
+  })
+  const events = await digestBillingTable('billing_provider_events', eventColumns, async cursor => {
+    const result = await database.query(
+      `select provider, event_id, organization_id, order_id::text as order_id, event_type, payload_hash,
+         ${canonicalTimestamp('occurred_at')} as occurred_at,
+         ${canonicalTimestamp('received_at')} as received_at
+       from ${qualified}.billing_provider_events
+       where $1::text is null
+         or provider collate "C" > ($1::text collate "C")
+         or (provider collate "C" = ($1::text collate "C")
+           and event_id collate "C" > ($2::text collate "C"))
+       order by provider collate "C", event_id collate "C"
+       limit $3`,
+      [cursor?.[0] ?? null, cursor?.[1] ?? null, BILLING_PAGE_SIZE])
+    return result.rows.map(row => ({ ...row, cursor: [row.provider, row.event_id] }))
+  })
+  return Object.freeze({
+    format: BILLING_DIGEST_FORMAT,
+    version: BILLING_DIGEST_VERSION,
+    tables: Object.freeze({ billing_orders: orders, billing_provider_events: events }),
+  })
+}
+
 async function postgresState(database, schema) {
   const role = await database.query(
     `select current_user as current_user,
@@ -629,7 +746,7 @@ function archiveRecord(path) {
   return info
 }
 
-function manifestDocument(schema, tools, files) {
+function manifestDocument(schema, tools, files, billing) {
   return Object.freeze({
     format: FORMAT,
     version: VERSION,
@@ -638,7 +755,34 @@ function manifestDocument(schema, tools, files) {
     quiescence: 'operator-asserted-runtime-stopped-and-sources-stable',
     tools: Object.freeze({ node: process.version, pgDump: tools.pgDump, pgRestore: tools.pgRestore }),
     files: Object.freeze(files),
+    billing,
   })
+}
+
+function requireBillingArchiveToc(value, schema) {
+  if (typeof value !== 'string') fail('pg_restore table of contents is invalid')
+  const found = new Map(Object.keys(BILLING_TABLES).flatMap(table => [
+    [`TABLE\0${table}`, []], [`TABLE DATA\0${table}`, []],
+  ]))
+  const dumpIds = new Set()
+  for (const line of value.split(/\r?\n/u)) {
+    const match = /^(\d+);\s+(\d+)\s+(\d+)\s+(TABLE DATA|TABLE)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/u.exec(line)
+    if (match === null || !Object.hasOwn(BILLING_TABLES, match[6])) continue
+    const [, dumpId, catalogOid, objectOid, descriptor, entrySchema, table, owner] = match
+    if (entrySchema !== schema || owner !== 'registry_migrator'
+      || (descriptor === 'TABLE' ? catalogOid !== '1259' : catalogOid !== '0')
+      || !/^[1-9][0-9]*$/u.test(dumpId) || !/^[1-9][0-9]*$/u.test(objectOid)
+      || dumpIds.has(dumpId)) {
+      fail('PostgreSQL archive contains an invalid billing table entry')
+    }
+    dumpIds.add(dumpId)
+    found.get(`${descriptor}\0${table}`).push(objectOid)
+  }
+  if ([...found.values()].some(entries => entries.length !== 1)
+    || Object.keys(BILLING_TABLES).some(table =>
+      found.get(`TABLE\0${table}`)[0] !== found.get(`TABLE DATA\0${table}`)[0])) {
+    fail('PostgreSQL archive must contain exactly one TABLE and TABLE DATA entry for each billing table')
+  }
 }
 
 export async function createBackupSet({ schema, destination, quiesced, environment = process.env,
@@ -669,6 +813,7 @@ export async function createBackupSet({ schema, destination, quiesced, environme
   let database
   let backupDatabase
   let transaction = false
+  let backupTransaction = false
   let primaryError
   try {
     const tools = {
@@ -687,7 +832,12 @@ export async function createBackupSet({ schema, destination, quiesced, environme
     await acquireBackupLock(database, schema)
     await lockSchemaTables(database, schema)
     await postgresState(database, schema)
+    await backupDatabase.query('begin isolation level repeatable read read only')
+    backupTransaction = true
     const beforeBackup = await backupRoleState(backupDatabase, schema)
+    const billing = await readBillingState(backupDatabase, schema)
+    await backupDatabase.query('commit')
+    backupTransaction = false
     const beforeSqlite = new Map(await Promise.all(sources.map(async source =>
       [source.role, await sourceObservation(source.path)])))
     const archivePath = join(partial, ARCHIVE)
@@ -706,9 +856,10 @@ export async function createBackupSet({ schema, destination, quiesced, environme
     for (const source of sources) {
       files[source.role] = await backupSqlite(source.path, join(partial, source.file))
     }
-    await runCommand(pgRestore, ['--list', archivePath], {
+    const archiveToc = await runCommand(pgRestore, ['--list', archivePath], {
       environment: cleanEnvironment(environment), timeoutMs: COMMAND_TIMEOUT_MS, label: 'pg_restore --list',
     })
+    requireBillingArchiveToc(archiveToc.stdout, schema)
     await postgresState(database, schema)
     const afterBackup = await backupRoleState(backupDatabase, schema)
     if (beforeBackup.sequenceState !== afterBackup.sequenceState) {
@@ -719,7 +870,7 @@ export async function createBackupSet({ schema, destination, quiesced, environme
         fail(`${source.role} changed during the asserted quiescent backup`)
       }
     }
-    const manifest = manifestDocument(schema, tools, files)
+    const manifest = manifestDocument(schema, tools, files, billing)
     const document = `${JSON.stringify(manifest, undefined, 2)}\n`
     if (Buffer.byteLength(document, 'utf8') > MAX_MANIFEST_BYTES) fail('manifest exceeds the size limit')
     const manifestPath = join(partial, MANIFEST)
@@ -740,6 +891,10 @@ export async function createBackupSet({ schema, destination, quiesced, environme
       manifest: join(selectedDestination, MANIFEST), schema, files: Object.keys(files) })
   } catch (error) {
     primaryError = error
+    if (backupTransaction) {
+      try { await backupDatabase?.query('rollback') } catch { /* Preserve the primary backup failure. */ }
+      backupTransaction = false
+    }
     if (transaction) {
       try { await database?.query('rollback') } catch { /* Preserve the primary backup failure. */ }
       transaction = false
@@ -766,13 +921,37 @@ function validToolVersion(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\r\n]/u.test(value)
 }
 
+function readBillingManifest(value) {
+  exactObject(value, ['format', 'version', 'tables'], 'billing digest')
+  if (value.format !== BILLING_DIGEST_FORMAT || value.version !== BILLING_DIGEST_VERSION) {
+    fail('billing digest header is invalid')
+  }
+  exactObject(value.tables, Object.keys(BILLING_TABLES), 'billing digest tables')
+  const tables = {}
+  for (const [table, columns] of Object.entries(BILLING_TABLES)) {
+    const record = exactObject(value.tables[table], ['columns', 'rowCount', 'sha256'], `${table} digest`)
+    const expectedColumns = columns.map(([column, type]) => `${column}:${type}`)
+    if (!Array.isArray(record.columns) || record.columns.length !== expectedColumns.length
+      || record.columns.some((column, index) => column !== expectedColumns[index])
+      || typeof record.rowCount !== 'string' || !/^(?:0|[1-9][0-9]*)$/u.test(record.rowCount)
+      || BigInt(record.rowCount) > 0xffff_ffff_ffff_ffffn
+      || typeof record.sha256 !== 'string' || !SHA256.test(record.sha256)) {
+      fail(`${table} digest is invalid`)
+    }
+    tables[table] = Object.freeze({ columns: Object.freeze([...record.columns]),
+      rowCount: record.rowCount, sha256: record.sha256 })
+  }
+  return Object.freeze({ format: value.format, version: value.version, tables: Object.freeze(tables) })
+}
+
 function readManifest(directory) {
   const manifestPath = join(directory, MANIFEST)
   if (!existsSync(manifestPath) || !lstatSync(manifestPath).isFile()
     || statSync(manifestPath).size > MAX_MANIFEST_BYTES) fail('manifest is missing or invalid')
   let manifest
   try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) } catch { fail('manifest is invalid') }
-  exactObject(manifest, ['format', 'version', 'createdAt', 'schema', 'quiescence', 'tools', 'files'], 'manifest')
+  exactObject(manifest,
+    ['format', 'version', 'createdAt', 'schema', 'quiescence', 'tools', 'files', 'billing'], 'manifest')
   if (manifest.format !== FORMAT || manifest.version !== VERSION || Number.isNaN(Date.parse(manifest.createdAt))
     || !SCHEMA_NAME.test(manifest.schema)
     || manifest.quiescence !== 'operator-asserted-runtime-stopped-and-sources-stable') {
@@ -782,6 +961,7 @@ function readManifest(directory) {
   if (!validToolVersion(manifest.tools.node) || !validToolVersion(manifest.tools.pgDump)
     || !validToolVersion(manifest.tools.pgRestore)) fail('tool versions are invalid')
   exactObject(manifest.files, ['postgres', ...SQLITE_DATABASES.map(database => database.role)], 'file map')
+  manifest.billing = readBillingManifest(manifest.billing)
   return manifest
 }
 
@@ -841,13 +1021,89 @@ export async function verifyBackupSet({ directory, environment = process.env, ru
   }
   const pgRestore = toolPath(environment, 'DSH_REGISTRY_PG_RESTORE_PATH', 'pg_restore')
   const pgRestoreVersion = await toolVersion(pgRestore, 'pg_restore --version', environment, runCommand)
-  await runCommand(pgRestore, ['--list', postgres.path], {
+  const archiveToc = await runCommand(pgRestore, ['--list', postgres.path], {
     environment: cleanEnvironment(environment), timeoutMs: COMMAND_TIMEOUT_MS, label: 'pg_restore --list',
   })
+  requireBillingArchiveToc(archiveToc.stdout, manifest.schema)
   return Object.freeze({ verified: true, directory: selectedDirectory, createdAt: manifest.createdAt,
-    schema: manifest.schema, pgRestoreVersion, files: Object.freeze({
+    schema: manifest.schema, pgRestoreVersion, billing: manifest.billing, files: Object.freeze({
       postgres: Object.freeze({ sizeBytes: archiveInfo.size }), ...sqlite,
     }) })
+}
+
+function requireMatchingBillingState(expected, actual) {
+  for (const table of Object.keys(BILLING_TABLES)) {
+    const expectedTable = expected.tables[table]
+    const actualTable = actual.tables[table]
+    if (actualTable.rowCount !== expectedTable.rowCount || actualTable.sha256 !== expectedTable.sha256) {
+      fail(`restored ${table} content differs from the backup manifest`)
+    }
+  }
+}
+
+export async function verifyRestoredBilling({ directory, environment = process.env,
+  openPostgres = defaultOpenPostgres, runCommand = runBoundedCommand }) {
+  const offline = await verifyBackupSet({ directory, environment, runCommand })
+  const migratorConnection = postgresConnection(environment,
+    'DSH_REGISTRY_POSTGRES_MIGRATOR_URL', 'registry_migrator')
+  const backupConnection = postgresConnection(environment,
+    'DSH_REGISTRY_POSTGRES_BACKUP_URL', 'registry_backup')
+  if (!samePostgresTarget(migratorConnection, backupConnection)) {
+    fail('migrator and backup URLs must select the same PostgreSQL server and database')
+  }
+  let database
+  let backupDatabase
+  let transaction = false
+  let backupTransaction = false
+  let primaryError
+  try {
+    database = await openPostgres(migratorConnection.raw,
+      'dsh-registry-postgres-saas-restored-billing-guard')
+    backupDatabase = await openPostgres(backupConnection.raw,
+      'dsh-registry-postgres-saas-restored-billing-reader')
+    await postgresState(database, offline.schema)
+    await backupRoleState(backupDatabase, offline.schema)
+    await database.query('begin')
+    transaction = true
+    await database.query("set local lock_timeout = '10s'")
+    await acquireBackupLock(database, offline.schema)
+    await lockSchemaTables(database, offline.schema)
+    await postgresState(database, offline.schema)
+    await backupDatabase.query('begin isolation level repeatable read read only')
+    backupTransaction = true
+    await backupRoleState(backupDatabase, offline.schema)
+    const actual = await readBillingState(backupDatabase, offline.schema)
+    requireMatchingBillingState(offline.billing, actual)
+    await backupDatabase.query('commit')
+    backupTransaction = false
+    await database.query('commit')
+    transaction = false
+    return Object.freeze({ verified: true, directory: offline.directory, schema: offline.schema, billing: actual })
+  } catch (error) {
+    primaryError = error
+    if (backupTransaction) {
+      try { await backupDatabase?.query('rollback') } catch { /* Preserve the primary verification failure. */ }
+      backupTransaction = false
+    }
+    if (transaction) {
+      try { await database?.query('rollback') } catch { /* Preserve the primary verification failure. */ }
+      transaction = false
+    }
+    throw error
+  } finally {
+    let closeError
+    if (database !== undefined) {
+      try { await database.close() } catch (error) {
+        if (primaryError === undefined) closeError = error
+      }
+    }
+    if (backupDatabase !== undefined) {
+      try { await backupDatabase.close() } catch (error) {
+        if (primaryError === undefined && closeError === undefined) closeError = error
+      }
+    }
+    if (closeError !== undefined) throw closeError
+  }
 }
 
 export function parseCreate(arguments_) {
@@ -886,8 +1142,13 @@ export async function main(arguments_ = process.argv.slice(2), environment = pro
     if (directory === undefined || extra.length !== 0) fail('usage: verify <absolute-backup-directory>')
     const result = await verifyBackupSet({ directory, environment })
     process.stdout.write(`${JSON.stringify(result)}\n`)
+  } else if (command === 'verify-restored') {
+    const [directory, ...extra] = rest
+    if (directory === undefined || extra.length !== 0) fail('usage: verify-restored <absolute-backup-directory>')
+    const result = await verifyRestoredBilling({ directory, environment })
+    process.stdout.write(`${JSON.stringify(result)}\n`)
   } else {
-    fail('usage: create --schema <schema> --quiesced <absolute-new-directory> | verify <absolute-backup-directory>')
+    fail('usage: create --schema <schema> --quiesced <absolute-new-directory> | verify <absolute-backup-directory> | verify-restored <absolute-backup-directory>')
   }
 }
 

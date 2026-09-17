@@ -5,8 +5,52 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { createBackupSet, parseCreate, safeMessage,
-  verifyBackupSet } from '../deploy/registry/backup-postgres-saas-state.mjs'
+import { createBackupSet, parseCreate, readBillingState, safeMessage,
+  verifyBackupSet, verifyRestoredBilling } from '../deploy/registry/backup-postgres-saas-state.mjs'
+
+const BILLING_ROWS = Object.freeze({
+  billing_orders: Object.freeze([Object.freeze({
+    order_id: '00000000-0000-4000-8000-000000000001',
+    organization_id: 'org-fixture',
+    idempotency_key: 'idempotency-fixture',
+    request_hash: 'a'.repeat(64),
+    provider: 'fixture-provider',
+    plan_id: 'fixture-plan',
+    currency: 'CNY',
+    unit_amount: '1200',
+    interval: 'month',
+    state: 'paid',
+    provider_checkout_id: null,
+    checkout_expires_at: null,
+    paid_at: '2026-09-18T02:03:04.123456Z',
+    refunded_at: null,
+    disputed_at: null,
+    last_event_at: '2026-09-18T02:03:04.123456Z',
+    created_at: '2026-09-18T01:00:00.000001Z',
+    updated_at: '2026-09-18T02:03:04.123456Z',
+  })]),
+  billing_provider_events: Object.freeze([Object.freeze({
+    provider: 'fixture-provider',
+    event_id: 'event-fixture',
+    organization_id: 'org-fixture',
+    order_id: '00000000-0000-4000-8000-000000000001',
+    event_type: 'paid',
+    payload_hash: 'b'.repeat(64),
+    occurred_at: null,
+    received_at: '2026-09-18T02:03:05.654321Z',
+  })]),
+})
+
+function billingToc(schema = 'registry_saas', owner = 'registry_migrator') {
+  return [
+    '; Archive created by pg_dump',
+    `100; 1259 51001 TABLE ${schema} billing_orders ${owner}`,
+    `101; 0 51001 TABLE DATA ${schema} billing_orders ${owner}`,
+    `102; 1259 51002 TABLE ${schema} billing_provider_events ${owner}`,
+    `103; 0 51002 TABLE DATA ${schema} billing_provider_events ${owner}`,
+    '',
+  ].join('\n')
+}
 
 function sqlite(path, version, value) {
   const database = new DatabaseSync(path)
@@ -48,9 +92,13 @@ function migratorPostgres() {
   })
 }
 
-function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () => {} } = {}) {
+function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () => {},
+  inspectQuery = () => {}, billing = BILLING_ROWS } = {}) {
   return Object.freeze({
-    async query(statement) {
+    async query(statement, values = []) {
+      inspectQuery(statement)
+      if (statement === 'begin isolation level repeatable read read only'
+        || statement === 'commit' || statement === 'rollback') return { rows: [] }
       if (statement.includes('from pg_roles as selected_role')) return { rows: [{
         current_user: 'registry_backup', can_login: true, inherits: false, connection_limit: 2,
         superuser: false, bypass_rls: true,
@@ -78,6 +126,16 @@ function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () 
           invalid_direct: 0, writable: 0 }] }
       }
       if (statement.includes('from pg_sequences')) return { rows: [] }
+      if (statement.includes('.billing_orders')) {
+        const [cursor, limit] = values
+        return { rows: billing.billing_orders.filter(row => cursor === null || row.order_id > cursor)
+          .slice(0, limit) }
+      }
+      if (statement.includes('.billing_provider_events')) {
+        const [provider, eventId, limit] = values
+        return { rows: billing.billing_provider_events.filter(row => provider === null
+          || row.provider > provider || (row.provider === provider && row.event_id > eventId)).slice(0, limit) }
+      }
       throw new Error('unexpected registry_backup fixture query')
     },
     async close() {},
@@ -103,6 +161,51 @@ test('backup CLI preserves the explicit quiesced assertion', () => {
     destination: '/secure/registry-backup',
     quiesced: true,
   })
+})
+
+test('billing digests are canonical, bounded-query, and sensitive to nulls and microseconds', async () => {
+  const queries = []
+  const baseline = await readBillingState(backupPostgres({ inspectQuery: query => queries.push(query) }),
+    'registry_saas')
+  const repeated = await readBillingState(backupPostgres(), 'registry_saas')
+  assert.deepEqual(repeated, baseline)
+  assert.equal(baseline.tables.billing_orders.rowCount, '1')
+  assert.equal(baseline.tables.billing_provider_events.rowCount, '1')
+  assert.match(baseline.tables.billing_orders.sha256, /^[0-9a-f]{64}$/u)
+  assert.match(queries.find(query => query.includes('.billing_orders')), /limit \$2/u)
+  assert.match(queries.find(query => query.includes('.billing_orders')), /HH24:MI:SS\.US/u)
+  assert.match(queries.find(query => query.includes('.billing_provider_events')), /collate "C"/u)
+
+  const empty = await readBillingState(backupPostgres({ billing: {
+    billing_orders: [], billing_provider_events: [],
+  } }), 'registry_saas')
+  assert.equal(empty.tables.billing_orders.rowCount, '0')
+  assert.equal(empty.tables.billing_provider_events.rowCount, '0')
+  assert.notEqual(empty.tables.billing_orders.sha256, baseline.tables.billing_orders.sha256)
+
+  const nullChanged = { ...BILLING_ROWS, billing_orders: [
+    { ...BILLING_ROWS.billing_orders[0], paid_at: null },
+  ] }
+  const nullDigest = await readBillingState(backupPostgres({ billing: nullChanged }), 'registry_saas')
+  assert.notEqual(nullDigest.tables.billing_orders.sha256, baseline.tables.billing_orders.sha256)
+
+  const microsecondChanged = { ...BILLING_ROWS, billing_provider_events: [
+    { ...BILLING_ROWS.billing_provider_events[0], received_at: '2026-09-18T02:03:05.654322Z' },
+  ] }
+  const microsecondDigest = await readBillingState(
+    backupPostgres({ billing: microsecondChanged }), 'registry_saas')
+  assert.notEqual(microsecondDigest.tables.billing_provider_events.sha256,
+    baseline.tables.billing_provider_events.sha256)
+
+  const pagedBilling = { ...BILLING_ROWS, billing_orders: Array.from({ length: 257 }, (_, index) => ({
+    ...BILLING_ROWS.billing_orders[0],
+    order_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+  })) }
+  let orderPages = 0
+  const paged = await readBillingState(backupPostgres({ billing: pagedBilling,
+    inspectQuery: query => { if (query.includes('.billing_orders')) orderPages += 1 } }), 'registry_saas')
+  assert.equal(paged.tables.billing_orders.rowCount, '257')
+  assert.equal(orderPages, 2)
 })
 
 test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable, and tamper evident', async () => {
@@ -141,7 +244,7 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
       }
       if (arguments_[0] === '--list') {
         assert.match(readFileSync(arguments_[1], 'utf8'), /^PGDMP/u)
-        return { stdout: '; Archive created by pg_dump\n', stderr: '' }
+        return { stdout: billingToc(), stderr: '' }
       }
       throw new Error('unexpected PostgreSQL tool fixture invocation')
     }
@@ -162,6 +265,7 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
     assert.match(defaultAclQuery, /defaults\.defaclnamespace <> 0/u)
     assert.match(defaultAclQuery, /count\(\*\)::integer as total_items/u)
     const openedConnections = []
+    const backupQueries = []
     const created = await createBackupSet({
       schema: 'registry_saas',
       destination,
@@ -169,7 +273,8 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
       environment,
       openPostgres: async (value, applicationName) => {
         openedConnections.push({ value, applicationName })
-        return value === backupConnectionString ? backupPostgres() : migratorPostgres()
+        return value === backupConnectionString
+          ? backupPostgres({ inspectQuery: query => backupQueries.push(query) }) : migratorPostgres()
       },
       runCommand,
     })
@@ -182,13 +287,24 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
     assert.equal(dump.arguments_.includes('--no-acl'), false)
     assert.equal(dump.environment.PGPASSWORD, backupPassword)
     assert.deepEqual(created.files.sort(), ['admission', 'alertOutbox', 'postgres'])
+    const snapshotStart = backupQueries.indexOf('begin isolation level repeatable read read only')
+    const billingRead = backupQueries.findIndex(query => query.includes('.billing_orders'))
+    assert.notEqual(snapshotStart, -1)
+    assert.ok(billingRead > snapshotStart)
+    assert.ok(backupQueries.indexOf('commit') > billingRead)
+    assert.equal(backupQueries.includes('rollback'), false)
     const manifestText = readFileSync(join(destination, 'manifest.json'), 'utf8')
     const manifest = JSON.parse(manifestText)
     assert.deepEqual(Object.keys(manifest).sort(),
-      ['createdAt', 'files', 'format', 'quiescence', 'schema', 'tools', 'version'])
+      ['billing', 'createdAt', 'files', 'format', 'quiescence', 'schema', 'tools', 'version'])
     assert.deepEqual(Object.keys(manifest.files).sort(), ['admission', 'alertOutbox', 'postgres'])
     assert.equal(manifest.schema, 'registry_saas')
-    assert.equal(manifest.version, 1)
+    assert.equal(manifest.version, 2)
+    assert.equal(manifest.billing.tables.billing_orders.rowCount, '1')
+    assert.equal(manifest.billing.tables.billing_provider_events.rowCount, '1')
+    assert.match(manifest.billing.tables.billing_orders.sha256, /^[0-9a-f]{64}$/u)
+    assert.equal(manifestText.includes('org-fixture'), false)
+    assert.equal(manifestText.includes('idempotency-fixture'), false)
     assert.equal(manifestText.includes(password), false)
     assert.equal(manifestText.includes(backupPassword), false)
     assert.equal(manifestText.includes(connectionString), false)
@@ -208,11 +324,64 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
     const verified = await verifyBackupSet({ directory: destination, environment, runCommand })
     assert.equal(verified.verified, true)
     assert.equal(verified.schema, 'registry_saas')
+    assert.equal(verified.billing.tables.billing_orders.rowCount, '1')
     for (const invocation of invocations.slice(restoreStart)) {
       assert.equal('PGPASSWORD' in invocation.environment, false)
       assert.equal('DSH_REGISTRY_POSTGRES_MIGRATOR_URL' in invocation.environment, false)
       assert.equal('DSH_REGISTRY_POSTGRES_BACKUP_URL' in invocation.environment, false)
     }
+
+    for (const invalidToc of [
+      '; TABLE registry_saas billing_orders registry_migrator\n'
+        + '200; 1259 60001 TABLE registry_saas billing_orders_shadow registry_migrator\n',
+      billingToc('wrong_schema'),
+      billingToc('registry_saas', 'wrong_owner'),
+      `${billingToc()}104; 1259 51001 TABLE registry_saas billing_orders registry_migrator\n`,
+      billingToc().replace('101; 0 51001 TABLE DATA', '101; 0 51999 TABLE DATA'),
+    ]) {
+      await assert.rejects(verifyBackupSet({
+        directory: destination,
+        environment,
+        runCommand: async (command, arguments_, options) => {
+          const result = await runCommand(command, arguments_, options)
+          return arguments_[0] === '--list' ? { ...result, stdout: invalidToc } : result
+        },
+      }), /PostgreSQL archive/u)
+    }
+
+    const restored = await verifyRestoredBilling({
+      directory: destination,
+      environment,
+      openPostgres: async value => value === backupConnectionString
+        ? backupPostgres() : migratorPostgres(),
+      runCommand,
+    })
+    assert.equal(restored.verified, true)
+    assert.equal(restored.billing.tables.billing_orders.rowCount, '1')
+    const changedTarget = { ...BILLING_ROWS, billing_provider_events: [
+      { ...BILLING_ROWS.billing_provider_events[0], received_at: '2026-09-18T02:03:05.654322Z' },
+    ] }
+    await assert.rejects(verifyRestoredBilling({
+      directory: destination,
+      environment,
+      openPostgres: async value => value === backupConnectionString
+        ? backupPostgres({ billing: changedTarget }) : migratorPostgres(),
+      runCommand,
+    }), /restored billing_provider_events content differs/u)
+    assert.equal(JSON.stringify(restored).includes('org-fixture'), false)
+    assert.equal(JSON.stringify(restored).includes(connectionString), false)
+
+    writeFileSync(join(destination, 'manifest.json'), `${JSON.stringify({
+      ...manifest,
+      billing: { ...manifest.billing, tables: {
+        ...manifest.billing.tables,
+        billing_orders: { ...manifest.billing.tables.billing_orders, unexpected: true },
+      } },
+    }, undefined, 2)}\n`)
+    await assert.rejects(verifyBackupSet({ directory: destination, environment, runCommand }),
+      /billing_orders digest is invalid/u)
+    writeFileSync(join(destination, 'manifest.json'), manifestText)
+
     const redacted = safeMessage(
       new Error(`failed ${connectionString} ${password} ${backupConnectionString} ${backupPassword}`),
       [connectionString, password, backupConnectionString, backupPassword])

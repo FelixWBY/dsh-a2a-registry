@@ -73,7 +73,7 @@ Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 H
 
 ## 备份与恢复
 
-`registry/backup-registry-state.mjs` 和 `registry/backup-sqlite.mjs` 只覆盖纯 SQLite 部署。PostgreSQL SaaS 使用 `registry/backup-postgres-saas-state.mjs`：它把一个 PostgreSQL custom archive、admission SQLite、alert-outbox SQLite 和 exact v1 manifest 发布为一个不可拆分的停服备份集合。
+`registry/backup-registry-state.mjs` 和 `registry/backup-sqlite.mjs` 只覆盖纯 SQLite 部署。PostgreSQL SaaS 使用 `registry/backup-postgres-saas-state.mjs`：它把一个 PostgreSQL custom archive、admission SQLite、alert-outbox SQLite 和 exact v2 manifest 发布为一个不可拆分的停服备份集合。v2 manifest 还保存两张 schema v3 计费表的固定列签名、稳定行数和规范 SHA-256 摘要，不保存订单、事件或支付正文。
 
 ### PostgreSQL SaaS 停服备份
 
@@ -109,13 +109,13 @@ node deploy/registry/backup-postgres-saas-state.mjs create --schema registry_saa
 Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL,Env:\DSH_REGISTRY_POSTGRES_BACKUP_URL
 ```
 
-迁移账号持有同一事务内的 schema advisory lock 和所有目标表 `SHARE` 锁，备份账号执行 `pg_dump`；两个 SQLite 文件使用 SQLite backup API。工具还比较 SQLite 主文件和非空 WAL 的前后文件状态与摘要，以及 PostgreSQL 序列状态。任一步失败、发现活跃 Registry 连接或检测到源变化时只删除临时目录，不发布目标目录。可用 `DSH_REGISTRY_PG_DUMP_PATH`／`DSH_REGISTRY_PG_RESTORE_PATH` 指定名称严格匹配的绝对工具路径；否则从 `PATH` 查找。离线验证不需要数据库凭据：
+迁移账号持有同一事务内的 schema advisory lock 和所有目标表 `SHARE` 锁，备份账号执行 `pg_dump`；计费摘要由同一受限备份账号在 `REPEATABLE READ READ ONLY` 快照中按主键分页计算，两个 SQLite 文件使用 SQLite backup API。工具还比较 SQLite 主文件和非空 WAL 的前后文件状态与摘要，以及 PostgreSQL 序列状态。任一步失败、发现活跃 Registry 连接或检测到源变化时只删除临时目录，不发布目标目录。可用 `DSH_REGISTRY_PG_DUMP_PATH`／`DSH_REGISTRY_PG_RESTORE_PATH` 指定名称严格匹配的绝对工具路径；否则从 `PATH` 查找。离线验证不需要数据库凭据：
 
 ```powershell
 node deploy/registry/backup-postgres-saas-state.mjs verify D:\secure-backups\registry-20260917
 ```
 
-验证会核对 manifest exact shape、每个文件的 SHA-256／大小、两个 SQLite `quick_check`，并用受限的 `pg_restore --list` 确认 archive 可读。把整个目录复制到异机受限介质；凭据不在 manifest 内，必须单独备份。
+验证会核对 manifest exact shape、每个文件的 SHA-256／大小、两个 SQLite `quick_check`，并解析真实 `pg_restore --list` 输出，要求 `billing_orders` 和 `billing_provider_events` 在目标 schema 下各有且仅有一条 `TABLE` 和一条 `TABLE DATA`，且 owner 与对象 OID 成对。把整个目录复制到异机受限介质；凭据不在 manifest 内，必须单独备份。manifest 没有数字签名：这些检查用于发现损坏、漏表和误恢复，不能证明备份来源可信，也不能抵御能同时替换 archive 与 manifest 的攻击者。
 
 ### 只恢复到新隔离目标
 
@@ -169,7 +169,21 @@ node --import tsx/esm deploy/registry/migrate-postgres-schemas.mjs `
 Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL
 ```
 
-archive 保留源 ACL；`--no-owner` 让所有对象由执行恢复的 `registry_migrator` 持有。离线迁移完成后，仍须在停服状态依次运行 `split-registry-runtime-role.sql` 和 `provision-registry-backup-role.sql`，重新固化并验证 app/backup exact ACL。把两个 SQLite 文件复制到事先确认不存在的新路径，绝不能覆盖旧介质：
+archive 保留源 ACL；`--no-owner` 让所有对象由执行恢复的 `registry_migrator` 持有。离线迁移完成后，仍须在停服状态依次运行 `split-registry-runtime-role.sql` 和 `provision-registry-backup-role.sql`，重新固化并验证 app/backup exact ACL。
+
+权限重新固化后、启动 Registry 前，临时注入这个隔离目标的 migrator 与 backup URL，执行计费恢复完整性门禁。该命令会先重做全部离线备份验证，再由 migrator 锁住目标表，由 `registry_backup` 在只读一致快照中重新计算两张计费表的行数和摘要；任何缺表、内容变化、URL 指向不同数据库或权限漂移都会失败关闭，输出只含行数与摘要：
+
+```powershell
+$env:DSH_REGISTRY_POSTGRES_MIGRATOR_URL = '<隔离目标 registry_migrator URL>'
+$env:DSH_REGISTRY_POSTGRES_BACKUP_URL = '<同一隔离目标 registry_backup URL>'
+node deploy/registry/backup-postgres-saas-state.mjs verify-restored D:\secure-backups\registry-20260917
+if ($LASTEXITCODE -ne 0) { throw '计费表恢复完整性验证失败；禁止启动 Registry' }
+Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL,Env:\DSH_REGISTRY_POSTGRES_BACKUP_URL
+```
+
+该门禁只比对两张 schema v3 计费表，不能替代后续逐组织业务语义验证；当前仓库尚未用真实 schema v3 支付数据跑过一次完整隔离恢复。
+
+把两个 SQLite 文件复制到事先确认不存在的新路径，绝不能覆盖旧介质：
 
 ```powershell
 $restoreRoot = 'D:\registry-restore'
