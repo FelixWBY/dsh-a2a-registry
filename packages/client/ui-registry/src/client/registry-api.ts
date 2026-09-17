@@ -220,6 +220,7 @@ export interface RegistryInvitationPreview {
 
 export type RegistryConfigurationState = 'configured' | 'unconfigured'
 export type RegistryDeploymentMode = 'standard' | 'test-only'
+export type RegistryTenancyMode = 'saas' | 'single-organization' | 'unconfigured'
 export type RegistryIdentityProvider = 'oidc' | 'external' | 'local-test' | 'unconfigured'
 export type RegistryBillingProvider = 'stripe' | 'alipay' | 'unconfigured'
 
@@ -227,6 +228,8 @@ export type RegistryBillingProvider = 'stripe' | 'alipay' | 'unconfigured'
 export interface RegistryRuntimeStatus {
   /** Server-owned deployment class; `standard` is not itself a production-health claim. */
   readonly deploymentMode: RegistryDeploymentMode
+  /** Server-observed tenant router mode; `saas` means the live router provider is loaded. */
+  readonly tenancy: RegistryTenancyMode
   readonly identity: RegistryConfigurationState
   readonly identityProvider: RegistryIdentityProvider
   readonly registry: RegistryConfigurationState
@@ -883,6 +886,7 @@ function invitationPreview(value: unknown): RegistryInvitationPreview {
 function runtimeStatus(value: unknown): RegistryRuntimeStatus {
   const source = record(value)
   const deploymentMode = member(source?.deploymentMode, ['standard', 'test-only'] as const)
+  const tenancy = member(source?.tenancy, ['saas', 'single-organization', 'unconfigured'] as const)
   const identity = member(source?.identity, CONFIGURATION_STATES)
   const identityProvider = member(source?.identityProvider, ['oidc', 'external', 'local-test', 'unconfigured'] as const)
   const registry = member(source?.registry, CONFIGURATION_STATES)
@@ -894,7 +898,7 @@ function runtimeStatus(value: unknown): RegistryRuntimeStatus {
   const mailboxCleanup = member(source?.mailboxCleanup, CONFIGURATION_STATES)
   const billing = member(source?.billing, CONFIGURATION_STATES)
   const billingProvider = member(source?.billingProvider, ['stripe', 'alipay', 'unconfigured'] as const)
-  if (source === null || deploymentMode === null || identity === null || identityProvider === null
+  if (source === null || deploymentMode === null || tenancy === null || identity === null || identityProvider === null
     || (identity === 'unconfigured' && identityProvider !== 'unconfigured')
     || (identity === 'configured' && identityProvider === 'unconfigured')
     || registry === null || disclosureOperations === null
@@ -902,7 +906,7 @@ function runtimeStatus(value: unknown): RegistryRuntimeStatus {
     || disclosureCleanup === null || mailboxCleanup === null || billing === null || billingProvider === null
     || (billing === 'unconfigured' && billingProvider !== 'unconfigured')
     || (billing === 'configured' && billingProvider === 'unconfigured')) throw new RegistryApiError('unavailable')
-  return { deploymentMode, identity, identityProvider, registry, disclosureOperations, deviceBinding, audit, rateLimits,
+  return { deploymentMode, tenancy, identity, identityProvider, registry, disclosureOperations, deviceBinding, audit, rateLimits,
     disclosureCleanup, mailboxCleanup, billing, billingProvider }
 }
 

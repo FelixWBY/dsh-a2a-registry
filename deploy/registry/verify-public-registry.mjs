@@ -2,6 +2,8 @@
 import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { isIP } from 'node:net'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const TIMEOUT_MS = 10_000
 const MAX_FRAME_BYTES = 1_048_576
@@ -10,8 +12,6 @@ const REQUIRED_RUNTIME_CAPABILITIES = [
   'identity', 'registry', 'disclosureOperations', 'deviceBinding',
   'audit', 'rateLimits', 'disclosureCleanup', 'mailboxCleanup',
 ]
-const rawOrigin = process.argv[2]
-  ?? (process.env.REGISTRY_DOMAIN === undefined ? '' : `https://${process.env.REGISTRY_DOMAIN}`)
 let origin
 
 function fail(message) {
@@ -120,8 +120,19 @@ async function verifyRuntimeConfiguration() {
     || envelope.ok !== true || envelope.value === null || typeof envelope.value !== 'object'
     || Array.isArray(envelope.value)) fail('the runtime-configuration response has an invalid envelope')
   const status = envelope.value
+  verifyRuntimeConfigurationValue(status)
+}
+
+/** Validate server-owned production status without trusting browser state or deployment labels alone. */
+export function verifyRuntimeConfigurationValue(status) {
+  if (status === null || typeof status !== 'object' || Array.isArray(status)) {
+    fail('the runtime-configuration response has an invalid value')
+  }
   if (status.deploymentMode !== 'standard') {
     fail('the public Registry reports a test-only deployment mode')
+  }
+  if (status.tenancy !== 'saas') {
+    fail('the public Registry does not report a loaded SaaS tenant router')
   }
   const invalid = REQUIRED_RUNTIME_CAPABILITIES.filter(name => status[name] !== 'configured'
     && status[name] !== 'unconfigured')
@@ -202,25 +213,32 @@ async function verifyUnauthenticatedWss() {
   }).catch((error) => { fail(error instanceof Error ? error.message : 'the WSS authentication boundary failed') })
 }
 
-try {
-  origin = publicOrigin(rawOrigin)
-  checkNodeRuntime()
-  await verifyProbe('/healthz')
-  await verifyProbe('/readyz')
-  await verifyRuntimeConfiguration()
-  await verifyShell()
-  await verifyUnauthenticatedWss()
-  process.stdout.write([
-    'registry-public-verification: passed',
-    `- origin: ${origin.origin}`,
-    '- HTTPS shell, HSTS and browser security headers: valid',
-    '- liveness and shell readiness: ready',
-    '- deployment mode: standard; required runtime capabilities: configured',
-    '- WSS upgrade: available; uncredentialed hello: unauthorized',
-    '- identity, KMS, alert delivery, restore and SLO evidence require separate authenticated drills',
-    '',
-  ].join('\n'))
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : 'registry-public-verification: failed'}\n`)
-  process.exitCode = 1
+async function main() {
+  const rawOrigin = process.argv[2]
+    ?? (process.env.REGISTRY_DOMAIN === undefined ? '' : `https://${process.env.REGISTRY_DOMAIN}`)
+  try {
+    origin = publicOrigin(rawOrigin)
+    checkNodeRuntime()
+    await verifyProbe('/healthz')
+    await verifyProbe('/readyz')
+    await verifyRuntimeConfiguration()
+    await verifyShell()
+    await verifyUnauthenticatedWss()
+    process.stdout.write([
+      'registry-public-verification: passed',
+      `- origin: ${origin.origin}`,
+      '- HTTPS shell, HSTS and browser security headers: valid',
+      '- liveness and shell readiness: ready',
+      '- tenancy: SaaS tenant router loaded; deployment mode: standard',
+      '- required runtime capabilities: configured',
+      '- WSS upgrade: available; uncredentialed hello: unauthorized',
+      '- identity, KMS, alert delivery, restore and SLO evidence require separate authenticated drills',
+      '',
+    ].join('\n'))
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : 'registry-public-verification: failed'}\n`)
+    process.exitCode = 1
+  }
 }
+
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main()

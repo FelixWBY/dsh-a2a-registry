@@ -1755,6 +1755,10 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
             .every(method => typeof operations[method as keyof RegistryDisclosureOperations] === 'function')
         succeed(response, {
           deploymentMode: runtime.deploymentMode,
+          // This is derived from the live server provider graph. It is not a
+          // deployment label supplied by the browser or an environment flag.
+          tenancy: tenantRouterConfigured ? 'saas'
+            : ctx.get('registryDisclosureReader') === undefined ? 'unconfigured' : 'single-organization',
           identity: ctx.get('registryAccountAuthenticator') === undefined ? 'unconfigured' : 'configured',
           identityProvider: ctx.get('registryAccountAuthenticator') === undefined
             ? 'unconfigured' : runtime.identityProvider,

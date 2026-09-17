@@ -20,7 +20,7 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 npm start -- --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证和按租户持久导入队列均由 Registry 内建提供。该模板尚未配置披露解密和提问提供方，相应接口返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；真实 Harness 仍需实现提问消费、隔离执行与回复提交。该模板尚未配置披露解密提供方，因此固定 checkpoint 正文读取接口仍返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
 
 ## 公网入口
 
@@ -34,7 +34,7 @@ node --import tsx/esm deploy/registry/verify-public-registry.mjs
 node --import tsx/esm deploy/registry/verify-registry-device.mjs
 ```
 
-验证脚本从模板规定的环境变量读取配置。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
+`registry` 范围是公网 SaaS 门禁：必须显式提供使用 `registry_app` 角色的 PostgreSQL URL 和 SaaS 初始化信息，单组织 SQLite 配置不能通过。公网验证还会从服务端状态接口确认实时 `registryTenantRouter` 已加载，不以浏览器缓存或单纯的 `standard` 部署标签代替。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
 
 ## Harness 接入
 

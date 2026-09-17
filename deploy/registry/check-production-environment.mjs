@@ -197,7 +197,8 @@ if (checkRegistry || checkHarness) {
 }
 
 if (checkRegistry) {
-  for (const name of ['DSH_REGISTRY_BOOTSTRAP_MEMBER_ID', 'DSH_REGISTRY_BOOTSTRAP_MEMBER_NAME']) required(name)
+  for (const name of ['DSH_REGISTRY_BOOTSTRAP_MEMBER_ID', 'DSH_REGISTRY_BOOTSTRAP_MEMBER_NAME',
+    'DSH_REGISTRY_ORGANIZATION_NAME']) required(name)
   const publicOrigin = required('DSH_REGISTRY_PUBLIC_ORIGIN')
   if (publicOrigin.length > 0 && domain.length > 0) registryOrigin(publicOrigin, domain)
   const oidcIssuer = required('DSH_REGISTRY_OIDC_ISSUER')
@@ -207,7 +208,10 @@ if (checkRegistry) {
   if (audience.length > 0 && domain.length > 0) syncUrl('DSH_REGISTRY_SYNC_AUDIENCE', audience, domain)
 }
 
-const selectedPostgresUrl = checkRegistry ? process.env.DSH_REGISTRY_POSTGRES_URL?.trim() ?? '' : ''
+// The production Registry scope is the public multi-tenant SaaS contract. A
+// single-organization SQLite deployment remains useful for local development,
+// but must never satisfy this production gate.
+const selectedPostgresUrl = checkRegistry ? required('DSH_REGISTRY_POSTGRES_URL') : ''
 if (selectedPostgresUrl.length > 0) {
   const parsedPostgresUrl = postgresUrl(selectedPostgresUrl)
   if (parsedPostgresUrl !== undefined && parsedPostgresUrl.username.toLowerCase() !== 'registry_app') {
@@ -244,7 +248,7 @@ if (checkHarness) {
 const pathNames = [
   ...((checkRegistry || checkHarness) ? ['DSH_HOME'] : []),
   ...(checkRegistry ? [
-    ...(selectedPostgresUrl.length === 0 ? ['DSH_REGISTRY_SQLITE_PATH'] : []),
+    'DSH_REGISTRY_SQLITE_PATH',
     'DSH_REGISTRY_ADMISSION_SQLITE_PATH',
     'DSH_REGISTRY_ALERT_OUTBOX_SQLITE_PATH',
   ] : []),
