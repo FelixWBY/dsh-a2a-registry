@@ -1,4 +1,5 @@
 /** One bounded, sequential producer connection; every durable operation uses a current authority lease. */
+import { createHash } from 'node:crypto'
 import { symbols, type Context } from '@deepseek-ai/cordis'
 import WebSocket from 'ws'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
@@ -13,7 +14,8 @@ import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type Disclos
   type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { decodeRegistryClientFrame, encodeRegistryServerFrame, RegistrySyncProtocolError,
   type RegistryClientFrame, type RegistryInstanceReport, type RegistryProducerAccessUpdate,
-  type RegistryImportDelivery, type RegistryProducerRegistration, type RegistryServerFrame,
+  type RegistryImportDelivery, type RegistryProducerRegistration, type RegistryQuestionDelivery,
+  type RegistryServerFrame,
   type RegistrySyncErrorCode } from '@deepseek-ai/dsh-a2a-registry-sync'
 import type { RegistryRuntimeStore } from './runtime-store.ts'
 import type { RegistrySyncConfig } from './sync-config.ts'
@@ -101,6 +103,38 @@ function requireImportDelivery(delivery: RegistryImportDelivery, target: Registr
     || checkpoint.disclosureId !== delivery.disclosureId
     || checkpoint.checkpointHash !== delivery.checkpointHash) {
     throw new RegistryIngestError('invalid-storage')
+  }
+}
+
+/** Reject a broken question broker boundary before plaintext crosses the authenticated connection. */
+function requireQuestionDelivery(delivery: RegistryQuestionDelivery,
+  source: RegistryConnectionAuthority): void {
+  const binding = delivery.binding
+  const receipt = delivery.receipt
+  const checkpoint = delivery.prefix.checkpoint
+  const questionHash = `sha256:${createHash('sha256').update(delivery.question, 'utf8').digest('hex')}`
+  const sameReceipt = receipt.binding.requestId === binding.requestId
+    && receipt.binding.organizationId === binding.organizationId
+    && receipt.binding.disclosureId === binding.disclosureId
+    && receipt.binding.requesterId === binding.requesterId
+    && receipt.binding.instanceId === binding.instanceId
+    && receipt.binding.checkpointHash === binding.checkpointHash
+    && receipt.binding.authorizationVersion === binding.authorizationVersion
+    && receipt.binding.expiresAt === binding.expiresAt
+  if (!sameReceipt || binding.organizationId !== source.connection.organizationId
+    || binding.instanceId !== source.connection.instanceId
+    || binding.organizationId !== source.history.organizationId
+    || binding.instanceId !== source.history.instanceId
+    || checkpoint.organizationId !== binding.organizationId
+    || checkpoint.instanceId !== binding.instanceId
+    || checkpoint.disclosureId !== binding.disclosureId
+    || checkpoint.checkpointHash !== binding.checkpointHash
+    || (receipt.state !== 'delivered' && receipt.state !== 'running')
+    || receipt.questionHash !== questionHash || receipt.replyHash !== null
+    || !Number.isSafeInteger(receipt.version) || receipt.version <= 0
+    || delivery.prefix.authorizationVersion !== receipt.authorizationVersion
+    || receipt.authorizationVersion < binding.authorizationVersion) {
+    throw new MailboxError('invalid-storage')
   }
 }
 
@@ -501,7 +535,10 @@ export class RegistrySyncConnection {
       switch (frame.type) {
         case 'question-dispatch': {
           const delivery = await broker.dispatch(source, frame.excludeRequestIds ?? [], this.abort.signal)
-          if (delivery !== null) this.disclosures.add(delivery.binding.disclosureId)
+          if (delivery !== null) {
+            requireQuestionDelivery(delivery, source)
+            this.disclosures.add(delivery.binding.disclosureId)
+          }
           await checked()
           await this.send({ ...base, type: 'question-dispatch', delivery })
           return
@@ -532,9 +569,11 @@ export class RegistrySyncConnection {
           return
         }
         case 'question-authorize': {
-          await broker.withAuthorization(source, frame.binding, frame.expectedVersion, async (delivery) => {
+          await broker.withAuthorization(source, frame.binding, frame.expectedVersion,
+            async (delivery, authorizationSignal) => {
+            requireQuestionDelivery(delivery, source)
             this.disclosures.add(delivery.binding.disclosureId)
-            const waiting = this.waitForQuestionRelease(frame.requestId)
+            const waiting = this.waitForQuestionRelease(frame.requestId, authorizationSignal)
             try { await this.send({ ...base, type: 'question-authorized', delivery }) }
             catch (error) {
               this.stop()
@@ -606,22 +645,23 @@ export class RegistrySyncConnection {
     }
   }
 
-  private waitForQuestionRelease(authorizationRequestId: number): Promise<QuestionReleaseFrame> {
-    if (this.release !== undefined || this.abort.signal.aborted) return Promise.reject(new RegistrySyncProtocolError())
+  private waitForQuestionRelease(authorizationRequestId: number,
+    signal: AbortSignal = this.abort.signal): Promise<QuestionReleaseFrame> {
+    if (this.release !== undefined || signal.aborted) return Promise.reject(new RegistrySyncProtocolError())
     return new Promise((resolve, reject) => {
       let settled = false
       const settle = (frame: ReleaseFrame | undefined): void => {
         if (settled) return
         settled = true
-        this.abort.signal.removeEventListener('abort', abort)
+        signal.removeEventListener('abort', abort)
         if (this.release?.settle === settle) this.release = undefined
         if (frame === undefined || frame.type !== 'question-authorize-release') reject(new Unauthorized())
         else resolve(frame)
       }
       const abort = (): void => { settle(undefined) }
       this.release = { type: 'question-authorize-release', authorizationRequestId, settle }
-      this.abort.signal.addEventListener('abort', abort, { once: true })
-      if (this.abort.signal.aborted) abort()
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
     })
   }
 

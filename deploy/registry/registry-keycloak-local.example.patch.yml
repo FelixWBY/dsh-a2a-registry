@@ -89,6 +89,24 @@
         maxAuthorizationResponseBytes: 262144
         maxDeliveryBytes: 261120
         deliveryTimeoutMs: 15000
+      questions:
+        mailboxKeyEnv: DSH_LOCAL_REGISTRY_MAILBOX_KEY
+        maxAuthorizationResponseBytes: 262144
+        maxDeliveryBytes: 261120
+        operationTimeoutMs: 15000
+        executionLeaseMs: 30000
+        limits:
+          maxTextBytes: 8192
+          maxTextCharacters: 4096
+          maxCiphertextBytes: 16384
+          maxAggregateBytes: 32768
+          maxRequests: 2000
+          maxRetainedRequests: 10000
+          maxPendingOperations: 64
+          maxLifetimeMs: 604800000
+        expiryMaintenance:
+          intervalMs: 60000
+          maxItems: 100
       limits:
         maxInputBytes: 65536
         maxAggregateBytes: 1048576

@@ -427,9 +427,11 @@ export class LocalHarnessQuestionOperations implements RegistryQuestionBroker {
 
   /** Hold current Registry and device authority while the WSS receiver persists one fixed prefix. */
   async withAuthorization(source: RegistryConnectionAuthority, binding: MailboxBinding, expectedVersion: number,
-    receive: (delivery: RegistryQuestionDelivery) => Promise<void>, signal: AbortSignal): Promise<void> {
+    receive: (delivery: RegistryQuestionDelivery, signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal): Promise<void> {
     this.assertSource(source)
-    await this.withSourceImportAuthorization(binding, expectedVersion, signal, receive, source)
+    await this.withSourceImportAuthorization(binding, expectedVersion, signal,
+      delivery => receive(delivery, signal), source)
   }
 
   /** Persist one immutable, checkpoint-pinned question. */

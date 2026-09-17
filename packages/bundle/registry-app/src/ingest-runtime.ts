@@ -22,8 +22,10 @@ import type { RegistryEnrollment } from './enrollment.ts'
 import { RegistryOperationalAlertExporter, RegistryOperationalAlertsConfigSchema,
   type RegistryOperationalAlertsConfig, type RegistryOperationalRateLimitScope } from './operational-alerts.ts'
 import { RegistrySaasImportQueue, type RegistrySaasImportQueueConfig } from './saas-import-queue.ts'
+import { RegistrySaasQuestionMailbox, type RegistrySaasQuestionMailboxConfig } from './saas-question-mailbox.ts'
 
 const IMPORT_DELIVERY_ENVELOPE_BYTES = 1024
+const QUESTION_DELIVERY_ENVELOPE_BYTES = 1024
 
 function boundedObservation<T>(value: T, maximum: number): T {
   if (Buffer.byteLength(JSON.stringify(value), 'utf8') > maximum) throw new RegistryIngestError('limit')
@@ -55,6 +57,8 @@ export interface RegistryIngestRuntimeConfig {
   sync?: RegistrySyncConfig
   /** Optional tenant-owned durable context-import queue delivered through Registry Sync. */
   imports?: RegistrySaasImportQueueConfig
+  /** Optional tenant-owned encrypted text-question mailbox delivered through Registry Sync. */
+  questions?: RegistrySaasQuestionMailboxConfig
 }
 
 const positive = () => z.natural().min(1).max(Number.MAX_SAFE_INTEGER).required()
@@ -77,6 +81,17 @@ const schema: z<RegistryIngestRuntimeConfig> = z.object({
   imports: z.union([z.object({ maxOperations: positive(), maxRecordBytes: positive(),
     maxAuthorizationResponseBytes: positive(), maxDeliveryBytes: positive(),
     deliveryTimeoutMs: positive() }).required()]),
+  questions: z.union([z.object({
+    mailboxKeyEnv: z.string().role('credential-ref').required(),
+    maxAuthorizationResponseBytes: positive(), maxDeliveryBytes: positive(),
+    operationTimeoutMs: positive(), executionLeaseMs: positive(),
+    limits: z.object({
+      maxTextBytes: positive(), maxTextCharacters: positive(), maxCiphertextBytes: positive(),
+      maxAggregateBytes: positive(), maxRequests: positive(), maxRetainedRequests: positive(),
+      maxPendingOperations: positive(), maxLifetimeMs: positive(),
+    }).required(),
+    expiryMaintenance: z.object({ intervalMs: positive(), maxItems: positive() }).required(),
+  }).required()]),
 })
 export const Config: z<RegistryIngestRuntimeConfig> = z.transform(schema, (value) => {
   if (value.bindings !== undefined) {
@@ -101,6 +116,17 @@ export const Config: z<RegistryIngestRuntimeConfig> = z.transform(schema, (value
   if (value.imports !== undefined && value.sync !== undefined
     && value.imports.maxDeliveryBytes > value.sync.maxFrameBytes - IMPORT_DELIVERY_ENVELOPE_BYTES) {
     throw new z.ValidationError('Registry tenant import delivery exceeds the sync frame bound', {})
+  }
+  if (value.questions !== undefined
+    && (value.directory === undefined || value.bindings === undefined || value.sync === undefined)) {
+    throw new z.ValidationError('Registry tenant questions require directory, bindings and sync', {})
+  }
+  if (value.questions !== undefined && value.questions.maxAuthorizationResponseBytes > value.sync!.maxFrameBytes) {
+    throw new z.ValidationError('Registry tenant question authorization exceeds the sync frame bound', {})
+  }
+  if (value.questions !== undefined
+    && value.questions.maxDeliveryBytes > value.sync!.maxFrameBytes - QUESTION_DELIVERY_ENVELOPE_BYTES) {
+    throw new z.ValidationError('Registry tenant question delivery exceeds the sync frame bound', {})
   }
   return value
 })
@@ -169,6 +195,7 @@ export interface RegistryTenantRuntime {
   readonly directory?: RegistryDirectory
   readonly enrollment?: RegistryEnrollment
   readonly imports?: RegistrySaasImportQueue
+  readonly questions?: RegistrySaasQuestionMailbox
   readonly signal: AbortSignal
   readonly reportRateLimit?: (scope: RegistryOperationalRateLimitScope) => void
   close(): Promise<void>
@@ -191,12 +218,13 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
   const store = new RegistryRuntimeStore(ctx, ctx.storageDomain, options.organizationId, options.limits, abort,
     options.audit, options.directory, options.bindings, alerts, openOptions.storage)
   let imports: RegistrySaasImportQueue | undefined
+  let questions: RegistrySaasQuestionMailbox | undefined
   let worker = Promise.resolve()
   let closing: Promise<void> | undefined
   const close = (): Promise<void> => {
     closing ??= (async () => {
       abort.abort()
-      const outcomes = await Promise.allSettled([worker, imports?.close(), store.close(),
+      const outcomes = await Promise.allSettled([worker, questions?.close(), imports?.close(), store.close(),
         ownAlerts ? alerts?.close() : undefined])
       if (outcomes.some(outcome => outcome.status === 'rejected')) {
         ctx.logger.error('Registry tenant runtime cleanup failed')
@@ -332,6 +360,29 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
       throw error
     }
   }
+  if (options.questions !== undefined) {
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined || options.directory === undefined
+      || options.bindings === undefined || options.sync === undefined) {
+      await close().catch(() => undefined)
+      throw new Error('Registry SaaS questions require credentials, directory, bindings and sync')
+    }
+    if (options.questions.maxAuthorizationResponseBytes > options.sync.maxFrameBytes) {
+      await close().catch(() => undefined)
+      throw new Error('Registry SaaS question authorization exceeds the sync frame bound')
+    }
+    if (options.questions.maxDeliveryBytes > options.sync.maxFrameBytes - QUESTION_DELIVERY_ENVELOPE_BYTES) {
+      await close().catch(() => undefined)
+      throw new Error('Registry SaaS question delivery exceeds the sync frame bound')
+    }
+    try {
+      questions = await RegistrySaasQuestionMailbox.open(ctx, ctx.storageDomain, credentials,
+        options.organizationId, store, reader, options.questions, openOptions.storage)
+    } catch (error) {
+      await close().catch(() => undefined)
+      throw error
+    }
+  }
   if (options.maintenance !== undefined) {
     worker = runRegistryMaintenance(ctx, options.organizationId, options.maintenance, store, abort.signal)
   }
@@ -344,6 +395,7 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
     ...(directory === undefined ? {} : { directory }),
     ...(enrollment === undefined ? {} : { enrollment }),
     ...(imports === undefined ? {} : { imports }),
+    ...(questions === undefined ? {} : { questions }),
     signal: abort.signal,
     ...(alerts === undefined ? {} : {
       reportRateLimit: (scope: RegistryOperationalRateLimitScope) => { alerts.reportRateLimit(options.organizationId, scope) },

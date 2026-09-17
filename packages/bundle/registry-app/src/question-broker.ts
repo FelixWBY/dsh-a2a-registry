@@ -22,7 +22,8 @@ export interface RegistryQuestionBroker {
     transition: MailboxTransition, signal: AbortSignal): Promise<MailboxReceipt>
   /** Hold requester, disclosure and source authority while the receiver durably imports the prefix. */
   withAuthorization(source: RegistryConnectionAuthority, binding: MailboxBinding, expectedVersion: number,
-    receive: (delivery: RegistryQuestionDelivery) => Promise<void>, signal: AbortSignal): Promise<void>
+    receive: (delivery: RegistryQuestionDelivery, signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal): Promise<void>
 }
 
 declare module '@deepseek-ai/cordis' {

@@ -66,6 +66,14 @@ export interface MailboxOptions {
   readonly codec: MailboxTextCodec
   readonly withAuthorization: WithMailboxAuthorization
   readonly signal: AbortSignal
+  /** Optional Host-selected physical isolation. Omission retains the legacy global mailbox unit. */
+  readonly storage?: MailboxStorageScope
+}
+
+/** Host-owned durable unit name and backend tenant selector. */
+export interface MailboxStorageScope {
+  readonly domainName?: string
+  readonly tenantId?: string
 }
 
 /** Trusted server selection for bounded expiry cleanup; never decode this from a mailbox request. */

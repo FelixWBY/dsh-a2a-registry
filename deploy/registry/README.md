@@ -2,7 +2,7 @@
 
 请按[独立部署说明](../README.md)操作。本目录提供独立 Registry、外部 Harness、OIDC 和多租户 PostgreSQL 所需的配置模板及本地运维工具，不再使用原单体仓库的启动命令。
 
-生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时和 PostgreSQL RLS。所有 `.example` 文件均需替换为自己的环境配置，不包含真实凭据。
+生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时、PostgreSQL RLS、持久导入队列和加密提问邮箱。所有 `.example` 文件均需替换为自己的环境配置，不包含真实凭据。`DSH_REGISTRY_MAILBOX_KEY` 必须是秘密管理器注入的规范 base64url 32 字节根密钥；Registry 按组织派生邮箱密钥，轮换前必须先完成现有密文的迁移演练，不能直接替换后丢失回复解密能力。
 
 SaaS 设备同步使用 v5 绑定内建认证：Harness 在本机生成 Ed25519 密钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。成员审批并由 Harness 签名确认后，本机保存 `dsh1` 设备 token 和私钥；连接 WSS 时仍须签署 Registry 的一次性随机挑战。人工配对码、网页账号会话和共享测试密钥都不能替代设备凭据。
 

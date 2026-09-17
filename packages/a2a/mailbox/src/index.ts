@@ -43,8 +43,9 @@ export async function openA2aMailbox(facility: DomainFacility, options: MailboxO
     && options.executionLeaseMs <= 2_147_483_647, 'invalid-input')
   const resolved = { ...options, limits: Object.freeze({ ...options.limits }),
     codec: Object.freeze({ seal: options.codec.seal.bind(options.codec), open: options.codec.open.bind(options.codec) }) }
-  const owner = await openOwner(facility, 'a2a_mailbox', resolved.limits, resolved.signal,
-    value => parseRecord(value, resolved.limits), record => recordKey(record.binding), record => !isMailboxTombstone(record))
+  const owner = await openOwner(facility, resolved.storage?.domainName ?? 'a2a_mailbox', resolved.limits, resolved.signal,
+    value => parseRecord(value, resolved.limits), record => recordKey(record.binding),
+    record => !isMailboxTombstone(record), resolved.storage?.tenantId)
   return new A2aMailbox(owner, resolved)
 }
 

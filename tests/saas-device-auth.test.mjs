@@ -10,6 +10,7 @@ import Storage from '@deepseek-ai/dsh-storage'
 import * as jsonStorage from '@deepseek-ai/dsh-storage-json'
 import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
+import { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import {
   encodeRegistryDeviceToken,
   generateInstanceKeyPair,
@@ -27,12 +28,28 @@ import {
 } from '@deepseek-ai/dsh-a2a-registry-sync'
 import { RegistryBindingProducerAuthenticator } from '@deepseek-ai/dsh-registry-app'
 import { RegistrySaasImportRouter } from '@deepseek-ai/dsh-registry-app/src/saas-import-queue.ts'
+import { RegistrySaasQuestionRouter } from '@deepseek-ai/dsh-registry-app/src/saas-question-mailbox.ts'
 import { openRegistryTenantRuntime } from '@deepseek-ai/dsh-registry-app/src/ingest-runtime.ts'
 import { installRegistrySync } from '@deepseek-ai/dsh-registry-app/src/sync.ts'
 
 const MAX_FRAME_BYTES = 64 * 1024
 const TIMEOUT_MS = 5_000
 const AUDIENCE = `wss://registry.example${REGISTRY_SYNC_PATH}`
+const MAILBOX_KEY = Buffer.alloc(32, 0x5a).toString('base64url')
+
+class TestCredentials extends CredentialProvider {
+  resolve(ref) {
+    return Promise.resolve(ref === 'TEST_REGISTRY_MAILBOX_KEY'
+      ? { value: MAILBOX_KEY, source: 'test' } : undefined)
+  }
+  describe(ref) { return Promise.resolve({ configured: ref === 'TEST_REGISTRY_MAILBOX_KEY', source: 'test', writable: false }) }
+  set() { return Promise.reject(new Error('read only')) }
+  unset() { return Promise.reject(new Error('read only')) }
+  readRecord() { return Promise.resolve(undefined) }
+  describeRecord() { return Promise.resolve({ configured: false, writable: false }) }
+  listRecords() { return Promise.resolve([]) }
+  modifyRecord() { return Promise.reject(new Error('read only')) }
+}
 
 function waitForOpen(socket) {
   return new Promise((resolve, reject) => {
@@ -146,6 +163,24 @@ function runtimeConfig(organizationId, memberId) {
       maxDeliveryBytes: 8 * 1024,
       deliveryTimeoutMs: TIMEOUT_MS,
     },
+    questions: {
+      mailboxKeyEnv: 'TEST_REGISTRY_MAILBOX_KEY',
+      maxAuthorizationResponseBytes: MAX_FRAME_BYTES,
+      maxDeliveryBytes: 8 * 1024,
+      operationTimeoutMs: TIMEOUT_MS,
+      executionLeaseMs: TIMEOUT_MS,
+      limits: {
+        maxTextBytes: 4 * 1024,
+        maxTextCharacters: 2 * 1024,
+        maxCiphertextBytes: 8 * 1024,
+        maxAggregateBytes: 16 * 1024,
+        maxRequests: 16,
+        maxRetainedRequests: 32,
+        maxPendingOperations: 16,
+        maxLifetimeMs: 60_000,
+      },
+      expiryMaintenance: { intervalMs: 10_000, maxItems: 8 },
+    },
     sync: syncConfig(),
   }
 }
@@ -215,15 +250,18 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
   let authenticator
   let stopSync
   let withdrawImportBroker
+  let withdrawQuestionBroker
   try {
     await ctx.plugin(Storage)
     await ctx.plugin(jsonStorage, { root: join(home, 'storage') })
     await ctx.plugin(storageDomain, { backend: 'json' })
     await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0, compression: 'none' })
+    new TestCredentials(ctx)
 
     const organizationA = 'tenant-a'
     const organizationB = 'tenant-b'
     const memberA = 'owner-a'
+    const memberB = 'requester-b'
     let runtimeA = await openRegistryTenantRuntime(ctx, runtimeConfig(organizationA, memberA), {
       storage: { domainName: 'saas_device_auth_a', tenantId: organizationA },
     })
@@ -242,6 +280,10 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       requestedScopes: ['disclosure.sync', 'a2a.receive'],
     })
     const authority = accountAuthority(organizationA, memberA)
+    assert.ok(runtimeA.directory)
+    assert.equal((await runtimeA.directory.change(authority, { kind: 'put-member', member: {
+      memberId: memberB, displayName: 'Requester B', role: 'member', state: 'active',
+    } }, 0)).revision, 1)
     assert.equal((await runtimeA.enrollment.approve(authority, ticket.bindingId, ticket.code,
       'Tenant A producer')).state.kind, 'approved')
     const confirmed = await runtimeA.enrollment.confirm(ticket.bindingId,
@@ -264,7 +306,15 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         return { runtime, release() {} }
       },
     })
+    const questionRouter = new RegistrySaasQuestionRouter({
+      acquireRuntime: async (organizationId) => {
+        const runtime = byOrganization.get(organizationId)
+        if (runtime === undefined) throw new Error('tenant unavailable')
+        return { runtime, release() {} }
+      },
+    })
     withdrawImportBroker = ctx.provide('registryImportBroker', importRouter)
+    withdrawQuestionBroker = ctx.provide('registryQuestionBroker', questionRouter)
     const config = syncConfig()
     authenticator = new RegistryBindingProducerAuthenticator(ctx, {
       audience: config.audience,
@@ -353,7 +403,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         registration: {
           conversationId,
           policyVersion: 1,
-          targets: [{ kind: 'member', memberId: memberA }],
+          targets: [{ kind: 'member', memberId: memberA }, { kind: 'member', memberId: memberB }],
           expiresAt,
         },
       })
@@ -403,7 +453,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         registration: {
           conversationId: oversizedConversationId,
           policyVersion: 1,
-          targets: [{ kind: 'member', memberId: memberA }],
+          targets: [{ kind: 'member', memberId: memberA }, { kind: 'member', memberId: memberB }],
           expiresAt,
         },
       })).type, 'producer-register-ack')
@@ -474,13 +524,13 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     }
 
     let externalHistoryCalls = 0
-    const readerAuthority = () => ({
+    const readerAuthorityFor = (memberId) => ({
       subject: {
         authenticated: true,
         organizationId: organizationA,
-        memberId: memberA,
+        memberId,
         membership: 'active',
-        role: 'owner',
+        role: memberId === memberA ? 'owner' : 'member',
         currentTeamIds: [],
       },
       now: Date.now(),
@@ -489,6 +539,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         throw new Error('SaaS reads must not trust external key history')
       },
     })
+    const readerAuthority = () => readerAuthorityFor(memberA)
     const metadata = await runtimeA.reader.readMetadata(readerAuthority, disclosureId, 'read',
       { checkpointHash: checkpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
     assert.equal(metadata.checkpoint.checkpointHash, checkpoint.checkpointHash)
@@ -504,8 +555,9 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
 
     const oversizedMetadata = await runtimeA.reader.readMetadata(readerAuthority, oversizedDisclosureId, 'read',
       { checkpointHash: oversizedCheckpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
-    const selection = (selectedMetadata = metadata, selectedDisclosureId = disclosureId) => ({
-      subject: readerAuthority().subject,
+    const selection = (selectedMetadata = metadata, selectedDisclosureId = disclosureId,
+      selectedMemberId = memberA, selectedAction = 'import') => ({
+      subject: readerAuthorityFor(selectedMemberId).subject,
       disclosure: selectedMetadata,
       listAuthorizedTargets: async (signal) => {
         signal.throwIfAborted()
@@ -530,11 +582,12 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       },
       readAuthorizedPrefix: ({ sourceInstanceId, checkpointHash }, signal) => {
         signal.throwIfAborted()
-        return runtimeA.reader.readPrefix(readerAuthority, selectedDisclosureId,
-          sourceInstanceId, 'import', checkpointHash)
+        return runtimeA.reader.readPrefix(() => readerAuthorityFor(selectedMemberId), selectedDisclosureId,
+          sourceInstanceId, selectedAction, checkpointHash)
       },
     })
     assert.ok(runtimeA.imports)
+    assert.ok(runtimeA.questions)
     const importSignal = new AbortController().signal
     const targets = await runtimeA.imports.listImportTargets(selection(), importSignal)
     assert.deepEqual(targets, [{ instanceId: ticket.challenge.instanceId, transport: 'not-observed',
@@ -566,6 +619,56 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       rejectMisroute, importSignal), false)
     assert.equal(misroutedDelivery, false)
 
+    const questionSelection = (selectedMetadata = metadata, selectedDisclosureId = disclosureId) =>
+      selection(selectedMetadata, selectedDisclosureId, memberB, 'ask')
+    const oversizedQuestionInput = {
+      idempotencyKey: 'tenant-a-oversized-question-1', question: 'Summarize the large prefix.',
+    }
+    const queuedOversizedQuestion = await runtimeA.questions.askDisclosure(
+      questionSelection(oversizedMetadata, oversizedDisclosureId), oversizedQuestionInput, importSignal)
+    await new Promise(resolve => setTimeout(resolve, 2))
+    const questionInput = { idempotencyKey: 'tenant-a-question-1', question: 'What changed?' }
+    const abortedQuestion = new AbortController()
+    const abortingSelection = questionSelection()
+    await assert.rejects(runtimeA.questions.askDisclosure({ ...abortingSelection,
+      readAuthorizedPrefix: async (_expected, operationSignal) => {
+        abortedQuestion.abort()
+        operationSignal.throwIfAborted()
+      },
+    }, { idempotencyKey: 'tenant-a-aborted-question', question: 'Do not persist this.' },
+    abortedQuestion.signal), error => error?.code === 'closed')
+    const [queuedQuestion, concurrentRetry] = await Promise.all([
+      runtimeA.questions.askDisclosure(questionSelection(), questionInput, importSignal),
+      runtimeA.questions.askDisclosure(questionSelection(), questionInput, importSignal),
+    ])
+    assert.equal(queuedQuestion.status, 'queued')
+    assert.deepEqual(concurrentRetry, queuedQuestion)
+    assert.deepEqual(await runtimeA.questions.askDisclosure(questionSelection(), questionInput, importSignal), queuedQuestion)
+    await assert.rejects(runtimeA.questions.askDisclosure(questionSelection(), {
+      ...questionInput, question: 'A different request under the same key',
+    }, importSignal), error => error?.code === 'conflict')
+    await assert.rejects(runtimeA.questions.askDisclosure({
+      ...questionSelection(), disclosure: { ...metadata, authorizationVersion: metadata.authorizationVersion + 1 },
+    }, questionInput, importSignal), error => error?.code === 'conflict')
+    const cancelledQuestion = await runtimeA.questions.askDisclosure(questionSelection(), {
+      idempotencyKey: 'tenant-a-question-cancel', question: 'Cancel this queued request.',
+    }, importSignal)
+    const questionScope = {
+      subject: readerAuthorityFor(memberB).subject,
+      selectDisclosure: async (selectedDisclosureId, sourceInstanceId, signal) => {
+        signal.throwIfAborted()
+        if (sourceInstanceId !== ticket.challenge.instanceId) throw new Error('unexpected source')
+        return selectedDisclosureId === oversizedDisclosureId
+          ? questionSelection(oversizedMetadata, oversizedDisclosureId) : questionSelection()
+      },
+    }
+    const questionPage = await runtimeA.questions.listQuestions(questionScope,
+      { pageSize: 8 }, importSignal)
+    assert.deepEqual(new Set(questionPage.items.map(item => item.requestId)),
+      new Set([queuedOversizedQuestion.requestId, queuedQuestion.requestId, cancelledQuestion.requestId]))
+    assert.equal((await runtimeA.questions.cancelQuestion(questionSelection(),
+      cancelledQuestion.requestId, importSignal)).status, 'cancelled')
+
     await runtimeA.close()
     runtimeA = await openRegistryTenantRuntime(ctx, runtimeConfig(organizationA, memberA), {
       storage: { domainName: 'saas_device_auth_a', tenantId: organizationA },
@@ -573,23 +676,72 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     runtimes.push(runtimeA)
     byOrganization.set(organizationA, runtimeA)
     assert.ok(runtimeA.imports)
+    assert.ok(runtimeA.questions)
     const restoredMetadata = await runtimeA.reader.readMetadata(readerAuthority, disclosureId, 'import',
       { checkpointHash: checkpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
     const restoredSelection = () => ({ ...selection(), disclosure: restoredMetadata })
+    const restoredQuestionMetadata = await runtimeA.reader.readMetadata(() => readerAuthorityFor(memberB),
+      disclosureId, 'ask', { checkpointHash: checkpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
+    const restoredQuestionSelection = () => questionSelection(restoredQuestionMetadata)
     const restoredOversizedMetadata = await runtimeA.reader.readMetadata(readerAuthority,
       oversizedDisclosureId, 'import',
       { checkpointHash: oversizedCheckpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
     const restoredOversizedSelection = () => selection(restoredOversizedMetadata, oversizedDisclosureId)
+    const restoredOversizedQuestionMetadata = await runtimeA.reader.readMetadata(
+      () => readerAuthorityFor(memberB), oversizedDisclosureId, 'ask',
+      { checkpointHash: oversizedCheckpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
+    const restoredOversizedQuestionSelection = () =>
+      questionSelection(restoredOversizedQuestionMetadata, oversizedDisclosureId)
     assert.deepEqual(await runtimeA.imports.readImport(restoredOversizedSelection(),
       queuedOversizedImport.operationId, importSignal), queuedOversizedImport)
+    assert.deepEqual(await runtimeA.questions.readQuestion(restoredQuestionSelection(),
+      queuedQuestion.requestId, importSignal), queuedQuestion)
 
     const receiverSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
     let queuedImport
     let sessionId
     try {
-      const oversizedDispatch = await exchange(receiverSocket, 4, { type: 'import-dispatch' })
+      const questionDispatch = await exchange(receiverSocket, 4, { type: 'question-dispatch' })
+      assert.equal(questionDispatch.type, 'question-dispatch')
+      assert.equal(questionDispatch.delivery.binding.requestId, queuedQuestion.requestId)
+      assert.equal(questionDispatch.delivery.binding.organizationId, organizationA)
+      assert.equal(questionDispatch.delivery.binding.requesterId, memberB)
+      assert.equal(questionDispatch.delivery.binding.instanceId, ticket.challenge.instanceId)
+      assert.equal(questionDispatch.delivery.question, questionInput.question)
+      assert.equal(questionDispatch.delivery.receipt.questionHash,
+        `sha256:${createHash('sha256').update(questionDispatch.delivery.question, 'utf8').digest('hex')}`)
+      assert.equal(questionDispatch.delivery.receipt.replyHash, null)
+      assert.equal(questionDispatch.delivery.prefix.checkpoint.checkpointHash, checkpoint.checkpointHash)
+      const questionStarted = await exchange(receiverSocket, 5, {
+        type: 'question-start', binding: questionDispatch.delivery.binding,
+        expectedVersion: questionDispatch.delivery.receipt.version,
+      })
+      assert.equal(questionStarted.type, 'question-start')
+      assert.equal(questionStarted.started, true)
+      const questionAuthorized = await exchange(receiverSocket, 6, {
+        type: 'question-authorize', binding: questionDispatch.delivery.binding,
+        expectedVersion: questionDispatch.delivery.receipt.version,
+      })
+      assert.equal(questionAuthorized.type, 'question-authorized')
+      assert.equal(questionAuthorized.delivery.question, questionInput.question)
+      const questionReleased = await exchange(receiverSocket, 7, {
+        type: 'question-authorize-release', authorizationRequestId: 6,
+      })
+      assert.equal(questionReleased.type, 'question-authorize-released')
+      assert.equal(questionReleased.authorizationRequestId, 6)
+      const questionCompleted = await exchange(receiverSocket, 8, {
+        type: 'question-transition', binding: questionDispatch.delivery.binding,
+        expectedVersion: questionStarted.receipt.version,
+        transition: { state: 'completed', reply: 'Only the authorized prefix.' },
+      })
+      assert.equal(questionCompleted.type, 'question-transition')
+      assert.equal(questionCompleted.receipt.state, 'completed')
+      assert.equal((await runtimeA.questions.readQuestion(restoredOversizedQuestionSelection(),
+        queuedOversizedQuestion.requestId, importSignal)).status, 'failed')
+
+      const oversizedDispatch = await exchange(receiverSocket, 9, { type: 'import-dispatch' })
       assert.deepEqual(oversizedDispatch, {
-        protocolVersion: 1, requestId: 4, type: 'import-dispatch', delivery: null,
+        protocolVersion: 1, requestId: 9, type: 'import-dispatch', delivery: null,
       })
       assert.deepEqual(await runtimeA.imports.readImport(restoredOversizedSelection(),
         queuedOversizedImport.operationId, importSignal), {
@@ -600,7 +752,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       queuedImport = await runtimeA.imports.importDisclosure(restoredSelection(), importInput, importSignal)
       sessionId = `a2a-import-${createHash('sha256')
         .update(`${ticket.challenge.instanceId}\0${queuedImport.operationId}`, 'utf8').digest('hex')}`
-      const dispatched = await exchange(receiverSocket, 5, { type: 'import-dispatch' })
+      const dispatched = await exchange(receiverSocket, 10, { type: 'import-dispatch' })
       assert.equal(dispatched.type, 'import-dispatch')
       assert.equal(dispatched.delivery.operationId, queuedImport.operationId)
       assert.equal(dispatched.delivery.expectedSessionId, sessionId)
@@ -608,13 +760,13 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       assert.equal(dispatched.delivery.targetInstanceId, ticket.challenge.instanceId)
       assert.equal(dispatched.delivery.checkpointHash, checkpoint.checkpointHash)
       assert.deepEqual(dispatched.delivery.prefix, prefix)
-      const released = await exchange(receiverSocket, 6, {
+      const released = await exchange(receiverSocket, 11, {
         type: 'import-release',
-        authorizationRequestId: 5,
+        authorizationRequestId: 10,
         outcome: { status: 'completed', sessionId },
       })
       assert.equal(released.type, 'import-released')
-      assert.equal(released.authorizationRequestId, 5)
+      assert.equal(released.authorizationRequestId, 10)
     } finally {
       await closeSocket(receiverSocket)
     }
@@ -625,6 +777,13 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       targetInstanceId: ticket.challenge.instanceId, idempotencyKey: 'tenant-a-import-1',
     }, importSignal),
       completedImport)
+    assert.deepEqual(await runtimeA.questions.readQuestion(restoredQuestionSelection(), queuedQuestion.requestId,
+      importSignal), {
+      requestId: queuedQuestion.requestId,
+      checkpointHash: checkpoint.checkpointHash,
+      status: 'completed',
+      reply: 'Only the authorized prefix.',
+    })
     await assert.rejects(runtimeA.reader.readPrefix(readerAuthority, disclosureId,
       'different-source-instance', 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
     assert.equal(externalHistoryCalls, 0)
@@ -679,17 +838,17 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     const backupOwner = 'owner-backup'
     assert.equal((await runtimeA.directory.change(authority, { kind: 'put-member', member: {
       memberId: backupOwner, displayName: 'Backup owner', role: 'owner', state: 'active',
-    } }, 0)).revision, 1)
+    } }, 1)).revision, 2)
     const backupAuthority = accountAuthority(organizationA, backupOwner)
     assert.equal((await runtimeA.directory.change(backupAuthority, { kind: 'put-member', member: {
       memberId: memberA, displayName: `${organizationA} owner`, role: 'owner', state: 'suspended',
-    } }, 1)).revision, 2)
+    } }, 2)).revision, 3)
     await assert.rejects(runtimeA.reader.readPrefix(legacyReaderAuthority, disclosureId,
       ticket.challenge.instanceId, 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
     assert.equal(legacyHistoryCalls, 2)
     assert.equal((await runtimeA.directory.change(backupAuthority, { kind: 'put-member', member: {
       memberId: memberA, displayName: `${organizationA} owner`, role: 'owner', state: 'active',
-    } }, 2)).revision, 3)
+    } }, 3)).revision, 4)
 
     assert.equal((await runtimeA.enrollment.revoke(authority, ticket.bindingId)).state.kind, 'revoked')
     await assert.rejects(runtimeA.reader.readPrefix(legacyReaderAuthority, disclosureId,
@@ -700,6 +859,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     await Promise.allSettled([stopSync?.()])
     await Promise.allSettled([authenticator?.close()])
     await Promise.allSettled([Promise.resolve().then(() => withdrawImportBroker?.())])
+    await Promise.allSettled([Promise.resolve().then(() => withdrawQuestionBroker?.())])
     await Promise.allSettled(runtimes.map(runtime => runtime.close()))
     await ctx.fiber.dispose()
     await rm(home, { recursive: true, force: true })

@@ -171,7 +171,12 @@ if (Test-Path -LiteralPath $privateConfigPath) {
     password = "Dsh!$(New-Secret 18)"
     clientSecret = New-Secret 32
     sessionSecret = New-Secret 48
+    mailboxKey = New-Secret 32
   }
+  [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+}
+if ($null -eq $privateConfig.PSObject.Properties['mailboxKey']) {
+  $privateConfig | Add-Member -NotePropertyName mailboxKey -NotePropertyValue (New-Secret 32)
   [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
 
@@ -198,6 +203,7 @@ try {
   $env:DSH_HOME = Join-Path $artifactRoot 'home'
   $env:DSH_REGISTRY_POSTGRES_URL = $databaseUrlLine.Substring('DATABASE_URL='.Length)
   $env:DSH_LOCAL_REGISTRY_SESSION_SECRET = $privateConfig.sessionSecret
+  $env:DSH_LOCAL_REGISTRY_MAILBOX_KEY = $privateConfig.mailboxKey
   $registry = Start-Process -FilePath $NodePath `
     -ArgumentList @('--import', 'tsx/esm', 'src/dsh.ts', '--profile', 'registry', '--patch', (Join-Path $PSScriptRoot 'registry-keycloak-local.example.patch.yml')) `
     -WorkingDirectory $repositoryRoot `

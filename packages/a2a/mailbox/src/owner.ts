@@ -4,8 +4,10 @@ import { z } from 'zod'
 import { MailboxError, requireMailbox, validateLimits } from './record.ts'
 import type { MailboxLimits } from './types.ts'
 
-function specification<T>(name: string, parse: (value: unknown) => T) {
-  return defineDomain({ name, version: 1, layout: 'single', tables: { records: domainTable<string, T>(z.unknown().transform(parse)) } })
+function specification<T>(name: string, tenantId: string | undefined, parse: (value: unknown) => T) {
+  return defineDomain({ name, version: 1, layout: 'single',
+    ...(tenantId === undefined ? {} : { tenantId }),
+    tables: { records: domainTable<string, T>(z.unknown().transform(parse)) } })
 }
 
 /** Internal owner shared by Registry queue and separate instance-local receipt facility. */
@@ -84,11 +86,12 @@ export class RecordOwner<T> {
  * @returns Validated owner; caller must await close. */
 export async function openOwner<T>(facility: DomainFacility, name: string, limits: MailboxLimits, signal: AbortSignal,
   parse: (value: unknown) => T, keyOf: (value: T) => string,
-  occupiesRequestCapacity: (value: T) => boolean = () => true): Promise<RecordOwner<T>> {
+  occupiesRequestCapacity: (value: T) => boolean = () => true,
+  tenantId?: string): Promise<RecordOwner<T>> {
   validateLimits(limits)
   requireMailbox(!signal.aborted, 'closed')
   let domain: Domain<ReturnType<typeof specification<T>>>
-  try { domain = await facility.open(specification(name, parse)) } catch { throw new MailboxError('invalid-storage') }
+  try { domain = await facility.open(specification(name, tenantId, parse)) } catch { throw new MailboxError('invalid-storage') }
   try {
     requireMailbox(!signal.aborted, 'closed')
     const table = domain.table('records')

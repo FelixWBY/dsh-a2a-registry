@@ -25,6 +25,8 @@ import { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 import { installRegistrySync } from './sync.ts'
 import { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
 import { RegistrySaasImportRouter } from './saas-import-queue.ts'
+import { RegistrySaasQuestionRouter, validateRegistrySaasMailboxCredential } from './saas-question-mailbox.ts'
+import type { RegistryDisclosureOperations } from './operations.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
@@ -80,6 +82,8 @@ export { LocalHarnessOperations } from './local-harness-operations.ts'
 export type { LocalHarnessOperationsConfig } from './local-harness-operations.ts'
 export { RegistrySaasImportQueue, RegistrySaasImportRouter } from './saas-import-queue.ts'
 export type { RegistrySaasImportQueueConfig } from './saas-import-queue.ts'
+export { RegistrySaasQuestionMailbox, RegistrySaasQuestionRouter } from './saas-question-mailbox.ts'
+export type { RegistrySaasQuestionMailboxConfig } from './saas-question-mailbox.ts'
 export { A2A_LOOPBACK_QUESTIONS_PATH, LocalHarnessQuestionOperations } from './local-harness-question-operations.ts'
 export type { LocalHarnessQuestionOperationsConfig } from './local-harness-question-operations.ts'
 export { A2A_LOOPBACK_DISCLOSURES_PATH, A2A_LOOPBACK_DISCLOSURE_KEYS_PATH,
@@ -156,8 +160,11 @@ export const Config: z<Config> = z.transform(schema, (value) => {
   if (value.saas !== undefined && value.ingest?.imports === undefined) {
     throw new z.ValidationError('Registry SaaS requires the durable tenant import queue', {})
   }
-  if (value.saas === undefined && value.ingest?.imports !== undefined) {
-    throw new z.ValidationError('Registry tenant imports require SaaS runtime routing', {})
+  if (value.saas !== undefined && value.ingest?.questions === undefined) {
+    throw new z.ValidationError('Registry SaaS requires the durable tenant question mailbox', {})
+  }
+  if (value.saas === undefined && (value.ingest?.imports !== undefined || value.ingest?.questions !== undefined)) {
+    throw new z.ValidationError('Registry tenant operations require SaaS runtime routing', {})
   }
   if (value.ingest !== undefined && value.mailboxMaintenance !== undefined
     && value.ingest.organizationId !== value.mailboxMaintenance.organizationId) {
@@ -242,6 +249,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (credentials === undefined) {
         throw new Error('Registry SaaS requires registry-runtime inject: [storageDomain, credentials]')
       }
+      await validateRegistrySaasMailboxCredential(credentials, config.ingest.questions!.mailboxKeyEnv)
       const databaseUrl = await credentials.resolve(credentialRef(config.saas.databaseUrlEnv))
       if (databaseUrl === undefined || databaseUrl.value.length === 0) {
         throw new Error('Registry SaaS PostgreSQL credential is unavailable')
@@ -263,6 +271,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       let withdrawRouter: (() => void) | undefined
       let withdrawOperations: (() => void) | undefined
       let withdrawImportBroker: (() => void) | undefined
+      let withdrawQuestionBroker: (() => void) | undefined
       let authenticator: RegistryBindingProducerAuthenticator | undefined
       let withdrawAuthenticator: (() => void) | undefined
       let stopSync: (() => Promise<void>) | undefined
@@ -273,12 +282,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           config.ingest.organizationId, config.saas.maxActiveOrganizations)
         const activeRouter = router
         withdrawRouter = ctx.provide('registryTenantRouter', activeRouter)
-        if (ctx.get('registryDisclosureOperations') !== undefined || ctx.get('registryImportBroker') !== undefined) {
-          throw new Error('Registry SaaS imports cannot replace another operations provider')
+        if (ctx.get('registryDisclosureOperations') !== undefined || ctx.get('registryImportBroker') !== undefined
+          || ctx.get('registryQuestionBroker') !== undefined) {
+          throw new Error('Registry SaaS operations cannot replace another operations provider')
         }
         const importRouter = new RegistrySaasImportRouter(activeRouter)
-        withdrawOperations = ctx.provide('registryDisclosureOperations', importRouter)
+        const questionRouter = new RegistrySaasQuestionRouter(activeRouter)
+        const operations: RegistryDisclosureOperations = Object.freeze({
+          listImportTargets: importRouter.listImportTargets.bind(importRouter),
+          importDisclosure: importRouter.importDisclosure.bind(importRouter),
+          readImport: importRouter.readImport.bind(importRouter),
+          listQuestions: questionRouter.listQuestions.bind(questionRouter),
+          askDisclosure: questionRouter.askDisclosure.bind(questionRouter),
+          readQuestion: questionRouter.readQuestion.bind(questionRouter),
+          cancelQuestion: questionRouter.cancelQuestion.bind(questionRouter),
+        })
+        withdrawOperations = ctx.provide('registryDisclosureOperations', operations)
         withdrawImportBroker = ctx.provide('registryImportBroker', importRouter)
+        withdrawQuestionBroker = ctx.provide('registryQuestionBroker', questionRouter)
         const resolveRuntime = async (organizationId: Parameters<typeof activeRouter.acquireRuntime>[0]) => {
           const lease = await activeRouter.acquireRuntime(organizationId)
           return { store: lease.runtime.store, release: lease.release }
@@ -311,6 +332,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ]))
           outcomes.push(...await Promise.allSettled([ownedAuthenticator?.close()]))
           outcomes.push(...await Promise.allSettled([
+            withdrawQuestionBroker === undefined ? undefined : Promise.resolve().then(withdrawQuestionBroker),
             withdrawImportBroker === undefined ? undefined : Promise.resolve().then(withdrawImportBroker),
             withdrawOperations === undefined ? undefined : Promise.resolve().then(withdrawOperations),
           ]))
@@ -325,6 +347,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ? undefined : Promise.resolve().then(withdrawAuthenticator)])
         await Promise.allSettled([authenticator?.close()])
         await Promise.allSettled([
+          withdrawQuestionBroker === undefined ? undefined : Promise.resolve().then(withdrawQuestionBroker),
           withdrawImportBroker === undefined ? undefined : Promise.resolve().then(withdrawImportBroker),
           withdrawOperations === undefined ? undefined : Promise.resolve().then(withdrawOperations),
         ])
@@ -365,7 +388,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         : 'oidc',
       disclosureCleanup: config.ingest?.maintenance !== undefined,
       mailboxCleanup: config.mailboxMaintenance !== undefined
-        || config.localHarness?.question?.expiryMaintenance !== undefined,
+        || config.localHarness?.question?.expiryMaintenance !== undefined
+        || config.ingest?.questions?.expiryMaintenance !== undefined,
       ...(config.localHarness?.testOnlyRevoke === undefined
         ? {} : { testOnlyRevoke: structuredClone(config.localHarness.testOnlyRevoke) }),
     }), 'registry-app: browser metadata API')

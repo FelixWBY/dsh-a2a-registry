@@ -266,6 +266,7 @@ const secrets = [
     ['DSH_REGISTRY_ALERT_BEARER_TOKEN', 16],
     ['DSH_REGISTRY_OIDC_CLIENT_SECRET', 16],
     ['DSH_REGISTRY_SESSION_SECRET', 32],
+    ['DSH_REGISTRY_MAILBOX_KEY', 32],
   ] : []),
   ...(checkHarness ? [
     ['DSH_REGISTRY_DEVICE_TOKEN', 16],
@@ -273,6 +274,12 @@ const secrets = [
   ] : []),
 ]
 for (const [name, minimumBytes] of secrets) required(name, { secret: true, minimumBytes })
+if (checkRegistry) {
+  const mailboxKey = process.env.DSH_REGISTRY_MAILBOX_KEY?.trim() ?? ''
+  if (mailboxKey.length > 0 && !canonicalBase64Url(mailboxKey, 32)) {
+    issue('DSH_REGISTRY_MAILBOX_KEY must be canonical base64url 32-byte key material')
+  }
+}
 if (checkHarness) {
   const token = process.env.DSH_REGISTRY_DEVICE_TOKEN?.trim() ?? ''
   const privateKey = process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY?.trim() ?? ''

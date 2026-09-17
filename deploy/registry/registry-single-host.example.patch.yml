@@ -1,8 +1,8 @@
 # Single-host production foundation. It deliberately requires the external
-# Credentials service that this repository cannot invent. SaaS producer
-# authentication and tenant import operations are built in; producer authentication
-# does not use a deployment-wide bearer token. Disclosure decryption and questions
-# remain unconfigured and their HTTP capabilities return 501 until providers are added;
+# Credentials service that this repository cannot invent. SaaS producer authentication,
+# tenant imports and encrypted text questions are enabled by the PostgreSQL SaaS patch;
+# producer authentication does not use a deployment-wide bearer token. Disclosure body
+# decryption remains unconfigured and returns 501 until its KMS provider is added;
 # unfinished P-KMS does not by itself prevent Registry startup.
 # Never add localHarness or a test-only identity to this file.
 
