@@ -36,7 +36,8 @@ export { RegistryAccountAuthenticator, type RegistryAuthenticatedAccount } from 
 export { RegistryBillingProvider } from './billing.ts'
 export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, RegistryBillingCheckoutInput,
   RegistryBillingEvent, RegistryBillingEventType, RegistryBillingOrder, RegistryBillingOrderReservation,
-  RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName } from './billing.ts'
+  RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName, RegistryBillingVerifiedEvent,
+  RegistryBillingWebhookHeaders, RegistryBillingWebhookInput } from './billing.ts'
 export { RegistryDisclosureContentProvider } from './disclosure-content-provider.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
@@ -109,6 +110,8 @@ export interface RegistrySaasConfig extends Omit<PostgresRegistryTenancyConfig, 
   databaseUrlEnv: string
   /** Explicitly enable the deployment-owned disclosure content service; false keeps browser reads at 501. */
   disclosureContentProvider: boolean
+  /** Explicitly enable the deployment-owned checkout and verified webhook service. */
+  billingProvider: boolean
   /** Presentation name for the pre-SaaS organization retained during migration. */
   legacyOrganizationName: string
   /** Single-process safety bound for lazily opened organization data-plane runtimes. */
@@ -141,6 +144,7 @@ const schema: z<Config> = z.object({
   saas: z.union([z.object({
     databaseUrlEnv: z.string().role('credential-ref').required(),
     disclosureContentProvider: z.boolean().default(false),
+    billingProvider: z.boolean().default(false),
     schema: z.string().default('registry'),
     schemaMode: z.union([z.const('migrate'), z.const('validate')]).default('migrate'),
     allowUnsafeSharedDatabase: z.boolean().default(false),
@@ -169,6 +173,9 @@ export const Config: z<Config> = z.transform(schema, (value) => {
   }
   if (value.saas !== undefined && value.ingest?.questions === undefined) {
     throw new z.ValidationError('Registry SaaS requires the durable tenant question mailbox', {})
+  }
+  if (value.saas?.billingProvider && value.api?.admission === undefined) {
+    throw new z.ValidationError('Registry SaaS billing provider requires browser direct-peer admission', {})
   }
   if (value.saas === undefined && (value.ingest?.imports !== undefined || value.ingest?.questions !== undefined)) {
     throw new z.ValidationError('Registry tenant operations require SaaS runtime routing', {})
@@ -221,6 +228,13 @@ export const Config: z<Config> = z.transform(schema, (value) => {
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   let saasReadiness: RegistryReadinessProbe | undefined
+  if (config.saas?.billingProvider) {
+    const provider = ctx.get('registryBillingProvider')
+    if (provider === undefined) throw new Error('Registry SaaS billing provider is enabled but unavailable')
+    if (provider.provider !== 'stripe' && provider.provider !== 'alipay') {
+      throw new Error('Registry SaaS billing provider has an unsupported provider name')
+    }
+  }
   if (config.sharedAdmission !== undefined) {
     if (ctx.get('credentials') === undefined) {
       throw new Error('Registry shared admission requires registry-runtime inject: [credentials]')
@@ -402,6 +416,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       mailboxCleanup: config.mailboxMaintenance !== undefined
         || config.localHarness?.question?.expiryMaintenance !== undefined
         || config.ingest?.questions?.expiryMaintenance !== undefined,
+      billingProvider: config.saas?.billingProvider === true,
       ...(config.localHarness?.testOnlyRevoke === undefined
         ? {} : { testOnlyRevoke: structuredClone(config.localHarness.testOnlyRevoke) }),
     }), 'registry-app: browser metadata API')

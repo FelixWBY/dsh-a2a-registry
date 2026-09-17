@@ -75,6 +75,7 @@
       maxValueBytes: 262144
       maxCursorBytes: 4096
       maxOperationInputBytes: 16384
+      maxBillingWebhookBytes: 262144
       admission:
         directPeer:
           capacity: 20

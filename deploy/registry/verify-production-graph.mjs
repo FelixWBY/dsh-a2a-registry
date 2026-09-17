@@ -10,6 +10,8 @@ const BUNDLE_PATCH = resolve(ROOT, 'packages/bundle/registry-app/cordis.patch.ym
 const CREDENTIALS_PROVIDER = '@deepseek-ai/dsh-credentials-local'
 const DISCLOSURE_CONTENT_PROVIDER_ENTRY = 'registry-disclosure-content-provider'
 const DISCLOSURE_CONTENT_PROVIDER_SERVICE = 'registryDisclosureContentProvider'
+const BILLING_PROVIDER_ENTRY = 'registry-billing-provider'
+const BILLING_PROVIDER_SERVICE = 'registryBillingProvider'
 const TEST_CONFIGURATION_VALUES = new Set(['test-only', 'local-test', 'loopback-development'])
 const TEST_ENTRY = /(?:^|[/@_.-])(?:test|mock|fixture)(?:$|[/@_.-])|(?:^|[/@_.-])local-(?:oidc|harness)(?:$|[/@_.-])/iu
 
@@ -144,6 +146,22 @@ export function productionGraphIssues(composedEntries, composeWarnings = []) {
   if (enablesDisclosureContentProvider ? disclosureContentProviders.length !== 1
     : disclosureContentProviders.length !== 0) {
     issues.push(`enabled disclosure content requires exactly one active ${DISCLOSURE_CONTENT_PROVIDER_ENTRY} entry; disabled disclosure content requires none`)
+  }
+  const billingProviders = entries.filter(entry => entry.id === BILLING_PROVIDER_ENTRY)
+  const injectsBillingProvider = Array.isArray(runtime?.inject) && runtime.inject.includes(BILLING_PROVIDER_SERVICE)
+  const enablesBillingProvider = saas?.billingProvider === true
+  if (saas?.billingProvider !== undefined
+    && saas.billingProvider !== true && saas.billingProvider !== false) {
+    issues.push('registry-runtime.saas.billingProvider must be a literal boolean')
+  }
+  if (enablesBillingProvider !== injectsBillingProvider) {
+    issues.push(`registry-runtime.saas.billingProvider and ${BILLING_PROVIDER_SERVICE} injection must be enabled together`)
+  }
+  if (enablesBillingProvider ? billingProviders.length !== 1 : billingProviders.length !== 0) {
+    issues.push(`enabled billing requires exactly one active ${BILLING_PROVIDER_ENTRY} entry; disabled billing requires none`)
+  }
+  if (enablesBillingProvider && record(record(runtimeConfig?.api)?.admission) === undefined) {
+    issues.push('enabled billing requires registry-runtime.api.admission for unauthenticated webhook requests')
   }
   if (saas?.schemaMode !== 'validate') issues.push('registry-runtime.saas.schemaMode must be validate')
   if (saas?.databaseUrlEnv !== 'DSH_REGISTRY_POSTGRES_URL') {

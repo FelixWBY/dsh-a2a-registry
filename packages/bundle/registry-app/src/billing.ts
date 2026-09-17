@@ -67,6 +67,24 @@ export interface RegistryBillingEvent {
   readonly occurredAt: number
 }
 
+/** Lower-cased request headers with every wire value retained in arrival order. */
+export type RegistryBillingWebhookHeaders = Readonly<Record<string, readonly string[]>>
+
+/** Exact bounded request bytes and normalized headers supplied only to the deployment adapter. */
+export interface RegistryBillingWebhookInput {
+  readonly rawBody: Uint8Array
+  readonly headers: RegistryBillingWebhookHeaders
+}
+
+/** Provider result after signature, merchant and timestamp validation. Registry adds provider and payload hash. */
+export interface RegistryBillingVerifiedEvent {
+  readonly organizationId: OrganizationId
+  readonly orderId: string
+  readonly eventId: string
+  readonly eventType: RegistryBillingEventType
+  readonly occurredAt: number
+}
+
 /** Browser-safe provider-neutral order snapshot. */
 export interface RegistryBillingOrder {
   readonly orderId: string
@@ -101,4 +119,7 @@ export abstract class RegistryBillingProvider extends Service {
 
   abstract listPlans(subject: DisclosureSubject, signal: AbortSignal): Promise<readonly RegistryBillingPlan[]>
   abstract createCheckout(input: RegistryBillingCheckoutInput, signal: AbortSignal): Promise<RegistryBillingCheckout>
+  /** Return null only when signature, merchant identity or event freshness validation fails. */
+  abstract verifyWebhook(input: RegistryBillingWebhookInput, signal: AbortSignal):
+    Promise<RegistryBillingVerifiedEvent | null>
 }

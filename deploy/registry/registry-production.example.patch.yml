@@ -9,4 +9,10 @@
 # registryDisclosureContentProvider so Cordis owns their shared lifecycle.
 # Without all three declarations the production graph fails closed; without
 # any of them the Registry intentionally starts with disclosure content at 501.
+# A deployment-owned Stripe or Alipay adapter follows the same lifecycle rule:
+# use the fixed entry id registry-billing-provider, explicitly set
+# registry-runtime.config.saas.billingProvider to true, and include
+# registryBillingProvider in the complete registry-runtime inject list. Without
+# all three declarations checkout and the unauthenticated webhook route remain
+# closed; this example intentionally contains no merchant implementation.
 []

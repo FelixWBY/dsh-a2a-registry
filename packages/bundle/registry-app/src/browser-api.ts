@@ -1,4 +1,5 @@
 /** Same-origin Registry metadata API; account identity remains deployment-provided. */
+import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -25,7 +26,8 @@ import type { RegistryDirectory } from './directory.ts'
 import { RegistryBrowserAdmission, type RegistryBrowserAdmissionConfig,
   type RegistryBrowserAdmissionDecision } from './browser-admission.ts'
 import type { RegistryOperationalRateLimitScope } from './operational-alerts.ts'
-import type { RegistryBillingCheckout, RegistryBillingOrder, RegistryBillingPlan } from './billing.ts'
+import type { RegistryBillingCheckout, RegistryBillingOrder, RegistryBillingPlan, RegistryBillingProvider,
+  RegistryBillingProviderName, RegistryBillingVerifiedEvent, RegistryBillingWebhookHeaders } from './billing.ts'
 import type { RegistryAccount, RegistryAccountId, RegistryOrganizationAccess } from './tenancy.ts'
 import { RegistryTenancyError } from './tenancy.ts'
 import type { RegistryTenantRuntime } from './ingest-runtime.ts'
@@ -43,6 +45,7 @@ const ACCOUNT_PATH = `${API_BASE}/account`
 const ORGANIZATIONS_PATH = `${API_BASE}/organizations`
 const INVITATIONS_PATH = `${API_BASE}/invitations`
 const BILLING_PATH = `${API_BASE}/billing`
+const BILLING_WEBHOOKS_PATH = `${BILLING_PATH}/webhooks`
 const TEST_ONLY_REVOKE_PATH = `${API_BASE}/test-only/revoke-seed`
 const TEST_ONLY_CONFIRM_HEADER = 'x-dsh-local-mvp-confirm'
 const TEST_ONLY_CONFIRM_VALUE = 'revoke-seed'
@@ -66,6 +69,8 @@ export interface RegistryBrowserApiConfig {
   maxCursorBytes: number
   /** Maximum raw UTF-8 JSON bytes accepted by one import or question request. */
   maxOperationInputBytes: number
+  /** Maximum exact raw bytes accepted by one provider webhook. */
+  maxBillingWebhookBytes?: number
   /** Optional operation limits; top-level sharedAdmission can coordinate them across same-host processes. */
   admission?: RegistryBrowserAdmissionConfig
 }
@@ -80,6 +85,8 @@ export interface RegistryBrowserApiRuntimeConfiguration {
   readonly disclosureCleanup: boolean
   /** The mailbox owner started ciphertext expiry scheduling. */
   readonly mailboxCleanup: boolean
+  /** Deployment explicitly enabled the injected billing provider lifecycle. */
+  readonly billingProvider: boolean
   /** Exact one-shot seed withdrawal enabled only by the explicit local MVP overlay. */
   readonly testOnlyRevoke?: {
     readonly mode: 'test-only'
@@ -95,6 +102,7 @@ const UNCONFIGURED_RUNTIME: RegistryBrowserApiRuntimeConfiguration = {
   identityProvider: 'external',
   disclosureCleanup: false,
   mailboxCleanup: false,
+  billingProvider: false,
 }
 
 const positive = () => z.natural().min(1).max(Number.MAX_SAFE_INTEGER).required()
@@ -107,6 +115,7 @@ const trustedProxy = z.object({
 /** Loader schema for the optional browser API. */
 export const Config: z<RegistryBrowserApiConfig> = z.object({
   pageSize: positive(), maxValueBytes: positive(), maxCursorBytes: positive(), maxOperationInputBytes: positive(),
+  maxBillingWebhookBytes: positive().default(262_144),
   admission: z.union([z.object({ directPeer: admissionBucket, account: admissionBucket,
     trustedProxy: z.union([trustedProxy]) })]),
 })
@@ -146,8 +155,11 @@ type ApiRoute =
   | { readonly kind: 'status' }
   | { readonly kind: 'account' }
   | { readonly kind: 'organization-create' }
-  | { readonly kind: 'invitation-preview' | 'invitation-accept' | 'invitation-decline' }
+  | { readonly kind: 'invitation-preview' }
+  | { readonly kind: 'invitation-accept' }
+  | { readonly kind: 'invitation-decline' }
   | { readonly kind: 'test-only-revoke' }
+  | { readonly kind: 'billing-webhook'; readonly provider: RegistryBillingProviderName }
   | TenantApiRoute
 
 type OperationInput =
@@ -253,6 +265,11 @@ function noQuery(url: URL): void {
   if ([...url.searchParams].length !== 0) throw new ApiFailure(400, 'invalid-input')
 }
 
+function isBillingWebhookPrefix(request: IncomingMessage): boolean {
+  const pathname = new URL(request.url ?? '/', 'http://registry.invalid').pathname
+  return pathname === BILLING_WEBHOOKS_PATH || pathname.startsWith(`${BILLING_WEBHOOKS_PATH}/`)
+}
+
 function isJsonContentType(value: string | undefined): boolean {
   if (value === undefined) return false
   const parts = value.split(';').map(part => part.trim())
@@ -309,6 +326,102 @@ async function readJson(request: IncomingMessage, maxBytes: number, signal: Abor
   try { return JSON.parse(text) as unknown } catch {
     throw new ApiFailure(400, 'invalid-input')
   }
+}
+
+async function readRawBody(request: IncomingMessage, maxBytes: number, signal: AbortSignal): Promise<Buffer> {
+  const declared = declaredLength(request)
+  if (declared !== undefined && request.headers['transfer-encoding'] !== undefined) {
+    request.resume()
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  if (declared !== undefined && (declared === 0 || declared > maxBytes)) {
+    request.resume()
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  const chunks: Buffer[] = []
+  let size = 0
+  const stop = (): void => { request.destroy() }
+  signal.addEventListener('abort', stop, { once: true })
+  try {
+    for await (const raw of request) {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as string)
+      size += chunk.byteLength
+      if (size > maxBytes) {
+        request.resume()
+        throw new ApiFailure(400, 'invalid-input')
+      }
+      chunks.push(chunk)
+    }
+  } catch (error) {
+    if (error instanceof ApiFailure) throw error
+    throw new ApiFailure(400, 'invalid-input')
+  } finally {
+    signal.removeEventListener('abort', stop)
+  }
+  if (!request.complete || signal.aborted || size === 0 || declared !== undefined && declared !== size) {
+    throw new ApiFailure(400, 'invalid-input')
+  }
+  return Buffer.concat(chunks, size)
+}
+
+function normalizedWebhookHeaders(request: IncomingMessage): RegistryBillingWebhookHeaders {
+  if (request.rawHeaders.length % 2 !== 0) throw new ApiFailure(400, 'invalid-input')
+  const accumulated = Object.create(null) as Record<string, string[]>
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index]?.toLowerCase()
+    const value = request.rawHeaders[index + 1]
+    if (name === undefined || value === undefined) throw new ApiFailure(400, 'invalid-input')
+    const existing = accumulated[name]
+    if (existing === undefined) accumulated[name] = [value]
+    else existing.push(value)
+  }
+  const normalized = Object.create(null) as Record<string, readonly string[]>
+  for (const [name, values] of Object.entries(accumulated)) normalized[name] = Object.freeze([...values])
+  return Object.freeze(normalized)
+}
+
+const BILLING_EVENT_TYPES = new Set(['checkout-paid', 'checkout-expired', 'checkout-failed', 'refunded', 'disputed'])
+function webhookString(value: unknown, maxBytes: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value) && Buffer.byteLength(value, 'utf8') <= maxBytes
+}
+
+function billingVerifiedEvent(value: RegistryBillingVerifiedEvent): RegistryBillingVerifiedEvent {
+  const event = value as unknown
+  if (event === null || typeof event !== 'object' || Array.isArray(event)) throw new ApiFailure(503, 'unavailable')
+  const eventRecord = event as Record<string, unknown>
+  const eventKeys = ['organizationId', 'orderId', 'eventId', 'eventType', 'occurredAt']
+  if (Object.keys(eventRecord).length !== eventKeys.length
+    || Object.keys(eventRecord).some(key => !eventKeys.includes(key))
+    || typeof eventRecord.organizationId !== 'string' || !IDENTIFIER.test(eventRecord.organizationId)
+    || typeof eventRecord.orderId !== 'string' || !UUID.test(eventRecord.orderId)
+    || !webhookString(eventRecord.eventId, 512)
+    || typeof eventRecord.eventType !== 'string' || !BILLING_EVENT_TYPES.has(eventRecord.eventType)
+    || !Number.isSafeInteger(eventRecord.occurredAt) || (eventRecord.occurredAt as number) < 0) {
+    throw new ApiFailure(503, 'unavailable')
+  }
+  return eventRecord as unknown as RegistryBillingVerifiedEvent
+}
+
+function writeBillingWebhookSuccess(response: ServerResponse, provider: RegistryBillingProviderName): void {
+  const headers: Record<string, string> = {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  }
+  if (provider === 'alipay') {
+    headers['content-length'] = '7'
+    headers['content-type'] = 'text/plain; charset=utf-8'
+    response.writeHead(200, headers)
+    response.end('success')
+  } else {
+    response.writeHead(204, headers)
+    response.end()
+  }
+}
+
+function configuredBillingProvider(ctx: Context,
+  runtime: RegistryBrowserApiRuntimeConfiguration): RegistryBillingProvider | undefined {
+  return runtime.billingProvider ? ctx.get('registryBillingProvider') : undefined
 }
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -1043,6 +1156,15 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
     return { kind: url.pathname.endsWith('/preview') ? 'invitation-preview'
       : url.pathname.endsWith('/accept') ? 'invitation-accept' : 'invitation-decline' }
   }
+  if (url.pathname.startsWith(`${BILLING_WEBHOOKS_PATH}/`)) {
+    noQuery(url)
+    const segments = url.pathname.slice(BILLING_WEBHOOKS_PATH.length + 1).split('/')
+    const provider = segments[0]
+    if (segments.length !== 1 || provider !== 'stripe' && provider !== 'alipay') {
+      throw new ApiFailure(404, 'not-found')
+    }
+    return { kind: 'billing-webhook', provider }
+  }
   let organizationId: OrganizationId | undefined
   if (url.pathname.startsWith(`${ORGANIZATIONS_PATH}/`)) {
     const remainder = url.pathname.slice(ORGANIZATIONS_PATH.length + 1)
@@ -1188,6 +1310,10 @@ function parseRoute(request: IncomingMessage, config: RegistryBrowserApiConfig):
 }
 
 function assertMethod(request: IncomingMessage, route: ApiRoute): void {
+  if (route.kind === 'billing-webhook') {
+    if (request.method !== 'POST') throw new ApiFailure(405, 'method-not-allowed', 'POST')
+    return
+  }
   if (route.kind === 'account' || route.kind === 'organization-create'
     || route.kind === 'invitation-preview' || route.kind === 'invitation-accept'
     || route.kind === 'invitation-decline') {
@@ -1761,6 +1887,9 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
   const mailboxCleanupConfigured = runtime.mailboxCleanup
   const admission = config.admission === undefined ? undefined : new RegistryBrowserAdmission(
     config.admission, undefined, ctx.get('registrySharedAdmission', false))
+  if (runtime.billingProvider && admission === undefined) {
+    throw new Error('Registry billing webhook requires direct-peer admission')
+  }
   const active = new Set<AbortController>()
   let testOnlyRevokeConsumed = false
   const unregister = ctx.webServer.register({ kind: 'prefix', path: API_BASE, handler: async (request, response) => {
@@ -1771,6 +1900,12 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
     request.once('aborted', cancel)
     response.once('close', cancel)
     try {
+      const preAdmittedBillingWebhook = isBillingWebhookPrefix(request)
+      if (preAdmittedBillingWebhook && admission !== undefined) {
+        const address = request.socket.remoteAddress
+        if (address === undefined) throw new ApiFailure(503, 'unavailable')
+        requireAdmission(ctx, admission.admitDirectPeer(address, request.headers['x-forwarded-for']), 'client-address')
+      }
       const route = parseRoute(request, config)
       if (route.kind === 'test-only-revoke' && (runtime.testOnlyRevoke?.mode !== 'test-only'
         || !isDirectLoopback(request.socket.remoteAddress) || admission === undefined)) {
@@ -1787,6 +1922,39 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         const address = request.socket.remoteAddress
         if (address === undefined) throw new ApiFailure(503, 'unavailable')
         requireAdmission(ctx, admission.admitDirectPeer(address, request.headers['x-forwarded-for']), 'client-address')
+      }
+      if (route.kind === 'billing-webhook') {
+        const provider = configuredBillingProvider(ctx, runtime)
+        if (provider === undefined) {
+          request.resume()
+          throw new ApiFailure(501, 'operation-not-configured')
+        }
+        if (provider.provider !== route.provider) {
+          request.resume()
+          throw new ApiFailure(404, 'not-found')
+        }
+        const router = ctx.get('registryTenantRouter')
+        if (router === undefined) {
+          request.resume()
+          throw new ApiFailure(503, 'registry-not-configured')
+        }
+        const rawBody = await readRawBody(request, config.maxBillingWebhookBytes ?? 262_144, controller.signal)
+        const payloadHash = createHash('sha256').update(rawBody).digest('hex')
+        const supplied = await provider.verifyWebhook({
+          rawBody,
+          headers: normalizedWebhookHeaders(request),
+        }, controller.signal)
+        requireOperationActive(controller.signal)
+        if (supplied === null) throw new ApiFailure(400, 'invalid-input')
+        const verified = billingVerifiedEvent(supplied)
+        await router.tenancy.applyVerifiedBillingEvent({
+          ...verified,
+          provider: route.provider,
+          payloadHash,
+        })
+        requireOperationActive(controller.signal)
+        writeBillingWebhookSuccess(response, route.provider)
+        return
       }
       const input = route.kind === 'operation'
         ? await operationInput(request, route.action, config, controller.signal) : undefined
@@ -1850,8 +2018,8 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
           rateLimits: admission === undefined ? 'unconfigured' : 'configured',
           disclosureCleanup: disclosureCleanupConfigured ? 'configured' : 'unconfigured',
           mailboxCleanup: mailboxCleanupConfigured ? 'configured' : 'unconfigured',
-          billing: ctx.get('registryBillingProvider') === undefined ? 'unconfigured' : 'configured',
-          billingProvider: ctx.get('registryBillingProvider')?.provider ?? 'unconfigured',
+          billing: configuredBillingProvider(ctx, runtime) === undefined ? 'unconfigured' : 'configured',
+          billingProvider: configuredBillingProvider(ctx, runtime)?.provider ?? 'unconfigured',
         })
         return
       }
@@ -2031,7 +2199,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         if (route.organizationId === undefined) throw new ApiFailure(404, 'not-found')
         const { identity, account } = await billingOwner(ctx, request, controller.signal, route.organizationId)
         const subject = account.subject
-        const provider = ctx.get('registryBillingProvider')
+        const provider = configuredBillingProvider(ctx, runtime)
         const router = ctx.get('registryTenantRouter')
         if (provider === undefined || router === undefined) throw new ApiFailure(501, 'operation-not-configured')
         if (admission !== undefined) requireAdmission(ctx, admission.admitAccount(subject.organizationId,
@@ -2200,6 +2368,7 @@ export function installRegistryBrowserApi(ctx: Context, config: RegistryBrowserA
         }
       }
     } catch (error) {
+      if (!request.complete && !request.destroyed) request.resume()
       if (!response.headersSent && !response.destroyed) fail(response, mapFailure(error))
     } finally {
       tenantLease?.release()

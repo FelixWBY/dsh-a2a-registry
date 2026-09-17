@@ -81,6 +81,26 @@ test('installable production graph is closed and rejects unsafe deployment mutat
       entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
       entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
     }, /requires exactly one active registry-disclosure-content-provider entry/u],
+    ['billing provider missing runtime injection', entries => {
+      entries.push({ id: 'registry-billing-provider', name: '@example/registry-billing-provider' })
+      entry(entries, 'registry-runtime').config.saas.billingProvider = true
+    }, /billingProvider and registryBillingProvider injection must be enabled together/u],
+    ['orphan billing provider injection', entries => {
+      entry(entries, 'registry-runtime').inject.push('registryBillingProvider')
+    }, /billingProvider and registryBillingProvider injection must be enabled together/u],
+    ['billing provider entry without explicit enablement', entries => entries.push({
+      id: 'registry-billing-provider', name: '@example/registry-billing-provider',
+    }), /disabled billing requires none/u],
+    ['enabled billing provider missing fixed entry', entries => {
+      entry(entries, 'registry-runtime').config.saas.billingProvider = true
+      entry(entries, 'registry-runtime').inject.push('registryBillingProvider')
+    }, /requires exactly one active registry-billing-provider entry/u],
+    ['enabled billing provider missing admission', entries => {
+      entries.push({ id: 'registry-billing-provider', name: '@example/registry-billing-provider' })
+      entry(entries, 'registry-runtime').config.saas.billingProvider = true
+      entry(entries, 'registry-runtime').inject.push('registryBillingProvider')
+      delete entry(entries, 'registry-runtime').config.api.admission
+    }, /enabled billing requires registry-runtime\.api\.admission/u],
     ['local Harness', entries => { entry(entries, 'registry-runtime').config.localHarness = {} },
       /registry-runtime\.localHarness must not be present/u],
     ['test plugin', entries => entries.push({ id: 'registry-test-fixture', name: '@example/registry-test-fixture' }),
@@ -99,6 +119,12 @@ test('installable production graph is closed and rejects unsafe deployment mutat
   entry(withDisclosureContentProvider, 'registry-runtime').config.saas.disclosureContentProvider = true
   entry(withDisclosureContentProvider, 'registry-runtime').inject.push('registryDisclosureContentProvider')
   assert.deepEqual(productionGraphIssues(withDisclosureContentProvider), [])
+
+  const withBillingProvider = structuredClone(accepted)
+  withBillingProvider.push({ id: 'registry-billing-provider', name: '@example/registry-billing-provider' })
+  entry(withBillingProvider, 'registry-runtime').config.saas.billingProvider = true
+  entry(withBillingProvider, 'registry-runtime').inject.push('registryBillingProvider')
+  assert.deepEqual(productionGraphIssues(withBillingProvider), [])
 
   const unit = readFileSync(new URL('../deploy/registry/dsh-registry.service.example', import.meta.url), 'utf8')
   assert.match(unit, /^ExecStartPre=.*verify-production-graph\.mjs .*registry-single-host\.example\.patch\.yml .*registry-postgres\.example\.patch\.yml .*registry-production\.patch\.yml$/mu)
