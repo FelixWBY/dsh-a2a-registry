@@ -65,6 +65,22 @@ test('installable production graph is closed and rejects unsafe deployment mutat
     ['wrong mailbox secret', entries => {
       entry(entries, 'registry-runtime').config.ingest.questions.mailboxKeyEnv = 'DSH_REGISTRY_POSTGRES_URL'
     }, /questions must use DSH_REGISTRY_MAILBOX_KEY/u],
+    ['disclosure content provider missing runtime injection', entries => {
+      entries.push({
+        id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
+      })
+      entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
+    }, /disclosureContentProvider and registryDisclosureContentProvider injection must be enabled together/u],
+    ['orphan disclosure content provider injection', entries => {
+      entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
+    }, /disclosureContentProvider and registryDisclosureContentProvider injection must be enabled together/u],
+    ['provider entry without explicit enablement', entries => entries.push({
+      id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
+    }), /disabled disclosure content requires none/u],
+    ['enabled provider missing fixed entry', entries => {
+      entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
+      entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
+    }, /requires exactly one active registry-disclosure-content-provider entry/u],
     ['local Harness', entries => { entry(entries, 'registry-runtime').config.localHarness = {} },
       /registry-runtime\.localHarness must not be present/u],
     ['test plugin', entries => entries.push({ id: 'registry-test-fixture', name: '@example/registry-test-fixture' }),
@@ -75,6 +91,14 @@ test('installable production graph is closed and rejects unsafe deployment mutat
     mutate(entries)
     assert.match(productionGraphIssues(entries).join('\n'), expected, label)
   }
+
+  const withDisclosureContentProvider = structuredClone(accepted)
+  withDisclosureContentProvider.push({
+    id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
+  })
+  entry(withDisclosureContentProvider, 'registry-runtime').config.saas.disclosureContentProvider = true
+  entry(withDisclosureContentProvider, 'registry-runtime').inject.push('registryDisclosureContentProvider')
+  assert.deepEqual(productionGraphIssues(withDisclosureContentProvider), [])
 
   const unit = readFileSync(new URL('../deploy/registry/dsh-registry.service.example', import.meta.url), 'utf8')
   assert.match(unit, /^ExecStartPre=.*verify-production-graph\.mjs .*registry-single-host\.example\.patch\.yml .*registry-postgres\.example\.patch\.yml .*registry-production\.patch\.yml$/mu)

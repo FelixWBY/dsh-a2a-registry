@@ -2,4 +2,11 @@
 # /etc/dsh/registry-production.patch.yml and add only reviewed production
 # providers or overrides. The Registry service applies the checked single-host
 # and PostgreSQL layers before this file.
+# A deployment-owned disclosure content plugin must use the fixed entry id
+# registry-disclosure-content-provider. The same overlay must explicitly set
+# registry-runtime.config.saas.disclosureContentProvider to true and replace
+# the complete registry-runtime inject list with storageDomain, credentials and
+# registryDisclosureContentProvider so Cordis owns their shared lifecycle.
+# Without all three declarations the production graph fails closed; without
+# any of them the Registry intentionally starts with disclosure content at 501.
 []

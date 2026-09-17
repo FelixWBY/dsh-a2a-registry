@@ -8,6 +8,8 @@ import { composeEntries, loadOverlayPatches } from '@deepseek-ai/dsh-app-boot'
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const BUNDLE_PATCH = resolve(ROOT, 'packages/bundle/registry-app/cordis.patch.yml')
 const CREDENTIALS_PROVIDER = '@deepseek-ai/dsh-credentials-local'
+const DISCLOSURE_CONTENT_PROVIDER_ENTRY = 'registry-disclosure-content-provider'
+const DISCLOSURE_CONTENT_PROVIDER_SERVICE = 'registryDisclosureContentProvider'
 const TEST_CONFIGURATION_VALUES = new Set(['test-only', 'local-test', 'loopback-development'])
 const TEST_ENTRY = /(?:^|[/@_.-])(?:test|mock|fixture)(?:$|[/@_.-])|(?:^|[/@_.-])local-(?:oidc|harness)(?:$|[/@_.-])/iu
 
@@ -128,6 +130,21 @@ export function productionGraphIssues(composedEntries, composeWarnings = []) {
     issues.push('registry-runtime must inject storageDomain and credentials')
   }
   const saas = requiredRecord(runtimeConfig?.saas, 'registry-runtime.saas', issues)
+  const disclosureContentProviders = entries.filter(entry => entry.id === DISCLOSURE_CONTENT_PROVIDER_ENTRY)
+  const injectsDisclosureContentProvider = Array.isArray(runtime?.inject)
+    && runtime.inject.includes(DISCLOSURE_CONTENT_PROVIDER_SERVICE)
+  const enablesDisclosureContentProvider = saas?.disclosureContentProvider === true
+  if (saas?.disclosureContentProvider !== undefined
+    && saas.disclosureContentProvider !== true && saas.disclosureContentProvider !== false) {
+    issues.push('registry-runtime.saas.disclosureContentProvider must be a literal boolean')
+  }
+  if (enablesDisclosureContentProvider !== injectsDisclosureContentProvider) {
+    issues.push(`registry-runtime.saas.disclosureContentProvider and ${DISCLOSURE_CONTENT_PROVIDER_SERVICE} injection must be enabled together`)
+  }
+  if (enablesDisclosureContentProvider ? disclosureContentProviders.length !== 1
+    : disclosureContentProviders.length !== 0) {
+    issues.push(`enabled disclosure content requires exactly one active ${DISCLOSURE_CONTENT_PROVIDER_ENTRY} entry; disabled disclosure content requires none`)
+  }
   if (saas?.schemaMode !== 'validate') issues.push('registry-runtime.saas.schemaMode must be validate')
   if (saas?.databaseUrlEnv !== 'DSH_REGISTRY_POSTGRES_URL') {
     issues.push('registry-runtime.saas.databaseUrlEnv must be DSH_REGISTRY_POSTGRES_URL')

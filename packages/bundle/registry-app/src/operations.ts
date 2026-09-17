@@ -149,9 +149,9 @@ export interface RegistryDisclosureQuestionListOptions {
   readonly cursor?: string
 }
 
-/** Deployment-owned execution bridge; the Registry browser API supplies no implementation. */
+/** Host-owned operation surface. In SaaS mode the Registry composes this surface and only delegates content projection. */
 export interface RegistryDisclosureOperations {
-  /** Decrypt one already authorized confirmed prefix using Registry-owned local-test Credentials.
+  /** Project one already authorized confirmed prefix into browser-safe plaintext.
    * The browser adapter must freshly authorize the same fixed checkpoint both before and after this call.
    * @param prefix - Complete reader-verified prefix selected by its exact checkpoint.
    * @param maxResponseBytes - Complete plaintext response bound.
@@ -209,7 +209,7 @@ export interface RegistryDisclosureOperations {
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    /** Present only while a deployment-owned import and A2A execution bridge is active. */
+    /** Present only while a complete Registry-owned or standalone operation surface is active. */
     registryDisclosureOperations: RegistryDisclosureOperations
   }
 }

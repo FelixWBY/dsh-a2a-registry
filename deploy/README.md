@@ -36,7 +36,7 @@ npm start -- \
   --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板，内建 provider 只解析启动进程继承的环境变量，不能读取 `.env`、本地凭据文件或写入秘密；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。由于 Loader 的 `config` patch 是整体替换，PostgreSQL 层显式携带完整 OIDC、API、限流、告警和同步配置，不能删成看似等价的局部片段。`verify-production-graph.mjs` 会按启动顺序合成同一组 patch，并在缺少 credentials、非回环监听、非 PostgreSQL domain、迁移模式、不安全共库、本地／测试插件或非 introspection OIDC 时阻止启动。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；真实 Harness 仍需实现提问消费、隔离执行与回复提交。该模板尚未配置披露解密提供方，因此固定 checkpoint 正文读取接口仍返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板，内建 provider 只解析启动进程继承的环境变量，不能读取 `.env`、本地凭据文件或写入秘密；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。由于 Loader 的 `config` patch 是整体替换，PostgreSQL 层显式携带完整 OIDC、API、限流、告警和同步配置，不能删成看似等价的局部片段。`verify-production-graph.mjs` 会按启动顺序合成同一组 patch，并在缺少 credentials、非回环监听、非 PostgreSQL domain、迁移模式、不安全共库、本地／测试插件或非 introspection OIDC 时阻止启动。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；真实 Harness 仍需实现提问消费、隔离执行与回复提交。Registry 已提供独立 `registryDisclosureContentProvider` 接线层，但模板尚未配置真实实现，因此固定 checkpoint 正文读取接口仍返回 501；生产 overlay 必须使用固定条目标识 `registry-disclosure-content-provider`、显式设置 `saas.disclosureContentProvider: true`，并将 `registryDisclosureContentProvider` 加入运行时 `inject`。生产图门禁要求三项同时存在或同时缺省，避免并发加载、卸载或热替换留下失效实例；KMS 缺失本身不会阻止 Registry 启动。
 
 ## 公网入口
 

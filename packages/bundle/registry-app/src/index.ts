@@ -26,6 +26,7 @@ import { installRegistrySync } from './sync.ts'
 import { RegistryBindingProducerAuthenticator } from './binding-producer-auth.ts'
 import { RegistrySaasImportRouter } from './saas-import-queue.ts'
 import { RegistrySaasQuestionRouter, validateRegistrySaasMailboxCredential } from './saas-question-mailbox.ts'
+import { createRegistrySaasDisclosureOperations } from './saas-disclosure-operations.ts'
 import { RegistryReadinessProbe } from './readiness.ts'
 import type { RegistryDisclosureOperations } from './operations.ts'
 export type { RegistryDisclosureControl } from './control.ts'
@@ -36,6 +37,7 @@ export { RegistryBillingProvider } from './billing.ts'
 export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, RegistryBillingCheckoutInput,
   RegistryBillingEvent, RegistryBillingEventType, RegistryBillingOrder, RegistryBillingOrderReservation,
   RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName } from './billing.ts'
+export { RegistryDisclosureContentProvider } from './disclosure-content-provider.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
 export { RegistryTenancyError } from './tenancy.ts'
@@ -105,6 +107,8 @@ export const inject = ['webServer', 'loader', 'clientModules']
 export interface RegistrySaasConfig extends Omit<PostgresRegistryTenancyConfig, 'connectionString'> {
   /** Credential reference containing the PostgreSQL URL; the value is never returned to the browser. */
   databaseUrlEnv: string
+  /** Explicitly enable the deployment-owned disclosure content service; false keeps browser reads at 501. */
+  disclosureContentProvider: boolean
   /** Presentation name for the pre-SaaS organization retained during migration. */
   legacyOrganizationName: string
   /** Single-process safety bound for lazily opened organization data-plane runtimes. */
@@ -136,6 +140,7 @@ const schema: z<Config> = z.object({
   oidc: z.union([RegistryOidcAccountAuthConfigSchema]),
   saas: z.union([z.object({
     databaseUrlEnv: z.string().role('credential-ref').required(),
+    disclosureContentProvider: z.boolean().default(false),
     schema: z.string().default('registry'),
     schemaMode: z.union([z.const('migrate'), z.const('validate')]).default('migrate'),
     allowUnsafeSharedDatabase: z.boolean().default(false),
@@ -297,15 +302,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
         const importRouter = new RegistrySaasImportRouter(activeRouter)
         const questionRouter = new RegistrySaasQuestionRouter(activeRouter)
-        const operations: RegistryDisclosureOperations = Object.freeze({
-          listImportTargets: importRouter.listImportTargets.bind(importRouter),
-          importDisclosure: importRouter.importDisclosure.bind(importRouter),
-          readImport: importRouter.readImport.bind(importRouter),
-          listQuestions: questionRouter.listQuestions.bind(questionRouter),
-          askDisclosure: questionRouter.askDisclosure.bind(questionRouter),
-          readQuestion: questionRouter.readQuestion.bind(questionRouter),
-          cancelQuestion: questionRouter.cancelQuestion.bind(questionRouter),
-        })
+        const disclosureContentProvider = config.saas.disclosureContentProvider
+          ? ctx.get('registryDisclosureContentProvider') : undefined
+        if (config.saas.disclosureContentProvider && disclosureContentProvider === undefined) {
+          throw new Error('Registry SaaS disclosure content provider is enabled but unavailable')
+        }
+        const operations: RegistryDisclosureOperations = createRegistrySaasDisclosureOperations(importRouter,
+          questionRouter, disclosureContentProvider)
         withdrawOperations = ctx.provide('registryDisclosureOperations', operations)
         withdrawImportBroker = ctx.provide('registryImportBroker', importRouter)
         withdrawQuestionBroker = ctx.provide('registryQuestionBroker', questionRouter)
