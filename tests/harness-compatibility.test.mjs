@@ -95,6 +95,12 @@ test('Harness compatibility checker accepts only the connection-only composed We
     'tokenEnv: DSH_REGISTRY_DEVICE_TOKEN',
     'tokenEnv: WRONG_TOKEN',
   )), /omitted connection-only field tokenEnv/u)
+  assert.throws(() => assertConnectionOnlyComposition(`${connectionOnly}
+- id: session-controller
+  config:
+    registryDisclosureImport: {}
+    registryA2aConsumer: {}
+`), /unexpectedly enabled registryDisclosureImport/u)
 })
 
 test('Harness compatibility checker requires the full production publication composition', () => {

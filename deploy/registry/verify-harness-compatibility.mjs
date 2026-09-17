@@ -556,8 +556,11 @@ export function assertConnectionOnlyComposition(output) {
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
     'registryA2aConsumer:',
+    'productionDisclosureAuthority',
+    'registryDisclosureKeyPublisher',
+    'a2aDisclosureDecryption:',
   ]) {
-    if (section.includes(forbidden)) fail(`connection-only overlay unexpectedly enabled ${forbidden}`)
+    if (output.includes(forbidden)) fail(`connection-only overlay unexpectedly enabled ${forbidden}`)
   }
 }
 

@@ -72,7 +72,46 @@ npm run verify:harness-compatibility -- `
 
 检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名和静态状态分支只验证 v1 codec 与配置兼容，不证明 WSS 挑战已由真实设备私钥签署，也不把完成与失败样本解释成同一次真实请求的状态轨迹；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
 
-Windows 本地验收可在 `export-env` 后用 `start-bound-harness.ps1` 从独立的 Harness 源码 checkout 启动上述连接专用 overlay。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程，也不会修改 Harness 源码；CLI 从源码的已构建 `apps/cli/lib/bin.js` 读取，工作目录、DSH_HOME 和日志均在外部私有目录。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
+Windows 本地验收不能直接从普通开发 checkout 启动。先把已审查、干净提交的 Harness 按官方发布边界构建并打成 dsh、vendor 和 Landlock tarball，再用 `prepare-bound-harness-runtime.ps1` 在仓库外生成一个受保护、版本化的实体运行包。准备器只接受三组受保护输入：dsh 和 vendor 目录必须由 `publish-order.txt` 精确覆盖，Landlock 目录必须只有 entry 包；所有包必须属于 `@deepseek-ai`，dsh 发布族必须同版本。源包先逐字节复制到受保护 staging 并核对复制前后摘要，npm 只读取该副本；安装后的 lockfile 会固定外部依赖版本与 integrity，实际落盘的依赖树则拒绝混入未由输入 tarball 提供的 DeepSeek 包。省略的跨平台 optional 包仍可出现在 lockfile 中，但不得落盘。准备器固定使用 `--ignore-scripts --omit=optional` 做 hoisted 安装，不复制 pnpm link farm，也不允许第三方生命周期脚本以当前账号执行；外部第三方依赖仍从指定 HTTPS npm registry 获取。当前产物只用于 connection-only 候选，不承诺完整 Agent、PTY 或本机持久化所需的原生安装产物。准备器会实体复制 CLI 到启动器要求的 `apps/cli/lib/bin.js`，复制 Node.js 24+ 和两层 overlay，执行 `--version` 与 connection-only `--dump-config` 烟测，递归拒绝 junction／符号链接，重置 ACL，并生成 tarball 来源摘要与逐文件 SHA-256 清单。整个结果先写同盘随机 staging，再通过目标必须不存在的目录重命名发布；失败只清理本次 staging。
+
+正式 tarball 必须来自干净且受保护的工作树，输出目录也必须预先放在只允许构建账号、`SYSTEM` 和管理员写入的固定盘命名空间内。准备器脚本及其同目录路径门禁本身是启动前信任根，必须先由发布流程核对受审查提交或发行摘要并保护该目录；脚本不能在自身已经被替换后完成可信的自证。`build:official` 会把当前提交写进构建产物，但不会替你拒绝未提交源码；因此当前存在脏改动的 checkout 只能做本地候选验证，不能标作生产发布。发布链与官方工作流保持一致：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm run release:verify --family dsh
+pnpm run build:official
+$packRoot = 'C:\trusted-build\dsh-0.1.2-rc.1-packs'
+pnpm run release:pack --family dsh --out "$packRoot/npm"
+pnpm run release:pack --family vendor --out "$packRoot/npm-vendor"
+pnpm --dir native/landlock-run run build:ts
+pnpm --dir native/landlock-run/packages/entry pack --pack-destination "$packRoot/npm-landlock"
+pnpm run release:verify-packed-install --family dsh `
+  --from "$packRoot/npm" --from "$packRoot/npm-vendor" --from "$packRoot/npm-landlock"
+```
+
+在一个全新的固定盘父目录中准备版本化运行包。父目录与最终内容只允许当前服务账号、`SYSTEM` 和本机管理员写入；下例先创建父目录，再让准备器原子发布子目录。典型实体运行树连同 Node 24 约占 270–390 MiB，这是本地复制与 npm 安装，不是 Docker 镜像下载；第三方依赖的首次网络下载量另计。
+
+```powershell
+$runtimeParent = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh-runtime'
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+$icaclsPath = Join-Path $systemDirectory 'icacls.exe'
+New-Item -ItemType Directory -Path $runtimeParent | Out-Null
+& $icaclsPath $runtimeParent '/inheritance:r' '/grant:r' `
+  "*${currentSid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+if ($LASTEXITCODE -ne 0) { throw '无法限制运行目录 ACL。' }
+
+$runtimeRoot = Join-Path $runtimeParent 'bound-0.1.2-rc.1-reviewed'
+Remove-Item Env:NODE_OPTIONS, Env:NODE_PATH -ErrorAction SilentlyContinue
+& 'C:\trusted-build\dsh-a2a-registry\deploy\registry\prepare-bound-harness-runtime.ps1' `
+  -TarballDirectory @("$packRoot\npm", "$packRoot\npm-vendor", "$packRoot\npm-landlock") `
+  -NodePath 'C:\path\to\node.exe' `
+  -DestinationRoot $runtimeRoot
+```
+
+上述产物必须在真实设备切换前由 `start-bound-harness.ps1` 完成本机 Web 启动验收；它只证明 CLI 与 connection-only 配置可以合成，不证明依赖安装脚本无关。后续完整 Agent／PTY／本机持久化链路若需要 `node-pty`、`koffi` 等安装产物，必须另做“无秘密构建账号生成并签名 → 最终服务账号只物化和复核”的两阶段交付，再实跑相应功能；当前准备器不提供脚本开启开关，也不得在已经保存设备密钥的服务账号中执行第三方安装脚本。
+
+Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动连接专用 overlay。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和 overlay 一起放进受保护目录。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 
 先在真实 Harness 服务账号下创建三个私有目录，并在写入 enrollment 状态／环境文件前关闭继承。启动器会再次检查目录与环境文件的实际 ACL：Allow 条目只可属于当前账号、`SYSTEM` 或本机管理员，私有目录本身必须已关闭继承。日志可能包含一次性 Web 启动 URL，也按凭据处理。以下示例只授权当前账号与 `SYSTEM`；如确需管理员恢复权限，可另外授予 `*S-1-5-32-544`：
 
@@ -88,14 +127,14 @@ foreach ($directory in @($privateRoot, $dshHome, $logDir)) {
 }
 ```
 
-Harness checkout、Node.js 可执行文件、启动器、overlay 与 CA 证书同样是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录和 CA 父目录还必须关闭 ACL 继承。普通 `D:\Felix` 或 Registry 开发 checkout 若继承了 `Authenticated Users: Modify`，就不能承载真实设备凭据；应先在本地固定磁盘的全新私有根目录中安装可信副本，再关闭这些根目录的继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此优先使用未占用的新路径，并以启动器的 ACL 检查结果为准。
+受保护运行包与 `.dsh-private` 必须是两个独立目录；运行包不读取、复制或创建 enrollment、设备密钥、CA、真实 `DSH_HOME` 或日志。Node.js、Harness、启动器、overlay 与 CA 证书都是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录和 CA 父目录还必须关闭 ACL 继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此只在未占用的新版本目录发布，并以准备器和启动器的 ACL 检查结果为准。
 
-确认 `apps/cli/lib/bin.js` 已由对应 Harness checkout 构建、线协议检查通过、3080 空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行：
+确认线协议检查通过、运行包的 `runtime-files.sha256` 已保存、3080 空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行：
 
 ```powershell
-pwsh -NoProfile -File 'C:\dsh-runtime\dsh-a2a-registry\deploy\registry\start-bound-harness.ps1' `
-  -HarnessRoot 'C:\dsh-runtime\deepseek-harness' `
-  -NodePath 'C:\path\to\node.exe' `
+pwsh -NoProfile -File "$runtimeRoot\launcher\start-bound-harness.ps1" `
+  -HarnessRoot "$runtimeRoot\harness" `
+  -NodePath "$runtimeRoot\node\node.exe" `
   -EnvFile 'C:\dsh-private\harness-registry.env' `
   -CaCertificate 'C:\dsh-private\registry-ca.pem' `
   -DshHome 'C:\dsh-private\home' `

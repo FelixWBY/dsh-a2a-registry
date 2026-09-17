@@ -223,6 +223,7 @@ $LogDirectory = Resolve-ExistingDirectory $LogDirectory 'LogDirectory'
 if (-not [IO.Path]::GetFileName($NodePath).Equals('node.exe', [StringComparison]::OrdinalIgnoreCase)) {
   throw 'NodePath 必须指向 node.exe。'
 }
+Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $NodePath) 'NodePath 父目录'
 Assert-NoUnauthorizedWriteAcl $NodePath 'NodePath' $false
 $nodeVersion = @(& $NodePath -p 'process.versions.node' 2>$null)
 if ($LASTEXITCODE -ne 0 -or $nodeVersion.Count -ne 1 -or $nodeVersion[0] -notmatch '^[0-9]+\.') {
@@ -242,7 +243,6 @@ Assert-NoUntrustedNamespaceReplacement $LogDirectory 'LogDirectory'
 Assert-NoUntrustedNamespaceReplacement $HarnessRoot 'HarnessRoot'
 Assert-NoUntrustedNamespaceReplacement $launcherRoot '启动器目录'
 Assert-NoUntrustedNamespaceReplacement $caParent 'CaCertificate 父目录'
-Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $NodePath) 'NodePath 父目录'
 Assert-OutsideDirectory $EnvFile $HarnessRoot 'EnvFile'
 Assert-OutsideDirectory $DshHome $HarnessRoot 'DshHome'
 Assert-OutsideDirectory $LogDirectory $HarnessRoot 'LogDirectory'

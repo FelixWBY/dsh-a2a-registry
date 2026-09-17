@@ -128,3 +128,33 @@ test('systemd production examples disable runtime injection, core dumps and priv
     assert.match(unit, /^PrivateDevices=true$/mu, `${relativePath} must hide host devices`)
   }
 })
+
+test('Windows Harness runtime preparer declares the static release and ACL gates', () => {
+  const preparer = readFileSync(new URL(
+    '../deploy/registry/prepare-bound-harness-runtime.ps1', import.meta.url), 'utf8')
+  assert.match(preparer, /--install-strategy=hoisted/u)
+  assert.match(preparer, /'--ignore-scripts', '--omit=optional'/u)
+  assert.doesNotMatch(preparer, /EnableLifecycleScripts/u)
+  assert.doesNotMatch(preparer, /Get-Command 'tar\.exe'|& icacls\.exe/u)
+  const nodeTrust = preparer.indexOf(
+    "Assert-NoUntrustedNamespaceReplacement $nodeSourceRoot 'NodePath 父目录'")
+  const nodeExecution = preparer.indexOf("$nodeVersion = @(& $NodePath -p 'process.versions.node'")
+  assert.ok(nodeTrust >= 0 && nodeExecution > nodeTrust,
+    'the source Node.js namespace must be trusted before execution')
+  assert.match(preparer, /Assert-NoReparsePointsRecursively \$stagingRoot/u)
+  assert.match(preparer, /runtime-files\.sha256/u)
+  assert.match(preparer, /Assert-PublishOrder/u)
+  assert.match(preparer, /runtime-package-lock\.json/u)
+  assert.match(preparer, /未由输入 tarball 提供的 DeepSeek 包/u)
+  assert.match(preparer, /\[IO\.Directory\]::Move\(\$stagingRoot, \$DestinationRoot\)/u)
+  assert.match(preparer, /productionRegistryConnection:/u)
+  assert.match(preparer, /Remove-StagingDirectory \$stagingRoot \$destinationParent \$stagingName/u)
+
+  const launcher = readFileSync(new URL(
+    '../deploy/registry/start-bound-harness.ps1', import.meta.url), 'utf8')
+  const namespaceCheck = launcher.indexOf(
+    "Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $NodePath) 'NodePath 父目录'")
+  const nodeProbe = launcher.indexOf("$nodeVersion = @(& $NodePath -p 'process.versions.node'")
+  assert.ok(namespaceCheck >= 0 && nodeProbe > namespaceCheck,
+    'Node.js must not execute before its parent namespace is trusted')
+})

@@ -138,10 +138,13 @@ function Assert-NoUnauthorizedWriteAcl(
   $allowedSids = @(
     $currentSid,
     'S-1-5-18',       # LocalSystem
-    'S-1-5-32-544'    # BUILTIN\Administrators
+    'S-1-5-32-544',   # BUILTIN\Administrators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # TrustedInstaller
   )
-  $writeMask = [Security.AccessControl.FileSystemRights]::Write `
-    -bor [Security.AccessControl.FileSystemRights]::Modify `
+  $writeMask = [Security.AccessControl.FileSystemRights]::WriteData `
+    -bor [Security.AccessControl.FileSystemRights]::AppendData `
+    -bor [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes `
+    -bor [Security.AccessControl.FileSystemRights]::WriteAttributes `
     -bor [Security.AccessControl.FileSystemRights]::Delete `
     -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles `
     -bor [Security.AccessControl.FileSystemRights]::ChangePermissions `
@@ -156,8 +159,9 @@ function Assert-NoUnauthorizedWriteAcl(
   }
   foreach ($rule in $acl.Access) {
     if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+    if (($rule.FileSystemRights -band $writeMask) -eq 0) { continue }
     $sid = Get-Sid $rule.IdentityReference
-    if ($allowedSids -notcontains $sid -and (($rule.FileSystemRights -band $writeMask) -ne 0)) {
+    if ($allowedSids -notcontains $sid) {
       throw "$Label lets an unauthorized identity modify executable content."
     }
   }
@@ -187,9 +191,9 @@ function Assert-NoUntrustedNamespaceReplacement([string]$Directory, [string]$Lab
       if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
         continue
       }
+      if (($rule.FileSystemRights -band $namespaceMutationMask) -eq 0) { continue }
       $sid = Get-Sid $rule.IdentityReference
-      if ($trustedSids -notcontains $sid -and
-        (($rule.FileSystemRights -band $namespaceMutationMask) -ne 0)) {
+      if ($trustedSids -notcontains $sid) {
         throw "$Label namespace can be replaced by an unauthorized identity."
       }
     }

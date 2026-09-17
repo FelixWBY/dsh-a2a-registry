@@ -11,6 +11,7 @@ import { assertPrivateWindowsSecretPath } from '../deploy/registry/enroll-regist
 
 const repository = dirname(dirname(fileURLToPath(import.meta.url)))
 const enrollment = join(repository, 'deploy', 'registry', 'enroll-registry-device.mjs')
+const windowsGate = join(repository, 'deploy', 'registry', 'windows-private-path-gate.ps1')
 
 function run(command, arguments_, options) {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -65,6 +66,21 @@ test('Windows private-path gate is injectable and skipped on non-Windows hosts',
   assert.deepEqual(calls, [[
     'C:\\private\\device.json', 'NewFile', { OS: 'Windows_NT', SystemRoot: 'C:\\Windows' },
   ]])
+})
+
+test('Windows executable trust gate accepts protected system tools and ignores read-only localized principals', {
+  skip: process.platform !== 'win32' ? 'Windows ACL integration test' : false,
+}, () => {
+  const quotedGate = windowsGate.replaceAll("'", "''")
+  windowsCommand('pwsh.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    `$ErrorActionPreference='Stop'; . '${quotedGate}'; `
+      + '$system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System); '
+      + "Assert-NoUntrustedNamespaceReplacement $system 'system'; "
+      + "foreach($name in 'icacls.exe','tar.exe','cmd.exe'){"
+      + "$path=Resolve-ExistingFile (Join-Path $system $name) $name;"
+      + 'Assert-NoUnauthorizedWriteAcl $path $name $false}',
+  ])
 })
 
 test('Windows enrollment rejects an inherited parent ACL before network or state-file creation', {
