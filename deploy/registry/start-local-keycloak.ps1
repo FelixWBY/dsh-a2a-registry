@@ -60,7 +60,10 @@ function Wait-File([string]$path, [int]$attempts = 60) {
 
 function Wait-Https([string]$uri, [string]$caCertificate, [int]$attempts = 60) {
   for ($attempt = 0; $attempt -lt $attempts; $attempt += 1) {
-    & curl.exe --silent --fail --cacert $caCertificate --noproxy localhost --output NUL $uri 2>$null
+    # The local Caddy CA has no public CRL. Schannel still validates its chain and hostname,
+    # while --ssl-no-revoke prevents an unrelated online revocation lookup from failing closed.
+    & curl.exe --silent --fail --ssl-no-revoke --cacert $caCertificate `
+      --noproxy localhost --output NUL $uri 2>$null
     if ($LASTEXITCODE -eq 0) { return }
     Start-Sleep -Seconds 1
   }
