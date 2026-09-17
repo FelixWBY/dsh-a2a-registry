@@ -405,22 +405,22 @@ async function postgresState(database, schema) {
 
 async function backupRoleState(database, schema) {
   const role = await database.query(
-    `select current_role.rolname as current_user,
-       current_role.rolcanlogin as can_login,
-       current_role.rolinherit as inherits,
-       current_role.rolconnlimit as connection_limit,
-       current_role.rolsuper as superuser,
-       current_role.rolbypassrls as bypass_rls,
-       current_role.rolcreatedb as create_database,
-       current_role.rolcreaterole as create_role,
-       current_role.rolreplication as replication,
+    `select selected_role.rolname as current_user,
+       selected_role.rolcanlogin as can_login,
+       selected_role.rolinherit as inherits,
+       selected_role.rolconnlimit as connection_limit,
+       selected_role.rolsuper as superuser,
+       selected_role.rolbypassrls as bypass_rls,
+       selected_role.rolcreatedb as create_database,
+       selected_role.rolcreaterole as create_role,
+       selected_role.rolreplication as replication,
        exists (
          select 1 from pg_auth_members as membership
-         where membership.member = current_role.oid or membership.roleid = current_role.oid
+         where membership.member = selected_role.oid or membership.roleid = selected_role.oid
        ) as unexpected_membership,
        has_database_privilege(current_user, current_database(), 'CREATE') as can_create_database_object,
        has_database_privilege(current_user, current_database(), 'TEMP') as can_create_temporary_object
-     from pg_roles as current_role where current_role.rolname = current_user`)
+     from pg_roles as selected_role where selected_role.rolname = current_user`)
   const selectedRole = role.rows[0]
   if (role.rows.length !== 1 || selectedRole?.current_user !== 'registry_backup'
     || selectedRole.can_login !== true || selectedRole.inherits !== false
@@ -850,7 +850,7 @@ export async function verifyBackupSet({ directory, environment = process.env, ru
     }) })
 }
 
-function parseCreate(arguments_) {
+export function parseCreate(arguments_) {
   let schema
   let quiesced = false
   let destination
@@ -873,7 +873,7 @@ function parseCreate(arguments_) {
   if (schema === undefined || destination === undefined || !quiesced) {
     fail('usage: create --schema <schema> --quiesced <absolute-new-directory>')
   }
-  return { schema, destination }
+  return { schema, destination, quiesced }
 }
 
 export async function main(arguments_ = process.argv.slice(2), environment = process.env) {

@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { createBackupSet, safeMessage, verifyBackupSet } from '../deploy/registry/backup-postgres-saas-state.mjs'
+import { createBackupSet, parseCreate, safeMessage,
+  verifyBackupSet } from '../deploy/registry/backup-postgres-saas-state.mjs'
 
 function sqlite(path, version, value) {
   const database = new DatabaseSync(path)
@@ -50,7 +51,7 @@ function migratorPostgres() {
 function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () => {} } = {}) {
   return Object.freeze({
     async query(statement) {
-      if (statement.includes('from pg_roles as current_role')) return { rows: [{
+      if (statement.includes('from pg_roles as selected_role')) return { rows: [{
         current_user: 'registry_backup', can_login: true, inherits: false, connection_limit: 2,
         superuser: false, bypass_rls: true,
         create_database: false, create_role: false, replication: false, can_read_all_stats: true,
@@ -92,6 +93,16 @@ test('backup role provisioning keeps global default ACLs in its exact scan', () 
   assert.match(sql, /defaults\.defaclobjtype in \('r', 'S', 'f', 'T', 'n', 'L'\)/u)
   assert.match(sql, /default_acl_count <> 2 or allowed_default_acl_count <> 2/u)
   assert.match(sql, /allowed_default_acl_types <> 2/u)
+})
+
+test('backup CLI preserves the explicit quiesced assertion', () => {
+  assert.deepEqual(parseCreate([
+    '--schema', 'registry_saas', '--quiesced', '/secure/registry-backup',
+  ]), {
+    schema: 'registry_saas',
+    destination: '/secure/registry-backup',
+    quiesced: true,
+  })
 })
 
 test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable, and tamper evident', async () => {
