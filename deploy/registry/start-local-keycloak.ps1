@@ -1,5 +1,4 @@
 param(
-  [string]$KeycloakPath = '',
   [string]$NodePath = '',
   [switch]$RegistryOnly
 )
@@ -8,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $artifactRoot = Join-Path $repositoryRoot '.artifacts\registry-oidc-local'
 $privateConfigPath = Join-Path $artifactRoot 'private-runtime.json'
-if ($KeycloakPath -eq '') { $KeycloakPath = Join-Path $repositoryRoot '.artifacts\keycloak-26.7.3' }
+$composePath = Join-Path $PSScriptRoot 'keycloak-local.compose.yaml'
 if ($NodePath -eq '') {
   $NodePath = (Get-Command node -ErrorAction Stop).Source
   if ((& $NodePath -p "Number(process.versions.node.split('.')[0])") -lt 24) {
@@ -18,18 +17,16 @@ if ($NodePath -eq '') {
       | Select-Object -Last 1 -ExpandProperty FullName
   }
 }
-$javaHome = $env:JAVA_HOME
-if ([string]::IsNullOrWhiteSpace($javaHome)) {
-  throw 'Java 21 was not found; set JAVA_HOME before starting the local OIDC stack'
-}
-if ((Split-Path -Leaf $javaHome) -eq 'bin' -and (Test-Path -LiteralPath (Join-Path $javaHome 'java.exe'))) {
-  $javaHome = Split-Path -Parent $javaHome
-}
-
 function New-Secret([int]$bytes) {
-  return [Convert]::ToBase64String(
-    [Security.Cryptography.RandomNumberGenerator]::GetBytes($bytes)
-  ).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+  $buffer = New-Object byte[] $bytes
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $rng.GetBytes($buffer)
+    return [Convert]::ToBase64String($buffer).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+  } finally {
+    $rng.Dispose()
+    [Array]::Clear($buffer, 0, $buffer.Length)
+  }
 }
 
 function Wait-Http([string]$uri, [int]$attempts = 60) {
@@ -45,29 +42,34 @@ function Wait-Http([string]$uri, [int]$attempts = 60) {
   throw "Service did not become ready: $uri"
 }
 
-foreach ($port in @($(if ($RegistryOnly) { 3181 } else { 3181, 3182 }))) {
-  if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
-    throw "TCP port $port is already in use"
-  }
+if (Get-NetTCPConnection -LocalPort 3181 -State Listen -ErrorAction SilentlyContinue) {
+  throw 'TCP port 3181 is already in use'
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $KeycloakPath 'bin\kc.bat'))) {
-  throw "Keycloak was not found at $KeycloakPath"
-}
 if ($null -eq $NodePath -or -not (Test-Path -LiteralPath $NodePath)) {
   throw 'Node.js 24 or newer was not found; pass -NodePath with its absolute node.exe path'
 }
 if ((& $NodePath -p "Number(process.versions.node.split('.')[0])") -lt 24) {
   throw 'Node.js 24 or newer was not found; pass -NodePath with its absolute node.exe path'
 }
-if (-not (Test-Path -LiteralPath (Join-Path $javaHome 'bin\java.exe'))) {
-  throw "Java 21 was not found at $javaHome"
+if (-not (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
+  $dockerCandidates = @(
+    "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe",
+    'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+  )
+  $dockerPath = $dockerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+  if (-not $dockerPath) { throw 'Docker Desktop is required for the local OIDC stack' }
+  $env:PATH = "$(Split-Path -Parent $dockerPath);$env:PATH"
 }
+& docker.exe --context desktop-linux info --format '{{.ServerVersion}}' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'The local Docker Desktop Linux engine is not ready' }
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $artifactRoot 'home') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $artifactRoot 'storage') -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $KeycloakPath 'data\import') -Force | Out-Null
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+& icacls.exe $artifactRoot /inheritance:r /grant:r "*$($identity):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Cannot secure the local OIDC artifacts directory' }
 
 if (Test-Path -LiteralPath $privateConfigPath) {
   $privateConfig = Get-Content -LiteralPath $privateConfigPath -Raw | ConvertFrom-Json
@@ -80,27 +82,20 @@ if (Test-Path -LiteralPath $privateConfigPath) {
     clientSecret = New-Secret 32
     sessionSecret = New-Secret 48
   }
-  $privateConfig | ConvertTo-Json | Set-Content -LiteralPath $privateConfigPath -Encoding utf8NoBOM
+  [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
-
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'keycloak-local-realm.example.json') `
-  -Destination (Join-Path $KeycloakPath 'data\import\dsh-local-realm.json') -Force
 
 $env:KC_BOOTSTRAP_ADMIN_USERNAME = $privateConfig.adminUsername
 $env:KC_BOOTSTRAP_ADMIN_PASSWORD = $privateConfig.adminPassword
-$env:JAVA_HOME = $javaHome
 $env:DSH_LOCAL_OIDC_CLIENT_SECRET = $privateConfig.clientSecret
 $env:DSH_LOCAL_OIDC_USER_PASSWORD = $privateConfig.password
 $env:DSH_LOCAL_REGISTRY_ORIGIN = 'http://127.0.0.1:3181'
 
-$keycloak = $null
+$keycloakStarted = $false
 if (-not $RegistryOnly) {
-  $keycloak = Start-Process -FilePath (Join-Path $KeycloakPath 'bin\kc.bat') `
-    -ArgumentList @('start-dev', '--http-host=127.0.0.1', '--http-port=3182', '--import-realm', '--health-enabled=true') `
-    -WorkingDirectory $KeycloakPath `
-    -RedirectStandardOutput (Join-Path $artifactRoot 'keycloak.stdout.log') `
-    -RedirectStandardError (Join-Path $artifactRoot 'keycloak.stderr.log') `
-    -WindowStyle Hidden -PassThru
+  & docker.exe --context desktop-linux compose -f $composePath up -d
+  if ($LASTEXITCODE -ne 0) { throw 'Local Keycloak container failed to start' }
+  $keycloakStarted = $true
 }
 
 $registry = $null
@@ -120,16 +115,15 @@ try {
   Wait-Http 'http://127.0.0.1:3181/readyz'
 } catch {
   if ($null -ne $registry -and -not $registry.HasExited) { Stop-Process -Id $registry.Id }
-  if ($null -ne $keycloak -and -not $keycloak.HasExited) { Stop-Process -Id $keycloak.Id }
+  if ($keycloakStarted) { & docker.exe --context desktop-linux compose -f $composePath stop | Out-Null }
   throw
 }
 
 [pscustomobject]@{
-  keycloakPid = (Get-NetTCPConnection -LocalPort 3182 -State Listen).OwningProcess
+  keycloakContainer = (& docker.exe --context desktop-linux compose -f $composePath ps --format json | ConvertFrom-Json).Name
   registryPid = $registry.Id
   issuer = 'http://127.0.0.1:3182/realms/dsh-local'
   registry = 'http://127.0.0.1:3181/#/sign-in'
   username = $privateConfig.username
-  password = $privateConfig.password
   privateConfig = $privateConfigPath
 } | ConvertTo-Json

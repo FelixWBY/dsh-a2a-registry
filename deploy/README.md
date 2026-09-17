@@ -6,13 +6,13 @@
 
 ## 本地 OIDC
 
-Windows 安装 Java 21 与 Keycloak，设置 `JAVA_HOME`，然后执行：
+启动 Docker Desktop，然后在仓库根目录执行：
 
 ```powershell
-pwsh -File deploy/registry/start-local-keycloak.ps1 -KeycloakPath C:\tools\keycloak -NodePath C:\tools\node\node.exe
+pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node.exe
 ```
 
-脚本在 3182 启动 Keycloak，在 3181 启动本仓库的 Registry；凭据首次随机生成并保存在忽略的 `.artifacts/registry-oidc-local/private-runtime.json`。仅绑定回环地址。Keycloak realm 中的 `registry-owner` 必须与 Registry 目录成员匹配。
+脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。两项服务都只绑定回环地址。Keycloak realm 中的 `registry-owner` 必须与 Registry 目录成员匹配。
 
 普通服务器或已有身份服务可以直接使用 OIDC patch：
 

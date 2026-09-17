@@ -40,7 +40,7 @@ npm test
 - [原始设计输入](design/a2a-registry/sources/dsh-a2a-disclosure-registry-design.source.txt)
 - [提取的源包清单](docs/source-packages.json)
 
-本地 Keycloak 示例保留在 `deploy/registry/`。它需要自行安装 Keycloak 和 Java，并在第一次运行时生成独立的本地测试凭据。本仓库不提供真实密码、设备私钥、生产数据库或本地运行快照。
+本地 Keycloak 示例保留在 `deploy/registry/`，通过 Docker Desktop 启动固定版本容器，并在第一次运行时生成独立的本地测试凭据。本仓库不提供真实密码、设备私钥、生产数据库或本地运行快照。
 
 公网生产尚需完成正式 IdP 租户、设备凭据签发、KMS、披露操作/刷新 provider，以及真实域名与部署验收。已提供的配置模板不能替代这些外部服务。
 
