@@ -143,7 +143,212 @@ async function assertRuntimeDatabasePrivileges(client: PoolClient,
   }
 }
 
-async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaName: string): Promise<void> {
+async function assertExactRegistryBackupRole(client: PoolClient): Promise<number> {
+  const state = await client.query<{ readonly oid: number; readonly unsafe: boolean }>(
+    `with backup_role as (
+       select oid, rolcanlogin, rolinherit, rolconnlimit, rolbypassrls,
+              rolsuper, rolcreatedb, rolcreaterole, rolreplication
+       from pg_roles where rolname = 'registry_backup'
+     )
+     select backup_role.oid,
+       not backup_role.rolcanlogin
+       or backup_role.rolinherit
+       or backup_role.rolconnlimit <> 2
+       or not backup_role.rolbypassrls
+       or backup_role.rolsuper
+       or backup_role.rolcreatedb
+       or backup_role.rolcreaterole
+       or backup_role.rolreplication
+       or exists (
+         select 1 from pg_auth_members membership
+         where membership.member = backup_role.oid or membership.roleid = backup_role.oid
+       )
+       or not has_database_privilege(backup_role.oid, current_database(), 'CONNECT')
+       or has_database_privilege(backup_role.oid, current_database(), 'CREATE')
+       or has_database_privilege(backup_role.oid, current_database(), 'TEMP')
+       or exists (
+         select 1 from pg_database database
+         where database.datname <> current_database()
+           and has_database_privilege(backup_role.oid, database.oid, 'CONNECT')
+       )
+       or exists (
+         select 1 from pg_database database
+         where database.datname <> current_database()
+           and database.datname <> 'postgres' and not database.datistemplate
+       )
+       or not exists (
+         select 1
+         from pg_database database
+         cross join lateral aclexplode(coalesce(database.datacl, acldefault('d', database.datdba))) acl
+         where database.datname = current_database()
+           and acl.grantee = backup_role.oid
+           and acl.privilege_type = 'CONNECT'
+           and not acl.is_grantable
+       )
+       or exists (
+         select 1
+         from pg_database database
+         cross join lateral aclexplode(coalesce(database.datacl, acldefault('d', database.datdba))) acl
+         where database.datname = current_database()
+           and acl.grantee = backup_role.oid
+           and (acl.privilege_type <> 'CONNECT' or acl.is_grantable)
+       )
+       or exists (
+         select 1
+         from pg_namespace namespace
+         where namespace.nspname <> 'information_schema'
+           and namespace.nspname !~ '^pg_'
+           and (
+             has_schema_privilege(backup_role.oid, namespace.oid, 'CREATE')
+             or exists (
+               select 1
+               from aclexplode(coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))) acl
+               where acl.grantee = backup_role.oid
+                 and (acl.privilege_type <> 'USAGE' or acl.is_grantable)
+             )
+           )
+       )
+       or exists (
+         select 1
+         from pg_class relation
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         where namespace.nspname <> 'information_schema'
+           and namespace.nspname !~ '^pg_'
+           and relation.relkind in ('r', 'p', 'v', 'm', 'f')
+           and (
+             has_table_privilege(backup_role.oid, relation.oid,
+               'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN')
+             or has_any_column_privilege(backup_role.oid, relation.oid, 'INSERT, UPDATE, REFERENCES')
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) acl
+               where acl.grantee = backup_role.oid
+                 and (acl.privilege_type <> 'SELECT' or acl.is_grantable)
+             )
+             or exists (
+               select 1
+               from pg_attribute attribute
+               cross join lateral aclexplode(attribute.attacl) acl
+               where attribute.attrelid = relation.oid
+                 and attribute.attnum > 0
+                 and not attribute.attisdropped
+                 and acl.grantee = backup_role.oid
+             )
+           )
+       )
+       or exists (
+         select 1
+         from pg_sequence sequence
+         join pg_class relation on relation.oid = sequence.seqrelid
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         where namespace.nspname <> 'information_schema'
+           and namespace.nspname !~ '^pg_'
+           and (
+             has_sequence_privilege(backup_role.oid, relation.oid, 'USAGE, UPDATE')
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('S', relation.relowner))) acl
+               where acl.grantee = backup_role.oid
+                 and (acl.privilege_type <> 'SELECT' or acl.is_grantable)
+             )
+           )
+       ) as unsafe
+     from backup_role`,
+  )
+  const selected = state.rows[0]
+  if (state.rows.length !== 1 || selected?.unsafe || selected.oid === undefined) {
+    throw new Error('PostgreSQL registry_backup role must be isolated and have only exact backup privileges')
+  }
+  return selected.oid
+}
+
+async function assertRegistryBackupTargetIsolation(client: PoolClient, schemaName: string,
+  backupRoleOid: number): Promise<void> {
+  const state = await client.query<{ readonly unsafe: boolean }>(
+    `select exists (
+       select 1
+       from pg_namespace namespace
+       where namespace.nspname <> $1
+         and namespace.nspname <> 'information_schema'
+         and namespace.nspname !~ '^pg_'
+         and (
+           has_schema_privilege($2::oid, namespace.oid, 'USAGE')
+           or has_schema_privilege($2::oid, namespace.oid, 'CREATE')
+           or exists (
+             select 1
+             from aclexplode(coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))) acl
+             where acl.grantee = $2::oid
+           )
+         )
+     ) or exists (
+       select 1
+       from pg_class relation
+       join pg_namespace namespace on namespace.oid = relation.relnamespace
+       where namespace.nspname <> $1
+         and namespace.nspname <> 'information_schema'
+         and namespace.nspname !~ '^pg_'
+         and relation.relkind in ('r', 'p', 'v', 'm', 'f')
+         and (
+           has_table_privilege($2::oid, relation.oid,
+             'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN')
+           or has_any_column_privilege($2::oid, relation.oid,
+             'SELECT, INSERT, UPDATE, REFERENCES')
+         )
+     ) or exists (
+       select 1
+       from pg_sequence sequence
+       join pg_class relation on relation.oid = sequence.seqrelid
+       join pg_namespace namespace on namespace.oid = relation.relnamespace
+       where namespace.nspname <> $1
+         and namespace.nspname <> 'information_schema'
+         and namespace.nspname !~ '^pg_'
+         and has_sequence_privilege($2::oid, relation.oid, 'USAGE, SELECT, UPDATE')
+     ) as unsafe`,
+    [schemaName, backupRoleOid],
+  )
+  if (state.rows.length !== 1 || state.rows[0]?.unsafe) {
+    throw new Error('PostgreSQL registry_backup role must not reach objects outside the selected schema')
+  }
+}
+
+async function assertRegistryBackupDefaultPrivileges(client: PoolClient, schemaName: string,
+  backupRoleOid: number, backupEnabled: boolean): Promise<void> {
+  const state = await client.query<{ readonly unsafe: boolean }>(
+    `select exists (
+       select 1
+       from pg_default_acl defaults
+       join pg_roles owner on owner.oid = defaults.defaclrole
+       left join pg_namespace namespace on namespace.oid = defaults.defaclnamespace
+       cross join lateral aclexplode(defaults.defaclacl) acl
+       where acl.grantee = $2::oid
+         and (defaults.defaclnamespace = 0
+           or owner.rolname <> 'registry_migrator'
+           or defaults.defaclobjtype not in ('r', 'S')
+           or acl.privilege_type <> 'SELECT'
+           or acl.is_grantable
+           or ((namespace.nspname is not distinct from $1) <> $3::boolean))
+     ) or ($3::boolean and (
+       select count(distinct defaults.defaclobjtype)
+       from pg_default_acl defaults
+       join pg_roles owner on owner.oid = defaults.defaclrole
+       join pg_namespace namespace on namespace.oid = defaults.defaclnamespace
+       cross join lateral aclexplode(defaults.defaclacl) acl
+       where owner.rolname = 'registry_migrator'
+         and namespace.nspname = $1
+         and defaults.defaclobjtype in ('r', 'S')
+         and acl.grantee = $2::oid
+         and acl.privilege_type = 'SELECT'
+         and not acl.is_grantable
+     ) <> 2) as unsafe`,
+    [schemaName, backupRoleOid, backupEnabled],
+  )
+  if (state.rows.length !== 1 || state.rows[0]?.unsafe) {
+    throw new Error('PostgreSQL registry_backup default privileges must match the selected schema state')
+  }
+}
+
+async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaName: string,
+  backupRoleOid: number, backupEnabled: boolean): Promise<void> {
   const state = await client.query<{ readonly unsafe: boolean }>(
     `with runtime_role as (
        select oid from pg_roles where rolname = current_user
@@ -160,7 +365,7 @@ async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaNam
              or exists (
                select 1
                from aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) acl
-               where acl.grantee not in (relation.relowner, runtime_role.oid)
+               where acl.grantee not in (relation.relowner, runtime_role.oid, $4::oid)
                  or (acl.grantee = runtime_role.oid and (
                    acl.is_grantable
                    or case
@@ -171,6 +376,9 @@ async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaNam
                      else true
                    end
                  ))
+                 or (acl.grantee = $4::oid and (
+                   not $5::boolean or acl.privilege_type <> 'SELECT' or acl.is_grantable
+                 ))
              )
              or exists (
                select 1
@@ -179,6 +387,21 @@ async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaNam
                where attribute.attrelid = relation.oid and attribute.attnum > 0
                  and not attribute.attisdropped and acl.grantee <> relation.relowner
              )
+             or ($5::boolean and not exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) acl
+               where acl.grantee = $4::oid
+                 and acl.privilege_type = 'SELECT'
+                 and not acl.is_grantable
+             ))
+             or has_table_privilege($4::oid, relation.oid, 'SELECT') <> $5::boolean
+             or has_table_privilege($4::oid, relation.oid, 'INSERT')
+             or has_table_privilege($4::oid, relation.oid, 'UPDATE')
+             or has_table_privilege($4::oid, relation.oid, 'DELETE')
+             or has_table_privilege($4::oid, relation.oid, 'TRUNCATE')
+             or has_table_privilege($4::oid, relation.oid, 'REFERENCES')
+             or has_table_privilege($4::oid, relation.oid, 'TRIGGER')
+             or has_table_privilege($4::oid, relation.oid, 'MAINTAIN')
              or case
                when relation.relname = any($2::text[]) then
                  not has_table_privilege(runtime_role.oid, relation.oid, 'SELECT')
@@ -215,15 +438,28 @@ async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaNam
              or exists (
                select 1
                from aclexplode(coalesce(relation.relacl, acldefault('S', relation.relowner))) acl
-               where acl.grantee <> relation.relowner
+               where acl.grantee not in (relation.relowner, $4::oid)
+                 or (acl.grantee = $4::oid and (
+                   not $5::boolean or acl.privilege_type <> 'SELECT' or acl.is_grantable
+                 ))
              )
              or has_sequence_privilege(runtime_role.oid, relation.oid, 'USAGE, SELECT, UPDATE')
+             or ($5::boolean and not exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('S', relation.relowner))) acl
+               where acl.grantee = $4::oid
+                 and acl.privilege_type = 'SELECT'
+                 and not acl.is_grantable
+             ))
+             or has_sequence_privilege($4::oid, relation.oid, 'SELECT') <> $5::boolean
+             or has_sequence_privilege($4::oid, relation.oid, 'USAGE')
+             or has_sequence_privilege($4::oid, relation.oid, 'UPDATE')
            )
        ) as unsafe`,
-    [schemaName, [...REGISTRY_META_TABLES], [...REGISTRY_BUSINESS_TABLES]],
+    [schemaName, [...REGISTRY_META_TABLES], [...REGISTRY_BUSINESS_TABLES], backupRoleOid, backupEnabled],
   )
   if (state.rows.length !== 1 || state.rows[0]?.unsafe) {
-    throw new Error('PostgreSQL schema objects must be owned by registry_migrator and expose only exact registry_app ACLs')
+    throw new Error('PostgreSQL schema objects must expose only exact registry_app and registry_backup ACLs')
   }
 }
 
@@ -360,9 +596,13 @@ async function validatePostgresSchema(pool: Pool, schemaName: string,
     }
     await assertSafeRoleChain(client, [])
     await assertRuntimeDatabasePrivileges(client, allowUnsafeSharedDatabase)
+    const backupRoleOid = await assertExactRegistryBackupRole(client)
 
     const schemaAccess = await client.query<{
       readonly acl_is_exact: boolean
+      readonly backup_can_create: boolean
+      readonly backup_can_use: boolean
+      readonly backup_enabled: boolean
       readonly can_create: boolean
       readonly can_use: boolean
       readonly owner_is_migrator: boolean
@@ -373,26 +613,43 @@ async function validatePostgresSchema(pool: Pool, schemaName: string,
            and has_schema_privilege(candidate.oid, namespace.oid, 'CREATE')
        ) as can_create,
        has_schema_privilege(current_user, namespace.oid, 'USAGE') as can_use,
+       has_schema_privilege($2::oid, namespace.oid, 'CREATE') as backup_can_create,
+       has_schema_privilege($2::oid, namespace.oid, 'USAGE') as backup_can_use,
+       exists (
+         select 1
+         from aclexplode(coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))) acl
+         where acl.grantee = $2::oid
+           and acl.privilege_type = 'USAGE'
+           and not acl.is_grantable
+       ) as backup_enabled,
        pg_get_userbyid(namespace.nspowner) = 'registry_migrator' as owner_is_migrator,
        not exists (
          select 1
          from aclexplode(coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))) acl
          where acl.grantee not in (
-             namespace.nspowner, (select oid from pg_roles where rolname = current_user)
+             namespace.nspowner, (select oid from pg_roles where rolname = current_user), $2::oid
            )
            or (acl.grantee = (select oid from pg_roles where rolname = current_user)
              and (acl.privilege_type <> 'USAGE' or acl.is_grantable))
+           or (acl.grantee = $2::oid
+             and (acl.privilege_type <> 'USAGE' or acl.is_grantable))
        ) as acl_is_exact
        from pg_namespace namespace where namespace.nspname = $1`,
-      [schemaName],
+      [schemaName, backupRoleOid],
     )
     if (schemaAccess.rows.length !== 1) throw schemaValidationError('configured schema does not exist')
     const selectedSchema = schemaAccess.rows[0]
-    if (selectedSchema?.can_create || !selectedSchema?.can_use
+    if (selectedSchema?.can_create || !selectedSchema?.can_use || selectedSchema?.backup_can_create
+      || selectedSchema?.backup_can_use !== selectedSchema?.backup_enabled
       || !selectedSchema?.owner_is_migrator || !selectedSchema?.acl_is_exact) {
-      throw new Error('PostgreSQL storage schema must be migrator-owned and grant only USAGE to registry_app')
+      throw new Error('PostgreSQL storage schema must have exact registry_app and optional registry_backup USAGE ACLs')
     }
-    await assertExactRegistryObjectPrivileges(client, schemaName)
+    if (selectedSchema.backup_enabled) {
+      await assertRegistryBackupTargetIsolation(client, schemaName, backupRoleOid)
+    }
+    await assertRegistryBackupDefaultPrivileges(client, schemaName, backupRoleOid,
+      selectedSchema.backup_enabled)
+    await assertExactRegistryObjectPrivileges(client, schemaName, backupRoleOid, selectedSchema.backup_enabled)
 
     const tables = await client.query<{
       readonly table_name: string

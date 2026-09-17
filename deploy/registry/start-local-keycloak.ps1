@@ -13,6 +13,7 @@ $caCertificatePath = Join-Path $tlsDataPath 'caddy\pki\authorities\local\root.cr
 $postgresConfigPath = Join-Path $repositoryRoot '.artifacts\postgres\private\connection.env'
 $postgresComposePath = Join-Path $repositoryRoot 'deploy\postgres\compose.yaml'
 $roleSplitPath = Join-Path $repositoryRoot 'deploy\postgres\split-registry-runtime-role.sql'
+$backupProvisionPath = Join-Path $repositoryRoot 'deploy\postgres\provision-registry-backup-role.sql'
 $composePath = Join-Path $PSScriptRoot 'keycloak-local.compose.yaml'
 if ($NodePath -eq '') {
   $NodePath = (Get-Command node -ErrorAction Stop).Source
@@ -143,9 +144,15 @@ if ($UpgradeDatabase) {
   $roleSplitSql | & docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
     psql -U postgres -d registry -v ON_ERROR_STOP=1 --set=target_schema=registry_saas_local | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'Cannot finalize local PostgreSQL runtime privileges' }
+  $backupProvisionSql = Get-Content -LiteralPath $backupProvisionPath -Raw
+  $backupProvisionSql | & docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
+    sh -c 'export REGISTRY_BACKUP_PASSWORD=$(cat /run/secrets/postgres_backup_password); exec psql -U postgres -d registry -v ON_ERROR_STOP=1 --set=target_schema=registry_saas_local' | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot provision the local PostgreSQL backup role' }
 }
 # Never let an operator's offline credential leak into the online Registry child process.
 Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\DSH_REGISTRY_POSTGRES_BACKUP_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\REGISTRY_BACKUP_PASSWORD -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $artifactRoot 'home') -Force | Out-Null

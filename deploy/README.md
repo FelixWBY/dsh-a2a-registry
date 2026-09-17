@@ -48,7 +48,111 @@ Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 H
 
 ## 备份与恢复
 
-`registry/backup-registry-state.mjs` 和 `registry/backup-sqlite.mjs` 目前只覆盖 SQLite 状态；PostgreSQL SaaS 权威数据必须使用独立的 PostgreSQL 备份流程。`registry/verify-registry-restore.mjs` 用于恢复后的语义检查：SaaS 恢复校验必须逐组织执行，捕获文件会固定组织 ID，验证时不能换租户：
+`registry/backup-registry-state.mjs` 和 `registry/backup-sqlite.mjs` 只覆盖纯 SQLite 部署。PostgreSQL SaaS 使用 `registry/backup-postgres-saas-state.mjs`：它把一个 PostgreSQL custom archive、admission SQLite、alert-outbox SQLite 和 exact v1 manifest 发布为一个不可拆分的停服备份集合。
+
+### PostgreSQL SaaS 停服备份
+
+生产契约是一套专用 PostgreSQL cluster 只承载一个权威 Registry 数据库和一个 SaaS schema，不能与其他业务数据库共享。`registry_backup` 是 cluster 级、持久但凭据仅离线注入的专用账号：固定 `LOGIN + NOINHERIT + CONNECTION LIMIT 2 + BYPASSRLS`，只能 `CONNECT` 权威数据库、`USAGE` 目标 schema、`SELECT` 目标表／序列，没有角色成员关系、写权限、`CREATE` 或 `TEMP`。不能给它 `pg_read_all_data`，也不能把它用于第二个数据库或 schema；误授外部权限时在线启动和备份都会失败关闭。下方 provisioning 会先拒绝存在其他用户数据库的 cluster，再撤销维护／模板数据库的 `PUBLIC CONNECT`，因此不会在共享 cluster 上静默收权。管理员在 Registry 停服后用秘密管理注入随机密码，并幂等执行：
+
+```powershell
+$env:REGISTRY_BACKUP_PASSWORD = '<由秘密管理注入，至少 24 字符>'
+Get-Content -Raw deploy/postgres/provision-registry-backup-role.sql |
+  psql -v ON_ERROR_STOP=1 --set=target_schema=registry_saas
+Remove-Item Env:\REGISTRY_BACKUP_PASSWORD
+```
+
+管理员连接信息同样只放 `PGHOST`、`PGUSER`、`PGPASSWORD`、`PGDATABASE` 等进程环境变量，不写入命令行或仓库。上述 SQL 会原子撤销目标外权限、清理双向角色成员关系、设置未来对象的只读默认权限并复核最终 ACL。旧 schema 共库只允许作为迁移期状态；本地只给 `registry_saas_local` 授权，不能把这种共库布局当成正式备份拓扑。
+
+先为每个组织运行下方语义 `capture`，再停止全部 Registry 进程，并确认 admission/outbox 文件不再被写入。`--quiesced` 是运维人员的明确停服承诺；数据库会话检查只能证明检查时没有 Registry 连接，不能单独证明某个空闲进程已经退出。备份父目录必须事先创建，并把 ACL 限制为备份操作员和系统管理员；不要把输出写入共享目录。在 Windows 上先执行：
+
+```powershell
+$backupRoot = 'D:\secure-backups'
+New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls.exe $backupRoot /inheritance:r /grant:r "*$($identity):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '无法限制备份目录 ACL' }
+```
+
+随后从秘密管理临时注入两个离线 URL 和两个绝对 SQLite 路径：
+
+```powershell
+$env:DSH_REGISTRY_POSTGRES_MIGRATOR_URL = '<registry_migrator URL>'
+$env:DSH_REGISTRY_POSTGRES_BACKUP_URL = '<registry_backup URL>'
+$env:DSH_REGISTRY_ADMISSION_SQLITE_PATH = 'D:\registry-state\admission.sqlite'
+$env:DSH_REGISTRY_ALERT_OUTBOX_SQLITE_PATH = 'D:\registry-state\alert-outbox.sqlite'
+node deploy/registry/backup-postgres-saas-state.mjs create --schema registry_saas --quiesced "$backupRoot\registry-20260917"
+Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL,Env:\DSH_REGISTRY_POSTGRES_BACKUP_URL
+```
+
+迁移账号持有同一事务内的 schema advisory lock 和所有目标表 `SHARE` 锁，备份账号执行 `pg_dump`；两个 SQLite 文件使用 SQLite backup API。工具还比较 SQLite 主文件和非空 WAL 的前后文件状态与摘要，以及 PostgreSQL 序列状态。任一步失败、发现活跃 Registry 连接或检测到源变化时只删除临时目录，不发布目标目录。可用 `DSH_REGISTRY_PG_DUMP_PATH`／`DSH_REGISTRY_PG_RESTORE_PATH` 指定名称严格匹配的绝对工具路径；否则从 `PATH` 查找。离线验证不需要数据库凭据：
+
+```powershell
+node deploy/registry/backup-postgres-saas-state.mjs verify D:\secure-backups\registry-20260917
+```
+
+验证会核对 manifest exact shape、每个文件的 SHA-256／大小、两个 SQLite `quick_check`，并用受限的 `pg_restore --list` 确认 archive 可读。把整个目录复制到异机受限介质；凭据不在 manifest 内，必须单独备份。
+
+### 只恢复到新隔离目标
+
+本切片不自动改数据库。恢复必须先验证备份，再在全新的专用 cluster 创建全新的空数据库和全新的 sidecar 路径；目标 schema 必须不存在。不要运行会预建 `registry` schema 的本地初始化脚本。连接到明确的隔离目标数据库后，以管理员运行 `deploy/postgres/create-registry-backup-role.sql`；它从环境创建／核对三个角色、收紧 cluster 数据库连接权限，并拒绝已有用户 schema 或关系的数据库：
+
+```powershell
+$env:PGHOST = '127.0.0.1'
+$env:PGPORT = '55432'
+$env:PGUSER = 'postgres'
+$env:PGPASSWORD = '<隔离实例管理员密码>'
+$env:PGDATABASE = 'registry_restore_empty'
+$env:REGISTRY_APP_PASSWORD = '<由秘密管理注入，至少 24 字符>'
+$env:REGISTRY_MIGRATOR_PASSWORD = '<由秘密管理注入，至少 24 字符>'
+$env:REGISTRY_BACKUP_PASSWORD = '<由秘密管理注入，至少 24 字符>'
+Get-Content -Raw deploy/postgres/create-registry-backup-role.sql | psql -v ON_ERROR_STOP=1
+$adminPassword = $env:PGPASSWORD
+$migratorPassword = $env:REGISTRY_MIGRATOR_PASSWORD
+Remove-Item Env:\PGPASSWORD,Env:\REGISTRY_APP_PASSWORD,Env:\REGISTRY_MIGRATOR_PASSWORD,Env:\REGISTRY_BACKUP_PASSWORD
+```
+
+archive 需要创建目标 schema，因此只在这次隔离恢复窗口临时给 migrator 当前数据库 `CREATE`，并在 `finally` 中撤销。实际 archive 仍仅由 `registry_migrator` 以 `--no-owner --single-transaction` 恢复；禁止 `--clean`，禁止指向现有数据库：
+
+```powershell
+$env:PGUSER = 'postgres'
+$env:PGPASSWORD = $adminPassword
+psql -v ON_ERROR_STOP=1 -c 'grant create on database registry_restore_empty to registry_migrator'
+if ($LASTEXITCODE -ne 0) { throw '无法开启隔离恢复窗口' }
+try {
+  $env:PGUSER = 'registry_migrator'
+  $env:PGPASSWORD = $migratorPassword
+  pg_restore --exit-on-error --single-transaction --no-owner --no-tablespaces --no-password `
+    --dbname $env:PGDATABASE D:\secure-backups\registry-20260917\registry.pgdump
+  if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL 恢复失败' }
+} finally {
+  $env:PGUSER = 'postgres'
+  $env:PGPASSWORD = $adminPassword
+  psql -v ON_ERROR_STOP=1 -c 'revoke create, temporary on database registry_restore_empty from registry_migrator'
+  if ($LASTEXITCODE -ne 0) { throw '无法关闭隔离恢复窗口；禁止启动 Registry' }
+  Remove-Item Env:\PGPASSWORD
+  $adminPassword = $null
+  $migratorPassword = $null
+}
+```
+
+archive 保留源 ACL；`--no-owner` 让所有对象由执行恢复的 `registry_migrator` 持有。恢复后仍须在停服状态依次运行 `split-registry-runtime-role.sql` 和 `provision-registry-backup-role.sql`，重新固化并验证 app/backup exact ACL。把两个 SQLite 文件复制到事先确认不存在的新路径，绝不能覆盖旧介质：
+
+```powershell
+$restoreRoot = 'D:\registry-restore'
+New-Item -ItemType Directory -Path $restoreRoot -Force | Out-Null
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls.exe $restoreRoot /inheritance:r /grant:r "*$($identity):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw '无法限制恢复目录 ACL' }
+$admission = Join-Path $restoreRoot 'admission.sqlite'
+$outbox = Join-Path $restoreRoot 'alert-outbox.sqlite'
+if ((Test-Path $admission) -or (Test-Path $outbox)) { throw '恢复 sidecar 路径必须为空' }
+Copy-Item D:\secure-backups\registry-20260917\admission.sqlite $admission
+Copy-Item D:\secure-backups\registry-20260917\alert-outbox.sqlite $outbox
+```
+
+最后只在隔离端口启动使用 `registry_app`、`schemaMode: validate` 和新 sidecar 路径的单实例 Registry；启动环境不得含 migrator/backup URL 或 `REGISTRY_BACKUP_PASSWORD`。就绪后逐组织运行下方 `verify`，全部通过后才能规划切流。
+
+`registry/verify-registry-restore.mjs` 用于恢复后的语义检查：SaaS 恢复校验必须逐组织执行；捕获文件会固定组织 ID，验证时不能换租户：
 
 ```text
 node deploy/registry/verify-registry-restore.mjs capture https://registry.example.com org-123 /secure/restore/org-123.json

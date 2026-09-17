@@ -217,6 +217,12 @@ if (selectedPostgresUrl.length > 0) {
 if (checkRegistry && (process.env.DSH_REGISTRY_POSTGRES_MIGRATOR_URL?.trim().length ?? 0) > 0) {
   issue('DSH_REGISTRY_POSTGRES_MIGRATOR_URL must not be present in the Registry runtime environment')
 }
+if (checkRegistry && (process.env.DSH_REGISTRY_POSTGRES_BACKUP_URL?.trim().length ?? 0) > 0) {
+  issue('DSH_REGISTRY_POSTGRES_BACKUP_URL must not be present in the Registry runtime environment')
+}
+if (checkRegistry && (process.env.REGISTRY_BACKUP_PASSWORD?.trim().length ?? 0) > 0) {
+  issue('REGISTRY_BACKUP_PASSWORD must not be present in the Registry runtime environment')
+}
 
 if (checkHarness) {
   const instanceId = required('DSH_INSTANCE_ID')

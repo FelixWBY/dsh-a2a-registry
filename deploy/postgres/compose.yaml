@@ -15,6 +15,7 @@ services:
       - postgres_admin_password
       - postgres_app_password
       - postgres_migrator_password
+      - postgres_backup_password
     volumes:
       - postgres_data:/var/lib/postgresql
       - ./init-registry.sh:/docker-entrypoint-initdb.d/10-registry.sh:ro
@@ -44,3 +45,5 @@ secrets:
     file: ../../.artifacts/postgres/private/app-password
   postgres_migrator_password:
     file: ../../.artifacts/postgres/private/migrator-password
+  postgres_backup_password:
+    file: ../../.artifacts/postgres/private/backup-password

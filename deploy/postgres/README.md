@@ -1,6 +1,6 @@
 # 本地 PostgreSQL（Docker）
 
-Windows 使用 Docker Desktop 的 WSL 2 / Linux 容器引擎，不安装 Windows 原生 PostgreSQL。固定 `postgres:18.6-bookworm`，数据库 `registry`，只监听 `127.0.0.1:5432`。`registry_migrator` 只供停服后的结构迁移，`registry_app` 只供在线业务读写；两者不互相继承。注册站已提供 PostgreSQL KV 后端与显式迁移工具；切换仍必须由部署者停写、备份并执行迁移，不能只修改配置。
+Windows 使用 Docker Desktop 的 WSL 2 / Linux 容器引擎，不安装 Windows 原生 PostgreSQL。固定 `postgres:18.6-bookworm`，数据库 `registry`，只监听 `127.0.0.1:5432`。这是 Registry 专用 cluster；backup 安全契约会撤销其他数据库的 `PUBLIC CONNECT`，不能混放其他业务数据库。`registry_migrator` 只供停服后的结构迁移，`registry_app` 只供在线业务读写，`registry_backup` 只供停服备份；三个角色互不继承。注册站已提供 PostgreSQL KV 后端与显式迁移工具；切换仍必须由部署者停写、备份并执行迁移，不能只修改配置。
 
 ## 启停
 
@@ -15,15 +15,15 @@ powershell -ExecutionPolicy Bypass -File scripts/local-postgres.ps1 Stop
 powershell -ExecutionPolicy Bypass -File scripts/local-postgres.ps1 Backup
 ```
 
-`Prepare` 可在 Docker 未启动时准备首次本地凭据。密码随机生成，仅存于忽略目录 `.artifacts/postgres/private`；`connection.env` 分别保存在线和离线连接串，但不会自动覆盖根目录环境文件。不要把此目录、连接串或数据库备份发到 GitHub。Registry 服务环境只能注入 `DSH_REGISTRY_POSTGRES_URL`，不能包含 `DSH_REGISTRY_POSTGRES_MIGRATOR_URL`。
+`Prepare` 可在 Docker 未启动时准备首次本地凭据。密码随机生成，仅存于忽略目录 `.artifacts/postgres/private`；`connection.env` 分别保存在线、迁移和备份连接串，但不会自动覆盖根目录环境文件。不要把此目录、连接串或数据库备份发到 GitHub。Registry 服务环境只能注入 `DSH_REGISTRY_POSTGRES_URL`，不能包含 migrator／backup URL 或 `REGISTRY_BACKUP_PASSWORD`。
 
-两个账号都不是超级管理员，也没有 `BYPASSRLS`。迁移账号持有 schema 和表，并仅额外继承 PostgreSQL 内置只读角色 `pg_read_all_stats`，以便离线工具能完整确认在线会话已经停止；在线账号被明确禁止继承该角色。在线账号没有数据库临时对象权限、schema `CREATE`、对象所有权或迁移角色成员关系，只获得 schema `USAGE`、元数据只读和已知业务表 DML，未知表及未来表默认无权。PostgreSQL KV schema v2 在三张领域表上保存 `tenant_id`，并使用强制 RLS 和复合主外键隔离租户。上层仍必须给每个组织传入正确的 `tenantId`；未传时只会进入保留的空字符串全局作用域，不能把这个兼容作用域当作组织路由。
+迁移和在线账号都不是超级管理员，也没有 `BYPASSRLS`。迁移账号持有 schema 和表，并仅额外继承 `pg_read_all_stats` 以检查当前数据库会话。备份账号因强制 RLS 必须固定 `BYPASSRLS`，但同时固定 `NOINHERIT`、两连接上限、零角色成员关系，并且只能连接数据库和读取唯一权威 SaaS schema；其凭据不得进入在线进程。在线账号没有数据库临时对象权限、schema `CREATE`、对象所有权或离线角色成员关系，只获得 schema `USAGE`、元数据只读和已知业务表 DML。PostgreSQL KV schema v2 在三张领域表上保存 `tenant_id`，并使用强制 RLS 和复合主外键隔离租户。上层仍必须给每个组织传入正确的 `tenantId`；未传时只会进入保留的空字符串全局作用域，不能把这个兼容作用域当作组织路由。
 
 当前数据面仍由单个 Registry 进程持有内存快照和排他写入队列。同一生产 schema 只能由一个业务副本使用；不能双实例滚动发布或水平扩容。任一 schema 的离线升级会拒绝当前数据库中的全部 `registry_app` 会话，因此共库的其他 Registry 也必须先停止。升级后只启动一个新实例并完成探针验证。
 
 ## 离线结构迁移与在线校验
 
-空卷首次初始化会创建两个角色，并让 `registry_migrator` 持有 `registry` schema。已有卷在运行新版 `Start` 后会幂等核对两个角色、密码、基础权限和空的基础 schema，但不会在业务进程运行时自动改已有对象所有权。停止相关 Registry 后，对每个实际 schema 依次执行：
+空卷首次初始化会创建三个角色，并让 `registry_migrator` 持有 `registry` schema。已有卷在运行新版 `Start` 后会幂等核对三个角色、密码、基础权限和空的基础 schema，但不会在业务进程运行时自动改已有对象所有权。`registry_backup` 默认不读取 legacy `registry` schema；`start-local-keycloak.ps1 -UpgradeDatabase` 只为 `registry_saas_local` 设置 exact backup ACL。停止相关 Registry 后，对每个实际 schema 依次执行：
 
 ```powershell
 $schema = 'registry_saas_local'
@@ -118,9 +118,9 @@ node --import tsx/esm deploy/registry/migrate-sqlite-storage-to-postgres.mjs `
 
 - 数据位于命名卷 `dsh-registry-postgres-data`；PostgreSQL 18 的挂载点为 `/var/lib/postgresql`。停止或重建容器不会主动删除该卷。
 - **禁止运行 `docker compose down -v` 或清理该卷。** 重装／重置 Docker Desktop 仍可能丢数据，持久卷不是备份。
-- `Backup` 生成自定义格式 `pg_dump`，保存在 `.artifacts/postgres-backups`；需要另行复制到安全的异机位置。此命令不备份角色密码。切换前的 JSON／SQLite 介质仍须单独保留，凭据也要单独安全保管。
+- `Backup` 只是本机管理员级整库快照。公网 SaaS 必须使用 `deploy/registry/backup-postgres-saas-state.mjs` 生成 PostgreSQL + admission + outbox 的一致备份集合，并复制到安全的异机位置；角色密码仍须单独安全保管。
 - 恢复时先创建隔离的新数据库，使用匹配版本的 `pg_restore` 验证；不要直接覆盖正在使用的库。大版本升级必须显式迁移和验证，不能直接把镜像改成下一代版本。
-- 初始化脚本只在空卷第一次运行并使用单事务。每次 `Start` 会从本机秘密文件幂等核对两个角色、密码、数据库基础权限和空的基础 schema，但不会在线迁移已有对象所有权；不要手改秘密文件。凭据丢失先恢复，不要删卷或生成新密码来“修复”。
+- 初始化脚本只在空卷第一次运行并使用单事务。每次 `Start` 会从本机秘密文件幂等核对三个角色、密码、数据库基础权限和空的基础 schema，但不会在线迁移已有对象所有权；不要手改秘密文件。凭据丢失先恢复，不要删卷或生成新密码来“修复”。
 
 ## 后续上线
 
