@@ -15,7 +15,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "node --import tsx/esm src/dsh.ts --profile registry",
-    "test": "node --import tsx/esm --test tests/smoke.test.mjs tests/saas-device-auth.test.mjs"
+    "test": "node --import tsx/esm --test tests/smoke.test.mjs tests/saas-device-auth.test.mjs tests/verify-registry-restore.test.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-registry-app": "*",

@@ -5,13 +5,14 @@ import { chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, re
 import { dirname, isAbsolute, resolve } from 'node:path'
 
 const FORMAT = 'dsh-registry-restore-expectation'
-const VERSION = 1
+const VERSION = 2
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const MAX_EXPECTATION_BYTES = 4 * 1024 * 1024
 const MAX_PAGES = 40
 const MAX_ITEMS = 2_000
 const CONTENT_SAMPLES = 20
 const AUDIT_SAMPLES = 10
+const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 
 function fail(message) {
   throw new Error(`registry-restore-verification: ${message}`)
@@ -33,6 +34,17 @@ function origin(value) {
     fail('origin must be a canonical HTTPS origin or an HTTP loopback origin')
   }
   return parsed.origin
+}
+
+function organizationId(value) {
+  if (typeof value !== 'string' || !IDENTIFIER.test(value)) {
+    fail('organizationId must be a canonical opaque identifier')
+  }
+  return value
+}
+
+function organizationPath(selectedOrganizationId, path) {
+  return `/organizations/${encodeURIComponent(selectedOrganizationId)}${path}`
 }
 
 function object(value, label) {
@@ -98,6 +110,36 @@ async function pages(selectedOrigin, path) {
   fail(`${path} exceeded the verification page limit`)
 }
 
+async function verifyAuditSample(selectedOrigin, path, expected) {
+  if (!Array.isArray(expected) || expected.length > AUDIT_SAMPLES
+    || expected.some(value => typeof value !== 'string' || value.length === 0)
+    || new Set(expected).size !== expected.length) fail('captured audit sample is invalid')
+  const pending = new Set(expected)
+  if (pending.size === 0) return
+  let cursor
+  let total = 0
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const query = cursor === undefined ? '' : `?cursor=${encodeURIComponent(cursor)}`
+    const pageValue = object(await api(selectedOrigin, `${path}${query}`), `${path} page`)
+    if (!Array.isArray(pageValue.items)
+      || !(pageValue.nextCursor === null || typeof pageValue.nextCursor === 'string')) {
+      fail(`${path} returned an invalid page`)
+    }
+    total += pageValue.items.length
+    if (total > MAX_ITEMS) fail(`${path} exceeded the verification item limit`)
+    for (const itemValue of pageValue.items) {
+      const item = object(itemValue, 'audit metadata')
+      if (typeof item.operationId !== 'string') fail('audit metadata is invalid')
+      pending.delete(item.operationId)
+    }
+    if (pending.size === 0) return
+    if (pageValue.nextCursor === null) break
+    if (pageValue.nextCursor.length === 0 || pageValue.nextCursor === cursor) fail(`${path} returned an invalid cursor`)
+    cursor = pageValue.nextCursor
+  }
+  fail('captured audit records were not found after restore')
+}
+
 function digest(value) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
 }
@@ -131,16 +173,18 @@ function sorted(values, field) {
   return values.sort((left, right) => String(left[field]).localeCompare(String(right[field]), 'en'))
 }
 
-async function snapshot(selectedOrigin) {
+async function snapshot(selectedOrigin, selectedOrganizationId) {
+  const scoped = path => organizationPath(selectedOrganizationId, path)
   const status = object(await api(selectedOrigin, '/status'), 'runtime status')
-  const directory = object(await api(selectedOrigin, '/directory'), 'directory')
-  const instancesValue = object(await api(selectedOrigin, '/instances'), 'instances')
+  const directory = object(await api(selectedOrigin, scoped('/directory')), 'directory')
+  const instancesValue = object(await api(selectedOrigin, scoped('/instances')), 'instances')
   if (!Array.isArray(instancesValue.items)) fail('instances result is invalid')
-  const disclosures = sorted((await pages(selectedOrigin, '/disclosures')).map(disclosure), 'disclosureId')
+  const disclosures = sorted((await pages(selectedOrigin, scoped('/disclosures'))).map(disclosure), 'disclosureId')
   const contents = []
   for (const item of disclosures.filter(value => value.authorizedActions.includes('read')).slice(0, CONTENT_SAMPLES)) {
     const content = object(await api(selectedOrigin,
-      `/disclosures/${encodeURIComponent(item.disclosureId)}/content?checkpoint=${encodeURIComponent(item.checkpoint.checkpointHash)}`),
+      scoped(`/disclosures/${encodeURIComponent(item.disclosureId)}/content`)
+        + `?checkpoint=${encodeURIComponent(item.checkpoint.checkpointHash)}`),
     'disclosure content')
     if (content.checkpointHash !== item.checkpoint.checkpointHash || !Array.isArray(content.events)) {
       fail('disclosure content does not match its fixed checkpoint')
@@ -148,7 +192,7 @@ async function snapshot(selectedOrigin) {
     contents.push({ disclosureId: item.disclosureId, checkpointHash: item.checkpoint.checkpointHash,
       eventCount: content.events.length, sha256: digest(content.events) })
   }
-  const auditPage = object(await api(selectedOrigin, '/audit'), 'audit page')
+  const auditPage = object(await api(selectedOrigin, scoped('/audit')), 'audit page')
   if (!Array.isArray(auditPage.items)) fail('audit result is invalid')
   const auditSample = auditPage.items.slice(0, AUDIT_SAMPLES).map(value => {
     const item = object(value, 'audit metadata')
@@ -165,10 +209,10 @@ async function snapshot(selectedOrigin) {
   }
 }
 
-function writeExpectation(path, selectedOrigin, state) {
+function writeExpectation(path, selectedOrigin, selectedOrganizationId, state) {
   if (existsSync(path)) fail('expectation file already exists')
   const document = `${JSON.stringify({ format: FORMAT, version: VERSION, capturedAt: new Date().toISOString(),
-    sourceOrigin: selectedOrigin, state }, undefined, 2)}\n`
+    sourceOrigin: selectedOrigin, organizationId: selectedOrganizationId, state }, undefined, 2)}\n`
   if (Buffer.byteLength(document, 'utf8') > MAX_EXPECTATION_BYTES) fail('expectation file would exceed the size limit')
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   const partial = `${path}.partial-${randomUUID()}`
@@ -195,41 +239,43 @@ function readExpectation(path) {
   if (parsed.format !== FORMAT || parsed.version !== VERSION || Number.isNaN(Date.parse(parsed.capturedAt))) {
     fail('expectation header is invalid')
   }
-  return object(parsed.state, 'expectation state')
+  return { organizationId: organizationId(parsed.organizationId), state: object(parsed.state, 'expectation state') }
 }
 
 function equal(left, right, label) {
   if (JSON.stringify(left) !== JSON.stringify(right)) fail(`${label} differs from the captured Registry state`)
 }
 
-const [command, originInput, expectationInput, ...rest] = process.argv.slice(2)
+const [command, originInput, organizationInput, expectationInput, ...rest] = process.argv.slice(2)
 if ((command !== 'capture' && command !== 'verify') || originInput === undefined
-  || expectationInput === undefined || rest.length !== 0) {
-  fail('usage: node verify-registry-restore.mjs <capture|verify> <origin> <absolute-expectation-file>')
+  || organizationInput === undefined || expectationInput === undefined || rest.length !== 0) {
+  fail('usage: node verify-registry-restore.mjs <capture|verify> <origin> <organizationId> <absolute-expectation-file>')
 }
 const selectedOrigin = origin(originInput)
+const selectedOrganizationId = organizationId(organizationInput)
 const expectation = absolutePath(expectationInput, 'expectation file')
 if (command === 'capture') {
-  const state = await snapshot(selectedOrigin)
-  writeExpectation(expectation, selectedOrigin, state)
-  process.stdout.write(`${JSON.stringify({ captured: true, expectation, disclosures: state.disclosures.length,
+  const state = await snapshot(selectedOrigin, selectedOrganizationId)
+  writeExpectation(expectation, selectedOrigin, selectedOrganizationId, state)
+  process.stdout.write(`${JSON.stringify({ captured: true, expectation, organizationId: selectedOrganizationId,
+    disclosures: state.disclosures.length,
     contentSamples: state.contents.length, instances: state.instances.length,
     auditSamples: state.auditSample.length })}\n`)
 } else {
   const expected = readExpectation(expectation)
-  const actual = await snapshot(selectedOrigin)
-  equal(actual.status, expected.status, 'runtime configuration')
-  equal(actual.directory, expected.directory, 'organization directory')
-  equal(actual.instances, expected.instances, 'durable instance bindings')
-  equal(actual.disclosures, expected.disclosures, 'authorized disclosure metadata')
-  equal(actual.contents, expected.contents, 'fixed-checkpoint content digests')
-  const auditPage = object(await api(selectedOrigin, '/audit'), 'audit page')
-  if (!Array.isArray(auditPage.items)) fail('audit result is invalid')
-  const actualAudit = new Set(auditPage.items.map(value => object(value, 'audit metadata').operationId))
-  if (!Array.isArray(expected.auditSample) || expected.auditSample.some(value => !actualAudit.has(value))) {
-    fail('captured audit records were not found after restore')
+  if (expected.organizationId !== selectedOrganizationId) {
+    fail('organizationId differs from the captured Registry tenant')
   }
+  const actual = await snapshot(selectedOrigin, selectedOrganizationId)
+  equal(actual.status, expected.state.status, 'runtime configuration')
+  equal(actual.directory, expected.state.directory, 'organization directory')
+  equal(actual.instances, expected.state.instances, 'durable instance bindings')
+  equal(actual.disclosures, expected.state.disclosures, 'authorized disclosure metadata')
+  equal(actual.contents, expected.state.contents, 'fixed-checkpoint content digests')
+  await verifyAuditSample(selectedOrigin, organizationPath(selectedOrganizationId, '/audit'),
+    expected.state.auditSample)
   process.stdout.write(`${JSON.stringify({ verified: true, origin: selectedOrigin,
+    organizationId: selectedOrganizationId,
     disclosures: actual.disclosures.length, contentSamples: actual.contents.length,
-    instances: actual.instances.length, preservedAuditSamples: expected.auditSample.length })}\n`)
+    instances: actual.instances.length, preservedAuditSamples: expected.state.auditSample.length })}\n`)
 }

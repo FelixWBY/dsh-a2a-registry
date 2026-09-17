@@ -48,7 +48,14 @@ Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 H
 
 ## 备份与恢复
 
-`registry/backup-registry-state.mjs`、`registry/backup-sqlite.mjs`、`registry/verify-registry-restore.mjs` 提供三库备份、摘要验证和隔离恢复检查。按各脚本的 `--help` 与生产环境模板使用，恢复到新路径，保留原介质。
+`registry/backup-registry-state.mjs` 和 `registry/backup-sqlite.mjs` 目前只覆盖 SQLite 状态；PostgreSQL SaaS 权威数据必须使用独立的 PostgreSQL 备份流程。`registry/verify-registry-restore.mjs` 用于恢复后的语义检查：SaaS 恢复校验必须逐组织执行，捕获文件会固定组织 ID，验证时不能换租户：
+
+```text
+node deploy/registry/verify-registry-restore.mjs capture https://registry.example.com org-123 /secure/restore/org-123.json
+node deploy/registry/verify-registry-restore.mjs verify  https://restored-registry.example.com org-123 /secure/restore/org-123.json
+```
+
+认证会话仅通过进程环境变量 `DSH_REGISTRY_RESTORE_COOKIE` 临时注入；不要把 Cookie 写入命令行、捕获文件或仓库。公网 origin 必须使用 HTTPS，本地隔离演练仅允许 HTTP loopback。
 
 告警恢复演练工具 `verify-operational-alert-recovery.mjs` 需用 `node --import tsx/esm` 运行，并将 `REGISTRY_DRILL_TLS_DIR` 设为独立测试证书目录，包含 `ca.pem`、`server.pem`、`server-key.pem`，服务端证书必须包含 IP SAN `127.0.0.1`。本仓库不提交任何私钥；不要使用生产证书进行此演练。
 
