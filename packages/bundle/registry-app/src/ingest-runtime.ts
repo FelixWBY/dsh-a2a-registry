@@ -217,13 +217,8 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
     list: (authority, options) => store.run(ingest => ingest.listMetadata(authority, options)),
     readMetadata: (authority, disclosureId, action, options) =>
       store.run(ingest => ingest.readMetadataWithResolver(authority, disclosureId, action, options)),
-    readPrefix: (authority, disclosureId, sourceInstanceId, action, checkpointHash) => store.run(ingest => ingest.read(
-      async () => {
-        const current = await authority()
-        const history = current.historyFor(sourceInstanceId)
-        if (history === null) throw new RegistryIngestError('not-found')
-        return { subject: current.subject, history, now: current.now }
-      }, disclosureId, action, checkpointHash)),
+    readPrefix: (authority, disclosureId, sourceInstanceId, action, checkpointHash) =>
+      store.run(ingest => ingest.readWithResolver(authority, disclosureId, sourceInstanceId, action, checkpointHash)),
     withAuthorizedPrefix: (authority, disclosureId, sourceInstanceId, action, checkpointHash,
       maxMetadataBytes, receive, callback) => store.run(async (ingest) => {
       let metadata: Awaited<ReturnType<typeof ingest.readMetadataWithResolver>>
@@ -237,12 +232,7 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
         }
         metadata = await ingest.readMetadataWithResolver(authority, disclosureId, action,
           { checkpointHash, maxResponseBytes: maxMetadataBytes })
-        prefix = await ingest.read(async () => {
-          const current = await authority()
-          const history = current.historyFor(sourceInstanceId)
-          if (history === null) throw new RegistryIngestError('not-found')
-          return { subject: current.subject, history, now: current.now }
-        }, disclosureId, action, checkpointHash)
+        prefix = await ingest.readWithResolver(authority, disclosureId, sourceInstanceId, action, checkpointHash)
       } catch (error) {
         if (error instanceof RegistryIngestError && error.code === 'not-found') return callback(null)
         throw error

@@ -14,6 +14,7 @@ import {
   generateInstanceKeyPair,
   generateRegistryDeviceSecret,
   hashRegistryDeviceSecret,
+  signDisclosureCheckpoint,
 } from '@deepseek-ai/dsh-a2a-device-identity'
 import { signRegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import {
@@ -228,8 +229,9 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     const authority = accountAuthority(organizationA, memberA)
     assert.equal((await runtimeA.enrollment.approve(authority, ticket.bindingId, ticket.code,
       'Tenant A producer')).state.kind, 'approved')
-    assert.equal((await runtimeA.enrollment.confirm(ticket.bindingId,
-      signRegistryChallenge(ticket.challenge, keyPair.privateKey))).state.kind, 'confirmed')
+    const confirmed = await runtimeA.enrollment.confirm(ticket.bindingId,
+      signRegistryChallenge(ticket.challenge, keyPair.privateKey))
+    assert.equal(confirmed.state.kind, 'confirmed')
 
     const byOrganization = new Map([
       [organizationA, runtimeA],
@@ -273,6 +275,162 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     } finally {
       await closeSocket(socket)
     }
+
+    const now = Date.now()
+    const disclosureId = 'tenant-a-disclosure'
+    const history = {
+      organizationId: organizationA,
+      instanceId: ticket.challenge.instanceId,
+      status: 'active',
+      keys: [{
+        keyId: keyPair.keyId,
+        publicKeySpki: keyPair.publicKeySpki,
+        validFrom: confirmed.state.confirmedAt,
+        validUntil: null,
+        revokedAt: null,
+      }],
+    }
+    const producerAuthority = () => ({
+      connection: {
+        organizationId: organizationA,
+        instanceId: ticket.challenge.instanceId,
+        keyId: keyPair.keyId,
+        now: Date.now(),
+      },
+      history,
+    })
+    await runtimeA.control.register(producerAuthority, {
+      conversationId: 'tenant-a-conversation',
+      policyVersion: 1,
+      access: {
+        organizationId: organizationA,
+        instanceId: ticket.challenge.instanceId,
+        disclosureId,
+        control: 'active',
+        producer: 'idle',
+        ingest: 'pending',
+        expiresAt: now + 60_000,
+        authorizationVersion: 0,
+        capabilities: ['conversation.read'],
+        checkpointHash: null,
+        grants: [{
+          target: { kind: 'member', memberId: memberA },
+          state: 'active',
+          capabilities: ['conversation.read'],
+          expiresAt: now + 60_000,
+        }],
+      },
+    })
+    const checkpoint = signDisclosureCheckpoint({
+      protocolVersion: 1,
+      organizationId: organizationA,
+      instanceId: ticket.challenge.instanceId,
+      disclosureId,
+      policyVersion: 1,
+      sourceCursor: 0,
+      eventCount: 0,
+      lastDisclosureSeq: -1,
+      lastEventHash: null,
+    }, keyPair.privateKey)
+    await runtimeA.store.run(ingest => ingest.ingestCheckpoint(producerAuthority, disclosureId, checkpoint))
+
+    let externalHistoryCalls = 0
+    const readerAuthority = () => ({
+      subject: {
+        authenticated: true,
+        organizationId: organizationA,
+        memberId: memberA,
+        membership: 'active',
+        role: 'owner',
+        currentTeamIds: [],
+      },
+      now: Date.now(),
+      historyFor() {
+        externalHistoryCalls += 1
+        throw new Error('SaaS reads must not trust external key history')
+      },
+    })
+    const metadata = await runtimeA.reader.readMetadata(readerAuthority, disclosureId, 'read',
+      { checkpointHash: checkpoint.checkpointHash, maxResponseBytes: MAX_FRAME_BYTES })
+    assert.equal(metadata.checkpoint.checkpointHash, checkpoint.checkpointHash)
+    const page = await runtimeA.reader.list(readerAuthority,
+      { pageSize: 8, maxPageSize: 8, maxResponseBytes: MAX_FRAME_BYTES })
+    assert.deepEqual(page.items.map(item => item.disclosureId), [disclosureId])
+    const prefix = await runtimeA.reader.readPrefix(readerAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash)
+    assert.equal(prefix.checkpoint.checkpointHash, checkpoint.checkpointHash)
+    assert.deepEqual(prefix.events, [])
+    assert.equal(externalHistoryCalls, 0)
+    await assert.rejects(runtimeA.reader.readPrefix(readerAuthority, disclosureId,
+      'different-source-instance', 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
+    assert.equal(externalHistoryCalls, 0)
+
+    const duplicateBindingId = '00000000-0000-4000-8000-000000000001'
+    await runtimeA.store.run(async (ingest) => {
+      const domain = ingest.domain
+      const original = domain.table('bindings').get(ticket.bindingId)
+      assert.ok(original)
+      assert.equal(typeof domain.putMany, 'function')
+      await domain.putMany([{ table: 'bindings', key: duplicateBindingId,
+        value: { ...original, bindingId: duplicateBindingId } }])
+    })
+    await assert.rejects(runtimeA.reader.readPrefix(readerAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
+    assert.equal(externalHistoryCalls, 0)
+    await runtimeA.store.run(async (ingest) => {
+      assert.equal(await ingest.domain.table('bindings').delete(duplicateBindingId), true)
+    })
+
+    await runtimeA.store.run(async (ingest) => {
+      const domain = ingest.domain
+      const original = domain.table('bindings').get(ticket.bindingId)
+      assert.equal(original?.version, 5)
+      const { deviceSecretHash: _deviceSecretHash, ...legacy } = original
+      await domain.putMany([{ table: 'bindings', key: ticket.bindingId, value: { ...legacy, version: 4 } }])
+    })
+    let legacyHistoryCalls = 0
+    const legacyReaderAuthority = () => ({
+      ...readerAuthority(),
+      historyFor(instanceId) {
+        legacyHistoryCalls += 1
+        return instanceId === history.instanceId ? history : null
+      },
+    })
+    assert.equal((await runtimeA.reader.readPrefix(legacyReaderAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash)).checkpoint.checkpointHash,
+    checkpoint.checkpointHash)
+    assert.equal(legacyHistoryCalls, 1)
+    const mismatchedLegacyAuthority = () => ({
+      ...readerAuthority(),
+      historyFor() {
+        legacyHistoryCalls += 1
+        return { ...history, instanceId: 'different-source-instance' }
+      },
+    })
+    await assert.rejects(runtimeA.reader.readPrefix(mismatchedLegacyAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
+    assert.equal(legacyHistoryCalls, 2)
+
+    assert.ok(runtimeA.directory)
+    const backupOwner = 'owner-backup'
+    assert.equal((await runtimeA.directory.change(authority, { kind: 'put-member', member: {
+      memberId: backupOwner, displayName: 'Backup owner', role: 'owner', state: 'active',
+    } }, 0)).revision, 1)
+    const backupAuthority = accountAuthority(organizationA, backupOwner)
+    assert.equal((await runtimeA.directory.change(backupAuthority, { kind: 'put-member', member: {
+      memberId: memberA, displayName: `${organizationA} owner`, role: 'owner', state: 'suspended',
+    } }, 1)).revision, 2)
+    await assert.rejects(runtimeA.reader.readPrefix(legacyReaderAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
+    assert.equal(legacyHistoryCalls, 2)
+    assert.equal((await runtimeA.directory.change(backupAuthority, { kind: 'put-member', member: {
+      memberId: memberA, displayName: `${organizationA} owner`, role: 'owner', state: 'active',
+    } }, 2)).revision, 3)
+
+    assert.equal((await runtimeA.enrollment.revoke(authority, ticket.bindingId)).state.kind, 'revoked')
+    await assert.rejects(runtimeA.reader.readPrefix(legacyReaderAuthority, disclosureId,
+      ticket.challenge.instanceId, 'read', checkpoint.checkpointHash), error => error?.code === 'not-found')
+    assert.equal(legacyHistoryCalls, 2)
   } finally {
     syncAbort.abort()
     await Promise.allSettled([stopSync?.()])

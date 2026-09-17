@@ -6,12 +6,12 @@ import { InstanceSignatureError, verifyDisclosureCheckpoint, verifyDisclosureEve
 import type { InstanceKeyHistory, InstanceVerificationContext,
   RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type DisclosureCheckpoint, type DisclosureConversationId,
-  type DisclosureHash, type DisclosureId, type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
+  type DisclosureHash, type DisclosureId, type DshInstanceId, type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { canUploadDisclosure, invalidateDisclosureAuthorization, transitionDisclosureControl, updateDisclosureAccess,
   type DisclosureAccessUpdate, type DisclosureAction, type DisclosureControlState } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type { DisclosureSubject } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { decodeRegistryAudience } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import { approveBinding, authenticateBindingCredential as resolveBindingCredential, confirmBinding, inspectBinding,
+import { approveBinding, authenticateBindingCredential as resolveBindingCredential, confirmedBindingHistory, confirmBinding, inspectBinding,
   parseBinding, rejectBinding, renameBinding, reviewBinding, revokeBinding, startBinding } from './binding.ts'
 import type { RegistryBindingConfig, RegistryBindingId, RegistryBindingInvalidation, RegistryBindingReceipt, RegistryBindingRecord,
   RegistryBindingRequest, RegistryBindingReview, RegistryBindingScope, RegistryBindingTicket } from './binding-types.ts'
@@ -656,10 +656,31 @@ export class RegistryIngest {
       const current = await this.authenticateReader(authority)
       this.attributeMember(current.subject)
       const record = this.table.get(recordKey(current.subject.organizationId, disclosureId))
-      const prefix = confirmedPrefix(record, current.subject, current.now, action,
-        () => this.readableHistory(current.history), checkpointHash)
+      const prefix = confirmedPrefix(record, current.subject, current.now, action, instanceId => this.readableHistory(
+        instanceId, current.now, () => current.history), checkpointHash)
       requireIngest(prefix !== null, 'not-found')
       await this.complete({ kind: 'observed', authorizationVersion: prefix.access.authorizationVersion, recordHash: prefix.checkpoint.checkpointHash })
+      return structuredClone({ authorizationVersion: prefix.access.authorizationVersion,
+        conversationId: brandString<DisclosureConversationId>(prefix.conversationId),
+        checkpoint: prefix.checkpoint, events: prefix.events.map(receipt => receipt.value) })
+    }))
+  }
+
+  /** Return one selected prefix using the same organization-scoped resolver snapshot as metadata reads.
+   * The caller-selected source instance is rechecked against the retained disclosure inside this owner operation. */
+  readWithResolver(authority: FreshRegistryMetadataAuthority, disclosureId: DisclosureId,
+    expectedSourceInstanceId: DshInstanceId, action: Extract<DisclosureAction, 'read' | 'import' | 'ask'>,
+    checkpointHash: DisclosureHash): Promise<RegistryConfirmedPrefix> {
+    return this.enqueue(() => this.audited('read', disclosureId, async () => {
+      const current = await this.authenticateReader(authority)
+      this.attributeMember(current.subject)
+      const record = this.table.get(recordKey(current.subject.organizationId, disclosureId))
+      requireIngest(record?.kind === 'disclosure' && record.access.instanceId === expectedSourceInstanceId, 'not-found')
+      const prefix = confirmedPrefix(record, current.subject, current.now, action,
+        instanceId => this.readableHistory(instanceId, current.now, () => current.historyFor(instanceId)), checkpointHash)
+      requireIngest(prefix !== null, 'not-found')
+      await this.complete({ kind: 'observed', authorizationVersion: prefix.access.authorizationVersion,
+        recordHash: prefix.checkpoint.checkpointHash })
       return structuredClone({ authorizationVersion: prefix.access.authorizationVersion,
         conversationId: brandString<DisclosureConversationId>(prefix.conversationId),
         checkpoint: prefix.checkpoint, events: prefix.events.map(receipt => receipt.value) })
@@ -680,7 +701,8 @@ export class RegistryIngest {
       const current = await this.authenticateReader(authority)
       this.attributeMember(current.subject)
       const record = this.table.get(recordKey(current.subject.organizationId, disclosureId))
-      const prefix = confirmedPrefix(record, current.subject, current.now, 'read', () => this.readableHistory(current.history), input.checkpointHash)
+      const prefix = confirmedPrefix(record, current.subject, current.now, 'read', instanceId => this.readableHistory(
+        instanceId, current.now, () => current.history), input.checkpointHash)
       requireIngest(prefix !== null, 'not-found')
       const metadata = this.boundedMetadata(metadataOf(prefix, current.subject, current.now), input.maxResponseBytes)
       await this.complete({ kind: 'observed', authorizationVersion: metadata.authorizationVersion, recordHash: metadata.checkpoint.checkpointHash })
@@ -705,7 +727,7 @@ export class RegistryIngest {
       this.attributeMember(current.subject)
       const record = this.table.get(recordKey(current.subject.organizationId, disclosureId))
       const prefix = confirmedPrefix(record, current.subject, current.now, action,
-        instanceId => this.readableHistory(current.historyFor(instanceId)), input.checkpointHash)
+        instanceId => this.readableHistory(instanceId, current.now, () => current.historyFor(instanceId)), input.checkpointHash)
       requireIngest(prefix !== null, 'not-found')
       const metadata = this.boundedMetadata(metadataOf(prefix, current.subject, current.now), input.maxResponseBytes)
       await this.complete({ kind: 'observed', authorizationVersion: metadata.authorizationVersion,
@@ -742,7 +764,8 @@ export class RegistryIngest {
       // Open/register enforce maxDisclosures; each prefix has at most maxEvents and maxCheckpoints receipts.
       for (const disclosureId of candidates) {
         const record = this.table.get(recordKey(current.subject.organizationId, disclosureId))
-        const prefix = confirmedPrefix(record, current.subject, current.now, 'read', instanceId => this.readableHistory(current.historyFor(instanceId)))
+        const prefix = confirmedPrefix(record, current.subject, current.now, 'read',
+          instanceId => this.readableHistory(instanceId, current.now, () => current.historyFor(instanceId)))
         if (prefix !== null) {
           readable.push(metadataOf(prefix, current.subject, current.now))
           if (readable.length > input.pageSize) break
@@ -1151,14 +1174,30 @@ export class RegistryIngest {
     }
   }
 
-  private readableHistory(history: InstanceKeyHistory | null): InstanceKeyHistory | null {
-    if (history === null || this.bindingConfig === undefined) return history
-    const binding = [...this.domain.table('bindings').entries()]
-      .find(([, record]) => record.challenge.instanceId === history.instanceId)?.[1]
-    if (binding === undefined || binding.state.kind !== 'confirmed'
-      || !binding.requestedScopes.includes('disclosure.sync')) return null
-    const memberId = binding.state.memberId
-    return this.directory().members.some(member => member.memberId === memberId && member.state === 'active') ? history : null
+  private readableHistory(instanceId: DshInstanceId, now: number,
+    external: () => InstanceKeyHistory | null): InstanceKeyHistory | null {
+    if (this.bindingConfig === undefined) return external()
+    return this.currentBindingHistory(instanceId, now, 'disclosure.sync', external)
+  }
+
+  private currentBindingHistory(instanceId: DshInstanceId, now: number,
+    requiredScope?: RegistryBindingScope, external?: () => InstanceKeyHistory | null): InstanceKeyHistory | null {
+    const bindingConfig = this.bindingConfig
+    if (bindingConfig === undefined) return null
+    const matches = [...this.domain.table('bindings').entries()]
+      .map(([, record]) => record).filter(record => record.challenge.instanceId === instanceId)
+    if (matches.length !== 1) return null
+    const binding = matches[0]
+    if (binding === undefined) return null
+    const state = binding.state
+    if (state.kind !== 'confirmed') return null
+    const members = this.directory().members.filter(member => member.memberId === state.memberId)
+    if (members.length !== 1 || members[0] === undefined) return null
+    try {
+      const legacyHistory = binding.version === 4 ? external?.() : undefined
+      return confirmedBindingHistory(binding, members[0], this.organizationId, now,
+        bindingConfig.audience, requiredScope, legacyHistory)
+    } catch { return null }
   }
 
   private async authenticateProducer(authority: FreshProducerAuthority): Promise<RegistryProducerAuthority> {
@@ -1167,20 +1206,18 @@ export class RegistryIngest {
 
   private async authenticateConnection(authority: FreshProducerAuthority,
     requiredScope?: RegistryBindingScope): Promise<RegistryProducerAuthority> {
-    const current = await this.authenticate(authority)
+    let current = await this.authenticate(authority)
     this.requireOrganization(current.connection.organizationId)
     producer(current)
     if (this.bindingConfig !== undefined) {
-      const binding = [...this.domain.table('bindings').entries()]
-        .find(([, record]) => record.challenge.instanceId === current.connection.instanceId)?.[1]
-      requireIngest(binding !== undefined && binding.state.kind === 'confirmed'
-        && (requiredScope === undefined || binding.requestedScopes.includes(requiredScope)), 'not-found')
-      const memberId = binding.state.memberId
-      requireIngest(this.directory().members.some(member => member.memberId === memberId && member.state === 'active'), 'not-found')
+      const history = this.currentBindingHistory(current.connection.instanceId, current.connection.now,
+        requiredScope, () => current.history)
+      requireIngest(history !== null, 'not-found')
+      const bindingKey = history.keys.find(key => key.keyId === current.connection.keyId)
       const key = current.history.keys.find(key => key.keyId === current.connection.keyId)
-      requireIngest(current.connection.now >= binding.state.confirmedAt && key !== undefined
-        && key.keyId === binding.challenge.keyId && key.publicKeySpki === binding.publicKeySpki
-        && key.validFrom >= binding.state.confirmedAt, 'not-found')
+      requireIngest(bindingKey !== undefined && key !== undefined
+        && key.keyId === bindingKey.keyId && key.publicKeySpki === bindingKey.publicKeySpki, 'not-found')
+      current = { connection: current.connection, history }
     }
     if (this.activeAudit !== undefined) {
       const { organizationId, instanceId, keyId } = current.connection

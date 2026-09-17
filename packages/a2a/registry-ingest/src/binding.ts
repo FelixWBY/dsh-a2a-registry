@@ -9,7 +9,7 @@ import type { DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protoco
 import type { DisclosureSubject, MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type { RegistryDirectoryMember } from './directory-types.ts'
 import type { RegistryBindingId, RegistryBindingLimits, RegistryBindingRecord, RegistryBindingRequest,
-  RegistryBindingReview, RegistryBindingStart, RegistryBindingRecordV5 } from './binding-types.ts'
+  RegistryBindingReview, RegistryBindingScope, RegistryBindingStart, RegistryBindingRecordV5 } from './binding-types.ts'
 import type { RegistryProducerAuthority } from './types.ts'
 import { byteLength, RegistryIngestError, requireIngest } from './record.ts'
 
@@ -49,6 +49,39 @@ function credentialHistory(record: RegistryBindingRecordV5 & {
   const { organizationId, instanceId, keyId } = record.challenge
   return decodeInstanceKeyHistory({ organizationId, instanceId, status: 'active', keys: [{ keyId,
     publicKeySpki: record.publicKeySpki, validFrom: record.state.confirmedAt, validUntil: null, revokedAt: null }] })
+}
+
+/** Resolve the only key history a current confirmed SaaS binding may authorize.
+ * V5 history is rebuilt from the binding; legacy V4 may use an external history only after its retained
+ * key is matched. The caller owns uniqueness of the selected instance. */
+export function confirmedBindingHistory(record: RegistryBindingRecord, member: RegistryDirectoryMember,
+  organizationId: OrganizationId, now: number, audience: string,
+  requiredScope?: RegistryBindingScope, legacyHistory?: InstanceKeyHistory | null): InstanceKeyHistory {
+  requireIngest(record.state.kind === 'confirmed'
+    && record.challenge.organizationId === organizationId && record.challenge.audience === audience
+    && record.state.memberId === member.memberId && member.state === 'active'
+    && Number.isSafeInteger(now) && now >= record.state.confirmedAt
+    && (requiredScope === undefined || record.requestedScopes.includes(requiredScope)), 'not-found')
+  let currentHistory: InstanceKeyHistory
+  if (record.version === 5) {
+    try {
+      currentHistory = credentialHistory(record as RegistryBindingRecordV5 & {
+        readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
+      })
+    } catch { throw new RegistryIngestError('not-found') }
+  } else {
+    requireIngest(legacyHistory !== undefined && legacyHistory !== null, 'not-found')
+    currentHistory = legacyHistory
+  }
+  const key = currentHistory.keys.find(candidate => candidate.keyId === record.challenge.keyId)
+  requireIngest(currentHistory.organizationId === organizationId
+    && currentHistory.instanceId === record.challenge.instanceId && currentHistory.status === 'active'
+    && key !== undefined
+    && key.keyId === record.challenge.keyId && key.publicKeySpki === record.publicKeySpki
+    && key.revokedAt === null && now >= key.validFrom && (key.validUntil === null || now < key.validUntil)
+    && (record.version === 4 || (currentHistory.keys.length === 1
+      && key.validFrom === record.state.confirmedAt && key.validUntil === null)), 'not-found')
+  return currentHistory
 }
 
 function codeHash(code: string): string {
@@ -142,18 +175,13 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
  * The serialized owner supplies the current approving member and configured audience. */
 export function authenticateBindingCredential(record: RegistryBindingRecord, member: RegistryDirectoryMember,
   presentedHash: RegistryDeviceSecretHash, now: number, audience: string): RegistryProducerAuthority {
-  requireIngest(record.version === 5 && record.state.kind === 'confirmed'
-    && member.memberId === record.state.memberId && member.state === 'active'
-    && Number.isSafeInteger(now) && now >= record.state.confirmedAt
-    && record.challenge.audience === audience, 'not-found')
+  requireIngest(record.version === 5 && record.state.kind === 'confirmed', 'not-found')
   let selectedHash: RegistryDeviceSecretHash
   try { selectedHash = decodeRegistryDeviceSecretHash(presentedHash) } catch { throw new RegistryIngestError('not-found') }
   const retained = Buffer.from(record.deviceSecretHash.slice('sha256:'.length), 'hex')
   const presented = Buffer.from(selectedHash.slice('sha256:'.length), 'hex')
   requireIngest(retained.length === 32 && presented.length === 32 && timingSafeEqual(retained, presented), 'not-found')
-  const currentHistory = credentialHistory(record as RegistryBindingRecordV5 & {
-    readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
-  })
+  const currentHistory = confirmedBindingHistory(record, member, record.challenge.organizationId, now, audience)
   const { organizationId, instanceId, keyId } = record.challenge
   requireIngest(currentHistory.organizationId === organizationId && currentHistory.instanceId === instanceId
     && currentHistory.keys.length === 1 && currentHistory.keys[0]?.keyId === keyId, 'not-found')
