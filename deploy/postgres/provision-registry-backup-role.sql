@@ -106,20 +106,37 @@ where namespace.nspname <> :'target_schema'
   and namespace.nspname <> 'information_schema' and namespace.nspname !~ '^pg_'
 order by namespace.nspname
 \gexec
+-- Revoke every supported default ACL entry for registry_backup before installing
+-- the two exact target-schema grants below. defaclnamespace = 0 is a global
+-- default and therefore has no pg_namespace row; keep the LEFT JOIN and omit
+-- IN SCHEMA for those entries.
 select distinct case when defaults.defaclnamespace = 0 then format(
   'alter default privileges for role %I revoke all privileges on %s from registry_backup',
-  owner.rolname, case defaults.defaclobjtype when 'r' then 'tables' when 'S' then 'sequences' end)
+  owner.rolname, case defaults.defaclobjtype
+    when 'r' then 'tables'
+    when 'S' then 'sequences'
+    when 'f' then 'functions'
+    when 'T' then 'types'
+    when 'n' then 'schemas'
+    when 'L' then 'large objects'
+  end)
 else format(
   'alter default privileges for role %I in schema %I revoke all privileges on %s from registry_backup',
   owner.rolname, namespace.nspname,
-  case defaults.defaclobjtype when 'r' then 'tables' when 'S' then 'sequences' end)
+  case defaults.defaclobjtype
+    when 'r' then 'tables'
+    when 'S' then 'sequences'
+    when 'f' then 'functions'
+    when 'T' then 'types'
+  end)
 end
 from pg_default_acl as defaults
 join pg_roles as owner on owner.oid = defaults.defaclrole
 left join pg_namespace as namespace on namespace.oid = defaults.defaclnamespace
 cross join lateral aclexplode(defaults.defaclacl) as acl
-where defaults.defaclobjtype in ('r', 'S')
+where defaults.defaclobjtype in ('r', 'S', 'f', 'T', 'n', 'L')
   and acl.grantee = (select oid from pg_roles where rolname = 'registry_backup')
+  and (defaults.defaclnamespace = 0 or defaults.defaclobjtype not in ('n', 'L'))
 order by 1
 \gexec
 
@@ -158,6 +175,9 @@ do $verify$
 declare
   target_schema text := current_setting('app.backup_schema');
   backup_oid oid;
+  default_acl_count bigint;
+  allowed_default_acl_count bigint;
+  allowed_default_acl_types bigint;
 begin
   select oid into backup_oid from pg_roles
   where rolname = 'registry_backup' and rolcanlogin and not rolinherit and rolconnlimit = 2
@@ -297,28 +317,27 @@ begin
   ) then
     raise exception 'registry_backup sequence privileges are not target-only SELECT';
   end if;
-  if exists (
-    select 1 from pg_default_acl as defaults
-    left join pg_namespace as namespace on namespace.oid = defaults.defaclnamespace
-    cross join lateral aclexplode(defaults.defaclacl) as acl
-    left join pg_roles as owner on owner.oid = defaults.defaclrole
-    where acl.grantee = backup_oid
-      and (defaults.defaclnamespace = 0 or owner.rolname <> 'registry_migrator'
-        or namespace.nspname is distinct from target_schema
-        or defaults.defaclobjtype not in ('r', 'S')
-        or acl.privilege_type <> 'SELECT' or acl.is_grantable)
-  ) or exists (
-    select required.object_type
-    from (values ('r'::"char"), ('S'::"char")) as required(object_type)
-    where not exists (
-      select 1 from pg_default_acl as defaults
-      left join pg_namespace as namespace on namespace.oid = defaults.defaclnamespace
-      cross join lateral aclexplode(defaults.defaclacl) as acl
-      where defaults.defaclrole = (select oid from pg_roles where rolname = 'registry_migrator')
-        and defaults.defaclobjtype = required.object_type and namespace.nspname = target_schema
-        and acl.grantee = backup_oid and acl.privilege_type = 'SELECT' and not acl.is_grantable
-    )
-  ) then
+  -- LEFT JOIN is required: global defaults use defaclnamespace = 0 and must be
+  -- counted as invalid instead of disappearing from the verification query.
+  select count(*),
+    count(*) filter (where defaults.defaclnamespace <> 0
+      and owner.rolname = 'registry_migrator'
+      and namespace.nspname = target_schema
+      and defaults.defaclobjtype in ('r', 'S')
+      and acl.privilege_type = 'SELECT' and not acl.is_grantable),
+    count(distinct defaults.defaclobjtype) filter (where defaults.defaclnamespace <> 0
+      and owner.rolname = 'registry_migrator'
+      and namespace.nspname = target_schema
+      and defaults.defaclobjtype in ('r', 'S')
+      and acl.privilege_type = 'SELECT' and not acl.is_grantable)
+  into default_acl_count, allowed_default_acl_count, allowed_default_acl_types
+  from pg_default_acl as defaults
+  left join pg_roles as owner on owner.oid = defaults.defaclrole
+  left join pg_namespace as namespace on namespace.oid = defaults.defaclnamespace
+  cross join lateral aclexplode(defaults.defaclacl) as acl
+  where acl.grantee = backup_oid;
+  if default_acl_count <> 2 or allowed_default_acl_count <> 2
+    or allowed_default_acl_types <> 2 then
     raise exception 'registry_backup default privileges are not target-only SELECT';
   end if;
 end

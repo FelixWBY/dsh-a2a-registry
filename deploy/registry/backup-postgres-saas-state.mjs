@@ -592,20 +592,23 @@ async function backupRoleState(database, schema) {
     fail('registry_backup must not access schemas outside the target schema')
   }
   const defaults = await database.query(
-    `select count(*) filter (where
-       owner.rolname <> 'registry_migrator' or namespace.nspname is distinct from $1
-       or defaults.defaclobjtype not in ('r', 'S')
-       or acl.privilege_type <> 'SELECT' or acl.is_grantable)::integer as invalid,
+    `select count(*)::integer as total_items,
+       count(*) filter (where defaults.defaclnamespace <> 0
+         and owner.rolname = 'registry_migrator' and namespace.nspname = $1
+         and defaults.defaclobjtype in ('r', 'S')
+         and acl.privilege_type = 'SELECT' and not acl.is_grantable)::integer as allowed_items,
        count(distinct defaults.defaclobjtype) filter (where
-         owner.rolname = 'registry_migrator' and namespace.nspname = $1
+         defaults.defaclnamespace <> 0
+         and owner.rolname = 'registry_migrator' and namespace.nspname = $1
          and defaults.defaclobjtype in ('r', 'S')
          and acl.privilege_type = 'SELECT' and not acl.is_grantable)::integer as exact_types
      from pg_default_acl as defaults
-     join pg_roles as owner on owner.oid = defaults.defaclrole
+     left join pg_roles as owner on owner.oid = defaults.defaclrole
      left join pg_namespace as namespace on namespace.oid = defaults.defaclnamespace
      cross join lateral aclexplode(defaults.defaclacl) as acl
      where acl.grantee = (select oid from pg_roles where rolname = current_user)`, [schema])
-  if (defaults.rows.length !== 1 || defaults.rows[0]?.invalid !== 0
+  if (defaults.rows.length !== 1 || defaults.rows[0]?.total_items !== 2
+    || defaults.rows[0]?.allowed_items !== 2
     || defaults.rows[0]?.exact_types !== 2) {
     fail('registry_backup default privileges must be target-only SELECT')
   }

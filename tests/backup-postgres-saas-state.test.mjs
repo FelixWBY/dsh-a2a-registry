@@ -47,7 +47,7 @@ function migratorPostgres() {
   })
 }
 
-function backupPostgres({ invalidDefaults = 0 } = {}) {
+function backupPostgres({ extraDefaultAclItems = 0, inspectDefaultAclQuery = () => {} } = {}) {
   return Object.freeze({
     async query(statement) {
       if (statement.includes('from pg_roles as current_role')) return { rows: [{
@@ -64,7 +64,8 @@ function backupPostgres({ invalidDefaults = 0 } = {}) {
         return { rows: [{ can_use: true, can_create: false, direct_usage: true, invalid_direct: false }] }
       }
       if (statement.includes('from pg_default_acl')) {
-        return { rows: [{ invalid: invalidDefaults, exact_types: 2 }] }
+        inspectDefaultAclQuery(statement)
+        return { rows: [{ total_items: 2 + extraDefaultAclItems, allowed_items: 2, exact_types: 2 }] }
       }
       if (statement.includes("namespace.nspname <> $1")) return { rows: [{ accessible: 0 }] }
       if (statement.includes("relation.relkind in ('r', 'p', 'v', 'm', 'f')")) {
@@ -81,6 +82,17 @@ function backupPostgres({ invalidDefaults = 0 } = {}) {
     async close() {},
   })
 }
+
+test('backup role provisioning keeps global default ACLs in its exact scan', () => {
+  const sql = readFileSync(new URL('../deploy/postgres/provision-registry-backup-role.sql', import.meta.url), 'utf8')
+  const scans = [...sql.matchAll(/from pg_default_acl as defaults([\s\S]*?)(?:\\gexec|;)/gu)]
+  assert.equal(scans.length, 2)
+  for (const scan of scans) assert.match(scan[1], /left join pg_namespace as namespace/u)
+  assert.match(sql, /when defaults\.defaclnamespace = 0 then format/u)
+  assert.match(sql, /defaults\.defaclobjtype in \('r', 'S', 'f', 'T', 'n', 'L'\)/u)
+  assert.match(sql, /default_acl_count <> 2 or allowed_default_acl_count <> 2/u)
+  assert.match(sql, /allowed_default_acl_types <> 2/u)
+})
 
 test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable, and tamper evident', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dsh-postgres-saas-backup-'))
@@ -122,15 +134,22 @@ test('PostgreSQL SaaS backup set is exact, secret-free, independently verifiable
       }
       throw new Error('unexpected PostgreSQL tool fixture invocation')
     }
+    let defaultAclQuery = ''
     await assert.rejects(createBackupSet({
       schema: 'registry_saas',
       destination: join(root, 'global-default-acl-rejected'),
       quiesced: true,
       environment,
       openPostgres: async value => value === backupConnectionString
-        ? backupPostgres({ invalidDefaults: 1 }) : migratorPostgres(),
+        ? backupPostgres({
+          extraDefaultAclItems: 1,
+          inspectDefaultAclQuery: statement => { defaultAclQuery = statement },
+        }) : migratorPostgres(),
       runCommand,
     }), /default privileges must be target-only SELECT/u)
+    assert.match(defaultAclQuery, /left join pg_namespace/u)
+    assert.match(defaultAclQuery, /defaults\.defaclnamespace <> 0/u)
+    assert.match(defaultAclQuery, /count\(\*\)::integer as total_items/u)
     const openedConnections = []
     const created = await createBackupSet({
       schema: 'registry_saas',
