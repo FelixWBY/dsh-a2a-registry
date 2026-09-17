@@ -4,6 +4,7 @@ After=dsh-registry.service
 
 [Service]
 EnvironmentFile=/etc/dsh/registry-edge.env
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 ExecStartPre=/usr/bin/node /opt/dsh-a2a-registry/deploy/registry/check-production-environment.mjs edge
 LimitCORE=0
 PrivateDevices=true

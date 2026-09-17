@@ -2,13 +2,13 @@
 
 请按[独立部署说明](../README.md)操作。本目录提供独立 Registry、外部 Harness、OIDC 和多租户 PostgreSQL 所需的配置模板及本地运维工具，不再使用原单体仓库的启动命令。
 
-生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时、PostgreSQL RLS、持久导入队列和加密提问邮箱。所有 `.example` 文件均需替换为自己的环境配置，不包含真实凭据。`DSH_REGISTRY_MAILBOX_KEY` 必须是秘密管理器注入的规范 base64url 32 字节根密钥；Registry 按组织派生邮箱密钥，轮换前必须先完成现有密文的迁移演练，不能直接替换后丢失回复解密能力。
+生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时、PostgreSQL RLS、持久导入队列和加密提问邮箱。把 `registry-production.example.patch.yml` 安装为 `/etc/dsh/registry-production.patch.yml`，只在该最终 overlay 增加部署专属 provider；systemd 示例会对启动所用的同一组三层 patch 运行 `verify-production-graph.mjs`。生产 credentials provider 仅解析服务启动环境，文件、`.env` 和写入路径全部关闭。所有 `.example` 文件均不包含真实凭据；除只读安装的基础层外，部署副本应放在仓库外。`DSH_REGISTRY_MAILBOX_KEY` 必须是秘密管理器注入的规范 base64url 32 字节根密钥；Registry 按组织派生邮箱密钥，轮换前必须先完成现有密文的迁移演练，不能直接替换后丢失回复解密能力。
 
 SaaS 设备同步使用 v5 绑定内建认证：Harness 在本机生成 Ed25519 密钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。成员审批并由 Harness 签名确认后，本机保存 `dsh1` 设备 token 和私钥；连接 WSS 时仍须签署 Registry 的一次性随机挑战。人工配对码、网页账号会话和共享测试密钥都不能替代设备凭据。
 
 ## 设备自助绑定
 
-在 Harness 主机使用 Node.js 24 运行绑定工具。状态和输出必须使用绝对路径，所在目录须提前建立；工具不会覆盖已有文件。`start` 默认申请披露同步与 A2A 接收两项权限，并用 `wx` 独占方式创建状态文件；POSIX 主机会固定为 0600。Windows 不支持用 Node mode 位设置 NTFS DACL，必须在运行前把父目录的 ACL 限制为当前 Harness 服务账号（以及必要的 `SYSTEM`／管理员恢复账号），不能依赖 `chmod`：
+在 Harness 主机使用 Node.js 24 运行绑定工具。状态和输出必须使用绝对路径，所在目录须提前建立；工具不会覆盖已有文件。`start` 默认申请披露同步与 A2A 接收两项权限，并用 `wx` 独占方式创建状态文件；POSIX 主机会固定为 0600。Windows 不支持用 Node mode 位设置 NTFS DACL，必须在运行前把父目录的 ACL 限制为当前 Harness 服务账号（以及必要的 `SYSTEM`／管理员恢复账号），不能依赖 `chmod`。绑定工具和 Harness 启动器共用同一套 Windows 路径门禁：只接受本地固定盘、非卷根、逐级不含 junction／符号链接等重解析点的路径；凭据父目录必须关闭继承，父目录和文件不能含 Deny 条目，所有者和全部 Allow 条目只能是当前账号、`SYSTEM` 或本机管理员，并且当前账号必须拥有修改权限。门禁还会沿整条祖先目录链拒绝可由其他账号删除、换名或改写 ACL 的命名空间，防止检查后替换父目录。任何一项不满足时，`start` 会在创建状态文件和访问 Registry 前失败，`confirm` 会在读取状态或发出确认请求前失败，`export-env` 会在读取状态和创建环境文件前失败：
 
 ```powershell
 $privateDir = 'C:\dsh-private'
@@ -18,7 +18,7 @@ $harnessPrincipal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Na
 if ($LASTEXITCODE -ne 0) { throw '无法设置 Harness 私有目录 ACL' }
 ```
 
-上述命令应由实际运行 Harness 的 Windows 账号执行；若由管理员代建目录，请把 `$harnessPrincipal` 明确改为该服务账号。确认 ACL 设置成功后再运行：
+上述命令应由实际运行 Harness 的 Windows 账号执行；若由管理员代建目录，请把 `$harnessPrincipal` 明确改为该服务账号。`/grant:r` 不会清除其他账号已有的显式 Allow，路径门禁仍会逐条复核并拒绝；不要把状态、token、私钥或环境文件内容放进命令行或诊断输出。确认 ACL 设置成功后再运行：
 
 ```powershell
 node deploy/registry/enroll-registry-device.mjs start `
@@ -39,15 +39,20 @@ node deploy/registry/enroll-registry-device.mjs export-env `
   --output C:\dsh-private\harness-registry.env
 ```
 
-确认成功会原子替换状态文件，删除配对码和独立 raw secret 字段；同一个设备 secret 已封装进 `dsh1` token，因此 token 与 Ed25519 PKCS8 私钥仍是长期敏感凭据。导出的五个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供启用完整披露链路的 `harness-production-publication.example.patch.yml` 使用；后者还必须配置 KMS 与披露权威实现。两个文件都含设备凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
+确认成功会在再次复核路径和 ACL 后原子替换状态文件，删除配对码和独立 raw secret 字段；同一个设备 secret 已封装进 `dsh1` token，因此 token 与 Ed25519 PKCS8 私钥仍是长期敏感凭据。导出的五个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供启用完整披露链路的 `harness-production-publication.example.patch.yml` 使用；后者还必须配置 KMS 与披露权威实现。两个文件都含设备凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
 
 在连接某个 Harness 源码版本前，先运行无秘密的线协议兼容检查：
 
 ```powershell
-npm run verify:harness-compatibility -- --harness-root C:\path\to\deepseek-harness
+npm run verify:harness-compatibility -- `
+  --harness-root C:\path\to\deepseek-harness `
+  --node-path C:\path\to\node.exe `
+  --overlay C:\path\to\dsh-a2a-registry\deploy\registry\harness-registry-connection.example.patch.yml
 ```
 
-检查会由当前 Registry 编码一个带签名事件和固定检查点的 v1 导入帧，再分别调用目标 Harness 的源码解码器与已构建 CLI 实际解析的 package export 读取；任一缺失、过期或拒绝时都不得启动真实接入。v1 帧只携带稳定操作标识，目标 Harness 以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立计算并核对完成回执中的 Session 标识。检查器不读取设备凭据，并把子进程环境缩减为运行 Node 所需的系统变量，但它会执行目标 checkout，因此只能指向可信目录，且不应从带生产秘密的交互 shell 运行。该检查不代替 WSS 握手、披露密钥分发、模型执行和离线恢复验收。
+检查使用显式指定的目标 Node.js 24 或更高版本。Registry 会编码 `challenge`、`authenticated`、`heartbeat-ack` 和带签名固定检查点的 `import-dispatch`，交给目标 Harness 的源码与已构建 codec 解码；目标 codec 再编码无凭据的 `hello`、固定伪签名 `prove` 和 `heartbeat`，由 Registry 解码。随后目标源码和已构建 web-app 会用自己的 app-boot 解析传入的实际连接专用 overlay，并以 `ProductionRegistryConnectionConfigSchema` 校验其中的真实字段；最后已构建 CLI 在新建的临时工作目录和临时 `DSH_HOME` 内执行 `--dump-config`，确认该 overlay 确实合成为唯一的 connection-only `web-runtime`，完成后删除临时目录，不写目标 Harness 的真实 profile。
+
+检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名只验证 v1 codec 兼容，不证明 WSS 挑战已由真实设备私钥签署；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
 
 Windows 本地验收可在 `export-env` 后用 `start-bound-harness.ps1` 从独立的 Harness 源码 checkout 启动上述连接专用 overlay。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程，也不会修改 Harness 源码；CLI 从源码的已构建 `apps/cli/lib/bin.js` 读取，工作目录、DSH_HOME 和日志均在外部私有目录。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 

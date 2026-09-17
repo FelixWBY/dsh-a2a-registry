@@ -4,7 +4,11 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { verifyHttpRedirectValue, verifyRuntimeConfigurationValue } from '../deploy/registry/verify-public-registry.mjs'
+import {
+  buildHttpRedirectProbes,
+  verifyHttpRedirectValue,
+  verifyRuntimeConfigurationValue,
+} from '../deploy/registry/verify-public-registry.mjs'
 
 const registryVariables = /^(?:DSH_|REGISTRY_DOMAIN$|REGISTRY_BACKUP_PASSWORD$)/u
 
@@ -97,13 +101,29 @@ test('public HTTP entry redirects permanently to the exact same HTTPS request ta
     'https://registry.acme.dev/wrong?verification=public-entry'), /does not preserve/u)
 })
 
-test('systemd production examples disable core dumps and private device access', () => {
+test('public HTTP redirect probes cover unpredictable page, API and WSS targets with GET and POST', () => {
+  const nonce = '0123456789abcdef0123456789abcdef'
+  const probes = buildHttpRedirectProbes(nonce)
+  assert.equal(probes.length, 5)
+  assert.deepEqual(new Set(probes.map(probe => probe.method)), new Set(['GET', 'POST']))
+  assert.ok(probes.some(probe => probe.path.startsWith('/?verification=')))
+  assert.ok(probes.some(probe => probe.path.startsWith('/registry-api/v1/status?verification=')))
+  assert.ok(probes.some(probe => probe.path.startsWith('/a2a/v1/sync?verification=')))
+  assert.ok(probes.some(probe => probe.path.includes(nonce)))
+  assert.equal(new Set(probes.map(probe => probe.path)).size, probes.length)
+  assert.throws(() => buildHttpRedirectProbes('predictable'), /nonce is invalid/u)
+})
+
+test('systemd production examples disable runtime injection, core dumps and private device access', () => {
   for (const relativePath of [
     'deploy/registry/dsh-registry.service.example',
     'deploy/registry/dsh-harness.service.example',
     'deploy/registry/caddy-registry.service.conf.example',
   ]) {
     const unit = readFileSync(new URL(`../${relativePath}`, import.meta.url), 'utf8')
+    assert.match(unit,
+      /^UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT$/mu,
+      `${relativePath} must clear inherited runtime injection variables`)
     assert.match(unit, /^LimitCORE=0$/mu, `${relativePath} must disable core dumps`)
     assert.match(unit, /^PrivateDevices=true$/mu, `${relativePath} must hide host devices`)
   }

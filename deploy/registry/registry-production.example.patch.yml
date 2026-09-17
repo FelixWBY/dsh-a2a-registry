@@ -1,0 +1,5 @@
+# Deployment-owned final production overlay. Install a copy at
+# /etc/dsh/registry-production.patch.yml and add only reviewed production
+# providers or overrides. The Registry service applies the checked single-host
+# and PostgreSQL layers before this file.
+[]

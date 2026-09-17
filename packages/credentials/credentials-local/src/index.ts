@@ -70,6 +70,8 @@ export interface Config {
   watch?: boolean
   /** Watcher write-settle window in milliseconds; defaults to 100. */
   debounceMs?: number
+  /** Resolve inherited process values only; disables every file, dotenv and write path. */
+  environmentOnly?: boolean
 }
 
 /** Fully resolved provider parameters; defaulting happens here, never inline. */
@@ -509,7 +511,7 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
     && sameJsonValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]))
 }
 
-/** File-backed credentials provider (`$DSH_HOME/.credentials.yaml`). */
+/** File-backed credentials provider (`$DSH_HOME/.credentials.yaml`), or an inherited-environment-only reader. */
 export class LocalCredentialProvider extends CredentialProvider {
   /* jscpd:ignore-start -- deliberate config-surface and lifecycle symmetry with
      settings-file (prefer symmetry for parallel values); extracting the shared
@@ -519,9 +521,11 @@ export class LocalCredentialProvider extends CredentialProvider {
     dshHome: z.string(),
     watch: z.boolean().default(true),
     debounceMs: z.number().min(0).default(100),
+    environmentOnly: z.boolean().default(false),
   })
 
   private readonly spec: ResolvedSpec
+  private readonly environmentOnly: boolean
   /**
    * Raw text of the last read or persisted document; `undefined` while the
    * file is absent. Watcher events whose content equals this cache are no-ops,
@@ -552,6 +556,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     // Programmatic construction may bypass Schemastery normalization; resolve
     // the same defaults in one explicit step either way.
     this.spec = resolveSpec(config)
+    this.environmentOnly = config.environmentOnly ?? false
   }
 
   /** The inherited-environment value for a reference, or `undefined` when empty or unset. */
@@ -566,6 +571,7 @@ export class LocalCredentialProvider extends CredentialProvider {
    * environment layering: the more specific location wins.
    */
   private dotenvFallback(ref: CredentialRef): LaunchEnvironmentEntry | undefined {
+    if (this.environmentOnly) return undefined
     const entry = launchEnvironmentOf(this.ctx).getFrom(ref, ['project-env', 'user-env'])
     return entry !== undefined && entry.value.length > 0 ? entry : undefined
   }
@@ -577,6 +583,7 @@ export class LocalCredentialProvider extends CredentialProvider {
       this.closed = true
       await this.operations
     }
+    if (this.environmentOnly) return
     await this.loadInitial()
     if (!this.spec.watch) return
     /* jscpd:ignore-start -- same watcher discipline as settings-file by design:
@@ -631,6 +638,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     if (this.inherited(ref) !== undefined) {
       return Promise.resolve({ configured: true, source: 'env', writable: false })
     }
+    if (this.environmentOnly) return Promise.resolve({ configured: false, writable: false })
     const stored = this.values.get(ref)
     if (stored !== undefined) return Promise.resolve({ configured: true, source: 'file', writable: true })
     const fallback = this.dotenvFallback(ref)
@@ -639,6 +647,7 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override async set(ref: CredentialRef, value: string): Promise<void> {
+    this.assertFileStoreEnabled(`set "${ref}"`)
     if (value.length === 0) {
       throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
     }
@@ -646,14 +655,17 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override async unset(ref: CredentialRef): Promise<void> {
+    this.assertFileStoreEnabled(`unset "${ref}"`)
     await this.write(ref, undefined)
   }
 
   override readRecord(key: CredentialKey): Promise<CredentialRecord | undefined> {
+    if (this.environmentOnly) return Promise.resolve(undefined)
     return Promise.resolve(this.records.get(key))
   }
 
   override describeRecord(key: CredentialKey): Promise<CredentialRecordInfo> {
+    if (this.environmentOnly) return Promise.resolve({ configured: false, writable: false })
     const stored = this.records.get(key)
     // Presence is the whole fact here: no layer ranks above this document for
     // a record, so nothing can shadow one, and an api-key record carrying
@@ -664,6 +676,7 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override listRecords(): Promise<readonly CredentialRecordEntry[]> {
+    if (this.environmentOnly) return Promise.resolve([])
     return Promise.resolve([...this.records].map(([key, record]) => ({
       // The parser has already proven every stored key addressable.
       key: parseCredentialKey(key),
@@ -675,6 +688,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     key: CredentialKey,
     mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>,
   ): Promise<CredentialRecord | undefined> {
+    this.assertFileStoreEnabled(`modify "${key}"`)
     if (this.isClosed()) throw new Error(`credentials-local is disposed: cannot modify "${key}"`)
     return this.enqueue(async () => {
       if (this.isClosed()) {
@@ -707,6 +721,7 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override async deleteRecord(key: CredentialKey): Promise<void> {
+    this.assertFileStoreEnabled(`delete "${key}"`)
     if (this.isClosed()) throw new Error(`credentials-local is disposed: cannot delete "${key}"`)
     await this.enqueue(async () => {
       if (this.isClosed()) {
@@ -797,6 +812,13 @@ export class LocalCredentialProvider extends CredentialProvider {
         `credentials-local: "${ref}" is supplied read-only by the launching environment, so ${verb} would be`
         + ' shadowed; unset it in the shell you start dsh from instead',
       )
+    }
+  }
+
+  /** Environment-only production providers expose no writable or file-backed credential surface. */
+  private assertFileStoreEnabled(action: string): void {
+    if (this.environmentOnly) {
+      throw new Error(`credentials-local: environment-only mode is read-only; cannot ${action}`)
     }
   }
 

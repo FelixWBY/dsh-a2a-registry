@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { realpathSync } from 'node:fs'
 import { isIP } from 'node:net'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,8 +9,6 @@ import { fileURLToPath } from 'node:url'
 const TIMEOUT_MS = 10_000
 const MAX_FRAME_BYTES = 1_048_576
 const MAX_STATUS_BYTES = 8_192
-const HTTP_REDIRECT_PROBE_PATH = '/.well-known/dsh-registry-http-redirect-check'
-const HTTP_REDIRECT_PROBE_SEARCH = '?verification=public-entry'
 const REQUIRED_RUNTIME_CAPABILITIES = [
   'identity', 'registry', 'disclosureOperations', 'deviceBinding',
   'audit', 'rateLimits', 'disclosureCleanup', 'mailboxCleanup',
@@ -110,25 +109,46 @@ export function verifyHttpRedirectValue(expectedOrigin, requestedUrl, status, lo
   }
 }
 
-async function verifyHttpRedirect() {
+/** Build unpredictable, representative port-80 probes so one allow-listed path cannot satisfy the gate. */
+export function buildHttpRedirectProbes(nonce) {
+  if (!/^[0-9a-f]{32}$/u.test(nonce)) fail('the HTTP redirect probe nonce is invalid')
+  const search = `?verification=${nonce}`
+  return [
+    { method: 'GET', path: `/${search}` },
+    { method: 'GET', path: `/registry-api/v1/status${search}` },
+    { method: 'GET', path: `/a2a/v1/sync${search}` },
+    { method: 'GET', path: `/.well-known/dsh-registry-http-redirect-check/${nonce}${search}` },
+    { method: 'POST', path: `/registry-api/v1/http-redirect-check/${nonce}${search}` },
+  ]
+}
+
+async function verifyHttpRedirectProbe(probe) {
   const requestedUrl = new URL(origin)
   requestedUrl.protocol = 'http:'
-  requestedUrl.pathname = HTTP_REDIRECT_PROBE_PATH
-  requestedUrl.search = HTTP_REDIRECT_PROBE_SEARCH
+  const target = new URL(probe.path, requestedUrl)
+  requestedUrl.pathname = target.pathname
+  requestedUrl.search = target.search
   let response
   try {
     response = await fetch(requestedUrl, {
+      method: probe.method,
       redirect: 'manual',
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
   } catch {
-    fail('HTTP port 80 could not be reached for the HTTPS redirect check')
+    fail(`HTTP port 80 could not be reached for the ${probe.method} ${requestedUrl.pathname} redirect check`)
   }
   try {
     verifyHttpRedirectValue(origin, requestedUrl, response.status, response.headers.get('location'))
   } finally {
     await response.body?.cancel().catch(() => undefined)
   }
+}
+
+async function verifyHttpRedirects() {
+  const probes = buildHttpRedirectProbes(randomBytes(16).toString('hex'))
+  await Promise.all(probes.map(verifyHttpRedirectProbe))
+  return probes.length
 }
 
 async function read(path) {
@@ -271,7 +291,7 @@ async function main() {
   try {
     origin = publicOrigin(rawOrigin)
     checkNodeRuntime()
-    await verifyHttpRedirect()
+    const redirectProbeCount = await verifyHttpRedirects()
     await verifyProbe('/healthz')
     await verifyProbe('/readyz')
     await verifyRuntimeConfiguration()
@@ -280,7 +300,7 @@ async function main() {
     process.stdout.write([
       'registry-public-verification: passed',
       `- origin: ${origin.origin}`,
-      '- HTTP port 80: permanent same-origin HTTPS redirect preserves the request target',
+      `- HTTP port 80: ${String(redirectProbeCount)} GET/POST probes permanently redirect to the same HTTPS request target`,
       '- HTTPS shell, HSTS and browser security headers: valid',
       '- liveness and shell readiness: ready',
       '- tenancy: SaaS tenant router loaded; deployment mode: standard',
@@ -295,4 +315,5 @@ async function main() {
   }
 }
 
-if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main()
+if (process.argv[1] !== undefined
+  && realpathSync.native(resolve(process.argv[1])) === realpathSync.native(fileURLToPath(import.meta.url))) await main()

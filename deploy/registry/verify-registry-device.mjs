@@ -175,38 +175,9 @@ async function close(socket) {
   })
 }
 
-async function main() {
-  if (process.argv.length !== 2) {
-    fail('usage: node --env-file=<harness.env> deploy/registry/verify-registry-device.mjs', 2)
-    return
-  }
-  let token
-  let encodedPrivateKey
+async function authenticateOnce({ WebSocket, url, codec, identity, key, token, organizationId, instanceId, abrupt }) {
   let socket
   try {
-    checkNodeRuntime()
-    const domain = required('REGISTRY_DOMAIN')
-    const url = endpoint(required('DSH_REGISTRY_SYNC_URL'), domain)
-    const organizationId = dshIdentifier('DSH_REGISTRY_ORGANIZATION_ID', required('DSH_REGISTRY_ORGANIZATION_ID'))
-    const instanceId = dshIdentifier('DSH_INSTANCE_ID', required('DSH_INSTANCE_ID'))
-    token = required('DSH_REGISTRY_DEVICE_TOKEN', 16)
-    encodedPrivateKey = required('DSH_REGISTRY_DEVICE_PRIVATE_KEY', 32)
-    delete process.env.DSH_REGISTRY_DEVICE_TOKEN
-    delete process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY
-
-    let codec
-    let identity
-    try {
-      [codec, identity] = await Promise.all([
-        import('@deepseek-ai/dsh-a2a-registry-sync'),
-        import('@deepseek-ai/dsh-a2a-device-identity/runtime'),
-      ])
-    } catch {
-      throw new Error('Registry dependencies unavailable; run npm ci and invoke this script with node --import tsx/esm')
-    }
-    const key = signingKey(encodedPrivateKey)
-    const requireFromClient = createRequire(new URL('../../packages/bundle/registry-app/package.json', import.meta.url))
-    const WebSocket = requireFromClient('ws')
     socket = new WebSocket(url, {
       rejectUnauthorized: true,
       followRedirects: false,
@@ -233,13 +204,61 @@ async function main() {
     if (!Number.isSafeInteger(heartbeat.observedAt) || heartbeat.observedAt < 0) {
       throw new Error('Registry returned an invalid heartbeat acknowledgement')
     }
+    if (abrupt) {
+      socket.terminate()
+      await close(socket)
+      socket = undefined
+    }
+    return { keyId: challenge.keyId, nonce: challenge.nonce }
+  } finally {
+    if (socket !== undefined) await close(socket)
+  }
+}
+
+async function main() {
+  if (process.argv.length !== 2) {
+    fail('usage: node --env-file=<harness.env> deploy/registry/verify-registry-device.mjs', 2)
+    return
+  }
+  let token
+  let encodedPrivateKey
+  try {
+    checkNodeRuntime()
+    const domain = required('REGISTRY_DOMAIN')
+    const url = endpoint(required('DSH_REGISTRY_SYNC_URL'), domain)
+    const organizationId = dshIdentifier('DSH_REGISTRY_ORGANIZATION_ID', required('DSH_REGISTRY_ORGANIZATION_ID'))
+    const instanceId = dshIdentifier('DSH_INSTANCE_ID', required('DSH_INSTANCE_ID'))
+    token = required('DSH_REGISTRY_DEVICE_TOKEN', 16)
+    encodedPrivateKey = required('DSH_REGISTRY_DEVICE_PRIVATE_KEY', 32)
+    delete process.env.DSH_REGISTRY_DEVICE_TOKEN
+    delete process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY
+
+    let codec
+    let identity
+    try {
+      [codec, identity] = await Promise.all([
+        import('@deepseek-ai/dsh-a2a-registry-sync'),
+        import('@deepseek-ai/dsh-a2a-device-identity/runtime'),
+      ])
+    } catch {
+      throw new Error('Registry dependencies unavailable; run npm ci and invoke this script with node --import tsx/esm')
+    }
+    const key = signingKey(encodedPrivateKey)
+    const requireFromClient = createRequire(new URL('../../packages/bundle/registry-app/package.json', import.meta.url))
+    const WebSocket = requireFromClient('ws')
+    const connection = { WebSocket, url, codec, identity, key, token, organizationId, instanceId }
+    const first = await authenticateOnce({ ...connection, abrupt: true })
+    const second = await authenticateOnce({ ...connection, abrupt: false })
+    if (second.keyId !== first.keyId || second.nonce === first.nonce) {
+      throw new Error('Registry reconnect did not preserve the device key or issue a fresh challenge')
+    }
     process.stdout.write([
-      'registry-device-verification: authenticated WSS succeeded',
+      'registry-device-verification: authenticated WSS and reconnect succeeded',
       `- endpoint: ${url}`,
       `- organization: ${organizationId}`,
       `- instance: ${instanceId}`,
-      `- key: ${challenge.keyId}`,
-      '- TLS trust, device challenge, identity match and heartbeat: valid',
+      `- key: ${second.keyId}`,
+      '- TLS trust, fresh device challenges, identity match, heartbeat and reconnect: valid',
       '- disclosure scopes, publication, import, questions, KMS and IdP still require separate verification',
       '',
     ].join('\n'))
@@ -248,7 +267,6 @@ async function main() {
   } finally {
     token = undefined
     encodedPrivateKey = undefined
-    if (socket !== undefined) await close(socket)
   }
 }
 

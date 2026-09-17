@@ -16,19 +16,22 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 
 浏览器登录必须使用支持 Token Introspection 的 OIDC 服务。Registry Cookie 只保存经过 HMAC 的随机会话 ID 和期限，Access Token 仅保留在当前 Registry 进程的有界内存中；每个新的受保护 HTTP 请求都会向身份服务重新确认 `active`、`sub`，并在响应提供时核对 `exp`、`client_id` 和 `iss`。停用用户或不一致响应会立即删除本地会话，身份服务超时或协议失败会拒绝受保护请求。`maxActiveSessions` 是单进程硬上限，满额时新会话失败关闭；`maxSessionsPerSubject` 限制同一 OIDC 主体的并发会话，超额时按签发时间和会话 ID 确定性淘汰最旧会话。当前只支持单副本，Registry 重启会使全部浏览器会话失效并要求重新登录。正式身份服务必须实测用户停用后下一次 introspection 返回非活动状态，不能只凭发现文档存在该端点就宣称验收完成。
 
-普通服务器或已有身份服务可以直接使用 OIDC patch：
+普通服务器或已有身份服务使用仓库内已经过配置图门禁的基础层和 PostgreSQL 层，再叠加部署者自己的最终 overlay。先把空的 `registry-production.example.patch.yml` 复制到 `/etc/dsh/registry-production.patch.yml`；以后只在这份部署文件中增加经过审查的 KMS、支付或其他生产 provider：
 
 ```sh
-npm start -- --patch /etc/dsh/registry-production.patch.yml
+npm start -- \
+  --patch deploy/registry/registry-single-host.example.patch.yml \
+  --patch deploy/registry/registry-postgres.example.patch.yml \
+  --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；真实 Harness 仍需实现提问消费、隔离执行与回复提交。该模板尚未配置披露解密提供方，因此固定 checkpoint 正文读取接口仍返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板，内建 provider 只解析启动进程继承的环境变量，不能读取 `.env`、本地凭据文件或写入秘密；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由和 PostgreSQL RLS。由于 Loader 的 `config` patch 是整体替换，PostgreSQL 层显式携带完整 OIDC、API、限流、告警和同步配置，不能删成看似等价的局部片段。`verify-production-graph.mjs` 会按启动顺序合成同一组 patch，并在缺少 credentials、非回环监听、非 PostgreSQL domain、迁移模式、不安全共库、本地／测试插件或非 introspection OIDC 时阻止启动。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；真实 Harness 仍需实现提问消费、隔离执行与回复提交。该模板尚未配置披露解密提供方，因此固定 checkpoint 正文读取接口仍返回 501；P-KMS 仍未完成，但 KMS 缺失本身不会阻止 Registry 启动。
 
 ## 公网入口
 
 把代码安装到 `/opt/dsh-a2a-registry`，Registry 只监听回环 3081；使用 `registry/Caddyfile.example` 在正式域名提供 HTTPS/WSS。`registry/dsh-registry.service.example` 已指向独立启动器。确保服务用户可以写入自己的 DSH_HOME 与三套数据库目录，不能读取 Harness 设备私钥。
 
-三个 systemd 示例都用 `LimitCORE=0` 禁止生成可能含会话、设备或数据库凭据的 core dump，并用 `PrivateDevices=true` 隐藏主机设备节点。这两项不会关闭 Registry、Harness 或 Caddy 需要的普通网络与工作目录访问。不要盲目追加 `MemoryDenyWriteExecute=true`、`PrivateNetwork=true` 或未验证的系统调用过滤：它们可能破坏 Node.js JIT、公网 WSS／OIDC 或 Harness 工作区。
+三个 systemd 示例都会在执行预检前清除 `NODE_OPTIONS`、`NODE_PATH`、`NODE_TLS_REJECT_UNAUTHORIZED` 和动态链接器注入变量，避免全局服务环境或秘密文件在预检启动前加载代码、改写模块解析或关闭 TLS 校验；生产所需变量必须逐项写入对应的受限环境文件。示例同时用 `LimitCORE=0` 禁止生成可能含会话、设备或数据库凭据的 core dump，并用 `PrivateDevices=true` 隐藏主机设备节点。这些设置不会关闭 Registry、Harness 或 Caddy 需要的普通网络与工作目录访问。不要盲目追加 `MemoryDenyWriteExecute=true`、`PrivateNetwork=true` 或未验证的系统调用过滤：它们可能破坏 Node.js JIT、公网 WSS／OIDC 或 Harness 工作区。
 
 不要将本地 Keycloak 的 `start-dev`、测试身份或回环 HTTP 配置直接作为公网生产配置。
 
@@ -40,7 +43,9 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 
 `registry` 范围是公网 SaaS 门禁：必须显式提供使用 `registry_app` 角色的 PostgreSQL URL 和 SaaS 初始化信息，单组织 SQLite 配置不能通过。公网验证还会从服务端状态接口确认实时 `registryTenantRouter` 已加载，不以浏览器缓存或单纯的 `standard` 部署标签代替。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
 
-公网验证器会先直接访问正式域名的 HTTP 80 端口，并以 `manual` 模式检查跳转而不自动跟随。只接受 301／308 永久跳转，`Location` 必须是不含用户名或密码的同域 HTTPS 443 地址，并完整保留探测请求的路径与查询；跨域、非 HTTPS、非 443、相对跳转、错误路径或附加片段都会失败。端口 80 只能承担该跳转，Registry 页面、API 与 WSS 均只由 443 提供。
+设备验证会使用同一凭据完成两轮独立的 WSS 挑战、认证和心跳：第一轮主动断开，第二轮必须取得新的挑战并以同一设备公钥重新认证。它证明公网链路允许设备重连，但不代替 Harness 自身的持久离线队列、进程重启恢复和业务消费验收。
+
+公网验证器会先直接访问正式域名的 HTTP 80 端口，并以 `manual` 模式检查跳转而不自动跟随。每次生成新的随机探测值，同时覆盖首页、状态 API、WSS 路径、不可预知路径和 GET／POST，避免边缘层只对白名单探针伪造通过。所有探测都只接受 301／308 永久跳转，`Location` 必须是不含用户名或密码的同域 HTTPS 443 地址，并完整保留各自请求的路径与查询；跨域、非 HTTPS、非 443、相对跳转、错误路径或附加片段都会失败。端口 80 只能承担该跳转，Registry 页面、API 与 WSS 均只由 443 提供。
 
 `/healthz` 只用于判断 Registry 进程是否存活。`/readyz` 还会等待应用加载完成，并在 SaaS 模式分别通过实际 storage pool 与 tenancy pool 核对 PostgreSQL 权威版本标记；非 PostgreSQL domain 路由、数据库中断或标记缺失时返回 503，数据库恢复后会自动恢复为 200。该数据库探针按进程单飞、短暂缓存，HTTP 决策在 2 秒内失败关闭，底层查询与新建连接也分别受 1.5 秒和 10 秒硬上限约束。Caddy 的上游健康检查使用 `/readyz`。
 

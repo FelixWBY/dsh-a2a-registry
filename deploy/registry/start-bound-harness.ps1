@@ -40,147 +40,13 @@ $deviceEnvironmentNames = @(
   'DSH_REGISTRY_DEVICE_PRIVATE_KEY'
 )
 
-function Assert-AbsoluteWindowsPath([string]$Path, [string]$Label) {
-  if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Contains([char]0) -or
-    $Path -notmatch '^[A-Za-z]:[\\/]') {
-    throw "$Label 必须是本地固定磁盘上的绝对 Windows 路径。"
-  }
-  $driveName = $Path.Substring(0, 1)
-  $drive = Get-PSDrive -Name $driveName -PSProvider FileSystem -ErrorAction Stop
-  $driveInfo = New-Object IO.DriveInfo("${driveName}:\")
-  if ($null -ne $drive.DisplayRoot -or $driveInfo.DriveType -ne [IO.DriveType]::Fixed) {
-    throw "$Label 必须位于本地固定磁盘，不能使用映射盘、UNC 或可移动介质。"
-  }
-}
-
-function Assert-NoReparsePointInPath([string]$Path, [string]$Label) {
-  $fullPath = [IO.Path]::GetFullPath($Path)
-  $root = [IO.Path]::GetPathRoot($fullPath)
-  $current = $root
-  foreach ($segment in $fullPath.Substring($root.Length).Split(
-      [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar),
-      [StringSplitOptions]::RemoveEmptyEntries)) {
-    $current = Join-Path $current $segment
-    $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw "$Label 的路径不能穿过重解析点。"
-    }
-  }
-}
-
-function Resolve-ExistingFile([string]$Path, [string]$Label) {
-  Assert-AbsoluteWindowsPath $Path $Label
-  $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
-  if ($resolved.Provider.Name -ne 'FileSystem') { throw "$Label 必须位于文件系统。" }
-  $item = Get-Item -LiteralPath $resolved.ProviderPath -Force
-  Assert-NoReparsePointInPath $item.FullName $Label
-  if ($item.PSIsContainer) {
-    throw "$Label 必须是普通文件，不能是目录或重解析点。"
-  }
-  return [IO.Path]::GetFullPath($item.FullName)
-}
-
-function Resolve-ExistingDirectory([string]$Path, [string]$Label) {
-  Assert-AbsoluteWindowsPath $Path $Label
-  $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
-  if ($resolved.Provider.Name -ne 'FileSystem') { throw "$Label 必须位于文件系统。" }
-  $item = Get-Item -LiteralPath $resolved.ProviderPath -Force
-  Assert-NoReparsePointInPath $item.FullName $Label
-  if (-not $item.PSIsContainer) {
-    throw "$Label 必须是普通目录，不能是文件或重解析点。"
-  }
-  $fullPath = [IO.Path]::GetFullPath($item.FullName)
-  $root = [IO.Path]::GetPathRoot($fullPath)
-  if ($fullPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) -eq
-    $root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) {
-    throw "$Label 不能是卷根目录。"
-  }
-  return $fullPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-}
+. (Join-Path $PSScriptRoot 'windows-private-path-gate.ps1')
 
 function Assert-OutsideDirectory([string]$Path, [string]$Directory, [string]$Label) {
   $prefix = $Directory + [IO.Path]::DirectorySeparatorChar
   if ($Path.Equals($Directory, [StringComparison]::OrdinalIgnoreCase) -or
     $Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "$Label 不能放在 Harness 源码目录内。"
-  }
-}
-
-function Get-Sid([object]$Identity) {
-  try {
-    if ($Identity -is [Security.Principal.SecurityIdentifier]) { return $Identity.Value }
-    $reference = if ($Identity -is [Security.Principal.IdentityReference]) {
-      $Identity
-    } else {
-      New-Object Security.Principal.NTAccount([string]$Identity)
-    }
-    return $reference.Translate([Security.Principal.SecurityIdentifier]).Value
-  } catch {
-    throw '无法验证 ACL 中的账号。'
-  }
-}
-
-function Assert-PrivateAcl([string]$Path, [string]$Label, [bool]$RequireProtectedInheritance) {
-  $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $allowedSids = @(
-    $currentSid,
-    'S-1-5-18',       # LocalSystem
-    'S-1-5-32-544'    # BUILTIN\Administrators，可选恢复账号
-  )
-  $acl = Get-Acl -LiteralPath $Path
-  if ($RequireProtectedInheritance -and -not $acl.AreAccessRulesProtected) {
-    throw "$Label 必须先关闭 ACL 继承。"
-  }
-  $ownerSid = Get-Sid $acl.Owner
-  if ($allowedSids -notcontains $ownerSid) {
-    throw "$Label 的所有者不在允许列表中。"
-  }
-  $currentUserCanRead = $false
-  foreach ($rule in $acl.Access) {
-    if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-    $sid = Get-Sid $rule.IdentityReference
-    if ($allowedSids -notcontains $sid) {
-      throw "$Label 含有未授权账号的 Allow 权限。"
-    }
-    if ($sid -eq $currentSid -and
-      (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Read) -ne 0)) {
-      $currentUserCanRead = $true
-    }
-  }
-  if (-not $currentUserCanRead) { throw "$Label 未授权当前 Harness 账号读取。" }
-}
-
-function Assert-NoUnauthorizedWriteAcl(
-  [string]$Path,
-  [string]$Label,
-  [bool]$RequireProtectedInheritance
-) {
-  $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $allowedSids = @(
-    $currentSid,
-    'S-1-5-18',       # LocalSystem
-    'S-1-5-32-544'    # BUILTIN\Administrators
-  )
-  $writeMask = [Security.AccessControl.FileSystemRights]::Write `
-    -bor [Security.AccessControl.FileSystemRights]::Modify `
-    -bor [Security.AccessControl.FileSystemRights]::Delete `
-    -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles `
-    -bor [Security.AccessControl.FileSystemRights]::ChangePermissions `
-    -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
-  $acl = Get-Acl -LiteralPath $Path
-  if ($RequireProtectedInheritance -and -not $acl.AreAccessRulesProtected) {
-    throw "$Label 必须先关闭 ACL 继承。"
-  }
-  $ownerSid = Get-Sid $acl.Owner
-  if ($allowedSids -notcontains $ownerSid) {
-    throw "$Label 的所有者不在可信列表中。"
-  }
-  foreach ($rule in $acl.Access) {
-    if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-    $sid = Get-Sid $rule.IdentityReference
-    if ($allowedSids -notcontains $sid -and (($rule.FileSystemRights -band $writeMask) -ne 0)) {
-      throw "$Label 允许未授权账号修改可执行内容。"
-    }
   }
 }
 
@@ -370,6 +236,13 @@ $launcherRoot = Resolve-ExistingDirectory $PSScriptRoot '启动器目录'
 $overlayPath = Resolve-ExistingFile (Join-Path $launcherRoot 'harness-registry-connection.example.patch.yml') '连接专用 overlay'
 $envParent = Resolve-ExistingDirectory (Split-Path -Parent $EnvFile) 'EnvFile 父目录'
 $caParent = Resolve-ExistingDirectory (Split-Path -Parent $CaCertificate) 'CaCertificate 父目录'
+Assert-NoUntrustedNamespaceReplacement $envParent 'EnvFile 父目录'
+Assert-NoUntrustedNamespaceReplacement $DshHome 'DshHome'
+Assert-NoUntrustedNamespaceReplacement $LogDirectory 'LogDirectory'
+Assert-NoUntrustedNamespaceReplacement $HarnessRoot 'HarnessRoot'
+Assert-NoUntrustedNamespaceReplacement $launcherRoot '启动器目录'
+Assert-NoUntrustedNamespaceReplacement $caParent 'CaCertificate 父目录'
+Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $NodePath) 'NodePath 父目录'
 Assert-OutsideDirectory $EnvFile $HarnessRoot 'EnvFile'
 Assert-OutsideDirectory $DshHome $HarnessRoot 'DshHome'
 Assert-OutsideDirectory $LogDirectory $HarnessRoot 'LogDirectory'

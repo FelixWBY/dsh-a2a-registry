@@ -12,6 +12,7 @@ User=dsh-harness
 Group=dsh-harness
 Environment=NODE_ENV=production
 EnvironmentFile=/run/secrets/dsh-harness.env
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 WorkingDirectory=/srv/dsh-harness-workspace
 ExecStartPre=/usr/bin/node /opt/deepseek-harness/deploy/registry/check-production-environment.mjs harness
 ExecStart=/usr/bin/node /opt/deepseek-harness/apps/cli/lib/bin.js --profile web --patch /etc/dsh/harness-production.patch.yml --no-open

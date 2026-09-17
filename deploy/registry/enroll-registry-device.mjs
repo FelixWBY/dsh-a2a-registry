@@ -1,13 +1,18 @@
 #!/usr/bin/env node
-import { constants as fsConstants } from 'node:fs'
+import { constants as fsConstants, realpathSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { lstat, open, rename, rm } from 'node:fs/promises'
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign } from 'node:crypto'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const STATE_VERSION = 1
 const MAX_RESPONSE_BYTES = 32 * 1024
 const MAX_STATE_BYTES = 64 * 1024
 const REQUEST_TIMEOUT_MS = 15_000
+const WINDOWS_PATH_GATE_TIMEOUT_MS = 15_000
+const MAX_WINDOWS_PATH_GATE_OUTPUT_BYTES = 4 * 1024
+const WINDOWS_PATH_GATE = fileURLToPath(new URL('./windows-private-path-gate.ps1', import.meta.url))
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const BASE64URL_32 = /^[A-Za-z0-9_-]{43}$/u
@@ -135,6 +140,76 @@ function absolutePath(value, argument) {
   return value
 }
 
+function windowsGateEnvironment(environment) {
+  const allowed = new Set(['COMSPEC', 'OS', 'PATHEXT', 'SYSTEMROOT', 'TEMP', 'TMP', 'WINDIR'])
+  const selected = {}
+  for (const [name, value] of Object.entries(environment)) {
+    if (typeof value === 'string' && allowed.has(name.toUpperCase())) selected[name] = value
+  }
+  return selected
+}
+
+function windowsPowerShell(environment) {
+  const entries = Object.entries(environment)
+  const root = entries.find(([name]) => name.toUpperCase() === 'SYSTEMROOT')?.[1]
+    ?? entries.find(([name]) => name.toUpperCase() === 'WINDIR')?.[1]
+  if (typeof root !== 'string' || !/^[A-Za-z]:[\\/]/u.test(root) || root.includes('\0')) {
+    fail('无法定位 Windows 路径权限检查器。')
+  }
+  return join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+}
+
+async function defaultWindowsPathGate(path, mode, environment) {
+  const executable = windowsPowerShell(environment)
+  await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(executable, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', WINDOWS_PATH_GATE, '-Mode', mode,
+    ], {
+      env: environment,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    let outputBytes = 0
+    let settled = false
+    let timer
+    const finish = error => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      if (error === undefined) resolvePromise()
+      else rejectPromise(error)
+    }
+    const receive = chunk => {
+      outputBytes += chunk.length
+      if (outputBytes > MAX_WINDOWS_PATH_GATE_OUTPUT_BYTES) child.kill()
+    }
+    child.stdout.on('data', receive)
+    child.stderr.on('data', receive)
+    child.once('error', () => finish(new CliFailure('Windows 长期凭据路径或 ACL 检查失败。')))
+    child.stdin.once('error', () => finish(new CliFailure('Windows 长期凭据路径或 ACL 检查失败。')))
+    child.once('close', code => finish(code === 0 && outputBytes <= MAX_WINDOWS_PATH_GATE_OUTPUT_BYTES
+      ? undefined : new CliFailure('Windows 长期凭据路径或 ACL 检查失败。')))
+    timer = setTimeout(() => {
+      child.kill()
+      finish(new CliFailure('Windows 长期凭据路径或 ACL 检查失败。'))
+    }, WINDOWS_PATH_GATE_TIMEOUT_MS)
+    timer.unref()
+    child.stdin.end(path, 'utf8')
+  })
+}
+
+export async function assertPrivateWindowsSecretPath(path, mode, {
+  platform = process.platform,
+  environment = process.env,
+  runGate = defaultWindowsPathGate,
+} = {}) {
+  if (platform !== 'win32') return
+  if (!['NewFile', 'ReadFile', 'ReplaceFile'].includes(mode)) fail('Windows 路径权限检查模式无效。')
+  await runGate(path, mode, windowsGateEnvironment(environment))
+}
+
 function identifier(value, argument) {
   if (typeof value !== 'string' || !IDENTIFIER.test(value)) fail(`${argument} 不是有效标识符。`, 2)
   return value
@@ -221,6 +296,7 @@ async function reserveExclusive(path, diagnostic) {
   let handle
   let created = false
   try {
+    await assertPrivateWindowsSecretPath(path, 'NewFile')
     const parent = await lstat(dirname(path))
     if (!parent.isDirectory() || parent.isSymbolicLink()) fail('输出目录不可用。')
     handle = await open(path, 'wx', 0o600)
@@ -244,12 +320,14 @@ async function discardReservation(path, handle) {
 
 async function commitReservation(path, handle, content) {
   try {
+    await assertPrivateWindowsSecretPath(path, 'ReplaceFile')
     await handle.writeFile(content, { encoding: 'utf8' })
     await handle.sync()
     await handle.close()
     await syncParent(path)
-  } catch {
+  } catch (error) {
     await discardReservation(path, handle)
+    if (error instanceof CliFailure) throw error
     fail('无法安全写入文件。')
   }
 }
@@ -262,6 +340,7 @@ async function writeExclusive(path, content, diagnostic) {
 async function readPrivateJson(path) {
   let handle
   try {
+    await assertPrivateWindowsSecretPath(path, 'ReadFile')
     const entry = await lstat(path)
     if (!entry.isFile() || entry.isSymbolicLink() || entry.size <= 0 || entry.size > MAX_STATE_BYTES) {
       fail('设备状态文件无效。')
@@ -284,6 +363,7 @@ async function readPrivateJson(path) {
 }
 
 async function replaceAtomically(path, content) {
+  await assertPrivateWindowsSecretPath(path, 'ReplaceFile')
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`)
   let handle
   try {
@@ -503,6 +583,7 @@ async function start(options) {
 }
 
 async function confirm(options) {
+  await assertPrivateWindowsSecretPath(options.statePath, 'ReplaceFile')
   const { state, challenge, key } = pendingState(await readPrivateJson(options.statePath))
   const proof = signRegistryChallenge(challenge, key)
   const url = new URL(`/registry-api/v1/organizations/${encodeURIComponent(state.organizationId)}/bindings/${encodeURIComponent(state.bindingId)}/confirm`,
@@ -546,6 +627,7 @@ async function confirm(options) {
 }
 
 async function exportEnvironment(options) {
+  await assertPrivateWindowsSecretPath(options.outputPath, 'NewFile')
   const state = confirmedState(await readPrivateJson(options.statePath))
   const content = [
     `DSH_REGISTRY_ORGANIZATION_ID=${state.organizationId}`,
@@ -577,4 +659,6 @@ async function main() {
   }
 }
 
-await main()
+const invoked = process.argv[1]
+if (invoked !== undefined
+  && realpathSync.native(resolve(invoked)) === realpathSync.native(fileURLToPath(import.meta.url))) await main()

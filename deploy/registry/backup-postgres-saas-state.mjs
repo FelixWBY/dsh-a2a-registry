@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync,
-  statSync, writeFileSync } from 'node:fs'
+import { chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync,
+  renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { backup, DatabaseSync } from 'node:sqlite'
 import { Pool } from 'pg'
 
@@ -891,8 +891,9 @@ export async function main(arguments_ = process.argv.slice(2), environment = pro
   }
 }
 
-const invoked = process.argv[1] === undefined ? undefined : pathToFileURL(resolve(process.argv[1])).href
-if (invoked === import.meta.url) {
+const invoked = process.argv[1]
+if (invoked !== undefined
+  && realpathSync.native(resolve(invoked)) === realpathSync.native(fileURLToPath(import.meta.url))) {
   await main().catch((error) => {
     process.stderr.write(`${safeMessage(error, [process.env.DSH_REGISTRY_POSTGRES_MIGRATOR_URL,
       process.env.DSH_REGISTRY_POSTGRES_BACKUP_URL,
