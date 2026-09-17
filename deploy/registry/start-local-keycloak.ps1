@@ -71,15 +71,53 @@ function Wait-Https([string]$uri, [string]$caCertificate, [int]$attempts = 60) {
   throw "TLS service did not become ready: $uri"
 }
 
-function Enable-SelfRegistration([string]$username, [string]$password) {
+function Set-LocalRealmConfiguration([string]$username, [string]$password) {
   $token = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3182/realms/master/protocol/openid-connect/token' `
     -ContentType 'application/x-www-form-urlencoded' `
     -Body @{ client_id = 'admin-cli'; grant_type = 'password'; username = $username; password = $password }
   if ($null -eq $token.access_token) { throw 'Cannot authenticate the local Keycloak administrator' }
   try {
+    $headers = @{ Authorization = "Bearer $($token.access_token)" }
     Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:3182/admin/realms/dsh-local' `
-      -Headers @{ Authorization = "Bearer $($token.access_token)" } -ContentType 'application/json' `
+      -Headers $headers -ContentType 'application/json' `
       -Body '{"registrationAllowed":true}' | Out-Null
+
+    $clients = @(Invoke-RestMethod -Method Get `
+      -Uri 'http://127.0.0.1:3182/admin/realms/dsh-local/clients?clientId=dsh-registry&search=false' `
+      -Headers $headers)
+    $clients = @($clients | Where-Object { $_.clientId -eq 'dsh-registry' })
+    if ($clients.Count -ne 1) {
+      throw "Expected exactly one dsh-registry client in the local Keycloak realm; found $($clients.Count)"
+    }
+    $clientInternalId = [Uri]::EscapeDataString([string]$clients[0].id)
+    $clientResource = "http://127.0.0.1:3182/admin/realms/dsh-local/clients/$clientInternalId"
+    $mappers = @(Invoke-RestMethod -Method Get -Uri "$clientResource/protocol-mappers/models" -Headers $headers)
+    $audienceMappers = @($mappers | Where-Object { $_.name -eq 'dsh-registry-audience' })
+    if ($audienceMappers.Count -gt 1) {
+      throw 'The local Keycloak realm contains duplicate dsh-registry-audience protocol mappers'
+    }
+    $audienceMapper = [ordered]@{
+      name = 'dsh-registry-audience'
+      protocol = 'openid-connect'
+      protocolMapper = 'oidc-audience-mapper'
+      consentRequired = $false
+      config = [ordered]@{
+        'included.client.audience' = 'dsh-registry'
+        'id.token.claim' = 'false'
+        'access.token.claim' = 'true'
+        'introspection.token.claim' = 'true'
+      }
+    }
+    if ($audienceMappers.Count -eq 0) {
+      Invoke-RestMethod -Method Post -Uri "$clientResource/protocol-mappers/models" -Headers $headers `
+        -ContentType 'application/json' -Body ($audienceMapper | ConvertTo-Json -Depth 5 -Compress) | Out-Null
+    } else {
+      $audienceMapper.id = $audienceMappers[0].id
+      $mapperId = [Uri]::EscapeDataString([string]$audienceMappers[0].id)
+      Invoke-RestMethod -Method Put `
+        -Uri "$clientResource/protocol-mappers/models/$mapperId" -Headers $headers `
+        -ContentType 'application/json' -Body ($audienceMapper | ConvertTo-Json -Depth 5 -Compress) | Out-Null
+    }
   } finally {
     $token = $null
   }
@@ -198,7 +236,7 @@ $registry = $null
 try {
   Wait-Http 'http://127.0.0.1:3182/realms/dsh-local/.well-known/openid-configuration'
   Wait-File $caCertificatePath
-  Enable-SelfRegistration $privateConfig.adminUsername $privateConfig.adminPassword
+  Set-LocalRealmConfiguration $privateConfig.adminUsername $privateConfig.adminPassword
 
   $env:DSH_HOME = Join-Path $artifactRoot 'home'
   $env:DSH_REGISTRY_POSTGRES_URL = $databaseUrlLine.Substring('DATABASE_URL='.Length)

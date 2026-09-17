@@ -1,5 +1,5 @@
 /** OIDC Authorization Code + PKCE account authentication for the standalone Registry. */
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { isIP } from 'node:net'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
@@ -20,6 +20,7 @@ import {
   randomNonce,
   randomPKCECodeVerifier,
   randomState,
+  tokenIntrospection,
   type CustomFetch,
   type Configuration,
 } from 'openid-client'
@@ -60,6 +61,12 @@ export interface RegistryOidcAccountAuthConfig {
   readonly legacyOwnerSubject?: string
   /** Space-delimited OIDC scopes; `openid` is mandatory. */
   readonly scopes: string
+  /** Every new browser request must confirm the access token remains active at the provider. */
+  readonly sessionValidation: 'introspection'
+  /** Hard process-local bound for opaque browser sessions. */
+  readonly maxActiveSessions: number
+  /** Per OIDC subject bound; creating another session deterministically evicts that subject's oldest session. */
+  readonly maxSessionsPerSubject: number
   /** Maximum browser session lifetime after a successful callback. */
   readonly sessionTtlMs: number
   /** Maximum lifetime of one state, nonce and PKCE transaction cookie. */
@@ -89,6 +96,9 @@ const rawSchema: z<RegistryOidcAccountAuthConfig> = z.object({
   memberIdClaim: z.string().pattern(CLAIM_NAME).required(),
   legacyOwnerSubject: z.string(),
   scopes: z.string().required(),
+  sessionValidation: z.const('introspection').required(),
+  maxActiveSessions: positive().max(100_000),
+  maxSessionsPerSubject: positive().max(100_000),
   sessionTtlMs: positive(),
   transactionTtlMs: positive(),
   maxAuthenticationAgeSeconds: positive(),
@@ -143,6 +153,9 @@ export const RegistryOidcAccountAuthConfigSchema: z<RegistryOidcAccountAuthConfi
     || value.maxCookieBytes > 65_536 || value.maxDirectoryBytes > 256 * 1024 * 1024) {
     throw new z.ValidationError('OIDC duration or response bound exceeds the supported maximum', {})
   }
+  if (value.maxSessionsPerSubject > value.maxActiveSessions) {
+    throw new z.ValidationError('OIDC maxSessionsPerSubject must not exceed maxActiveSessions', {})
+  }
   return value
 })
 
@@ -155,7 +168,7 @@ interface TransactionCookie {
   readonly expiresAt: number
 }
 
-interface LegacySessionCookie {
+interface LegacyAccountSession {
   readonly version: 1
   readonly issuer: string
   readonly memberId: string
@@ -163,7 +176,7 @@ interface LegacySessionCookie {
   readonly expiresAt: number
 }
 
-interface TenantSessionCookie {
+interface TenantAccountSession {
   readonly version: 2
   readonly issuer: string
   readonly subject: string
@@ -174,7 +187,17 @@ interface TenantSessionCookie {
   readonly expiresAt: number
 }
 
-type SessionCookie = LegacySessionCookie | TenantSessionCookie
+type AccountSession = (LegacyAccountSession | TenantAccountSession) & {
+  readonly oidcSubject: string
+  readonly accessToken: string
+}
+
+interface SessionCookie {
+  readonly version: 3
+  readonly sessionId: string
+  readonly issuedAt: number
+  readonly expiresAt: number
+}
 
 class OidcUnavailable extends Error {}
 
@@ -200,22 +223,11 @@ function transactionCookie(value: unknown): TransactionCookie | null {
 }
 
 function sessionCookie(value: unknown): SessionCookie | null {
-  const keys = value !== null && typeof value === 'object' && !Array.isArray(value)
-    && (value as Record<string, unknown>).version === 2
-    ? ['version', 'issuer', 'subject', 'accountId', 'memberId', 'displayName', 'issuedAt', 'expiresAt']
-    : ['version', 'issuer', 'memberId', 'issuedAt', 'expiresAt']
-  const record = exactRecord(value, keys)
-  if (record === null || (record.version !== 1 && record.version !== 2) || typeof record.issuer !== 'string'
-    || typeof record.memberId !== 'string' || !IDENTIFIER.test(record.memberId)
+  const record = exactRecord(value, ['version', 'sessionId', 'issuedAt', 'expiresAt'])
+  if (record === null || record.version !== 3 || typeof record.sessionId !== 'string'
+    || !/^[A-Za-z0-9_-]{43}$/u.test(record.sessionId)
     || !finiteTime(record.issuedAt) || !finiteTime(record.expiresAt)
     || record.expiresAt <= record.issuedAt) return null
-  if (record.version === 2 && (typeof record.subject !== 'string' || record.subject.length === 0
-    || Buffer.byteLength(record.subject, 'utf8') > 512 || !record.subject.isWellFormed()
-    || typeof record.accountId !== 'string'
-    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(record.accountId)
-    || typeof record.displayName !== 'string' || record.displayName.length === 0
-    || Buffer.byteLength(record.displayName, 'utf8') > 256 || !record.displayName.isWellFormed()
-    || /[\u0000-\u001f\u007f]/u.test(record.displayName))) return null
   return record as unknown as SessionCookie
 }
 
@@ -303,6 +315,8 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
   private readonly secureCookies: boolean
   private readonly sessionName: string
   private readonly transactionName: string
+  private readonly sessions = new Map<string, AccountSession>()
+  private readonly requestSessions = new WeakMap<IncomingMessage, Promise<AccountSession | null>>()
   private readonly requestAccounts = new WeakMap<IncomingMessage,
     Promise<RegistryAuthenticatedAccount | null>>()
   private readonly requestIdentities = new WeakMap<IncomingMessage,
@@ -371,7 +385,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
    * Re-entrant authorization callbacks share this request-local result so a directory read cannot lock itself. */
   private async authenticateFresh(request: IncomingMessage,
     signal: AbortSignal): Promise<RegistryAuthenticatedAccount | null> {
-    const session = await this.readSession(request)
+    const session = await this.readSession(request, signal)
     if (session === null) return null
     if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
     try { return await this.currentAccount(session.memberId, signal) } catch (error) {
@@ -382,7 +396,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
 
   private async identityFresh(request: IncomingMessage,
     signal: AbortSignal): Promise<RegistryAuthenticatedIdentity | null> {
-    const session = await this.readSession(request)
+    const session = await this.readSession(request, signal)
     if (session === null) return null
     if (session.version === 1) {
       if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
@@ -395,7 +409,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
 
   private async organizationAccountFresh(request: IncomingMessage, organizationId: OrganizationId,
     signal: AbortSignal): Promise<RegistryAuthenticatedAccount | null> {
-    const session = await this.readSession(request)
+    const session = await this.readSession(request, signal)
     if (session === null) return null
     if (session.version === 1) {
       if (this.runtimeCtx.get('registryTenantRouter') !== undefined) return null
@@ -412,7 +426,19 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     } finally { selected.lease.release() }
   }
 
-  private async readSession(request: IncomingMessage): Promise<SessionCookie | null> {
+  private async readSession(request: IncomingMessage, signal: AbortSignal): Promise<AccountSession | null> {
+    signal.throwIfAborted()
+    const cached = this.requestSessions.get(request)
+    if (cached !== undefined) return cached
+    const pending = this.readSessionFresh(request, signal)
+    this.requestSessions.set(request, pending)
+    try { return await pending } catch (error) {
+      this.requestSessions.delete(request)
+      throw error
+    }
+  }
+
+  private async readSessionCookie(request: IncomingMessage): Promise<SessionCookie | null> {
     const encoded = cookieValue(request, this.sessionName, this.config.maxCookieBytes)
     if (encoded === null) return null
     const secret = await this.secret(this.config.sessionSecretEnv)
@@ -420,9 +446,84 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
     try { value = open(secret, encoded, this.config.maxCookieBytes) } finally { secret.fill(0) }
     const session = sessionCookie(value)
     const now = Date.now()
-    if (session === null || session.issuer !== this.config.issuer || session.issuedAt > now
+    if (session === null || session.issuedAt > now
       || session.expiresAt <= now || session.expiresAt - session.issuedAt > this.config.sessionTtlMs) return null
     return session
+  }
+
+  private async readSessionFresh(request: IncomingMessage, signal: AbortSignal): Promise<AccountSession | null> {
+    const cookie = await this.readSessionCookie(request)
+    if (cookie === null) return null
+    const session = this.sessions.get(cookie.sessionId)
+    if (session === undefined || session.issuedAt !== cookie.issuedAt || session.expiresAt !== cookie.expiresAt
+      || session.issuer !== this.config.issuer) {
+      this.sessions.delete(cookie.sessionId)
+      return null
+    }
+    const now = Date.now()
+    if (session.expiresAt <= now) {
+      this.sessions.delete(cookie.sessionId)
+      return null
+    }
+    let introspection: Awaited<ReturnType<typeof tokenIntrospection>>
+    try {
+      introspection = await tokenIntrospection(await this.client(signal), session.accessToken)
+      signal.throwIfAborted()
+    } catch (error) {
+      throw new OidcUnavailable('OIDC token introspection unavailable', { cause: error })
+    }
+    const expiresAt = introspection.exp === undefined ? undefined : introspection.exp * 1000
+    const validExpiry = expiresAt === undefined || (Number.isSafeInteger(introspection.exp)
+      && introspection.exp! >= 0 && Number.isSafeInteger(expiresAt) && expiresAt > now)
+    const validClient = introspection.client_id === undefined || introspection.client_id === this.config.clientId
+    const validIssuer = introspection.iss === undefined || introspection.iss === this.config.issuer
+    if (!introspection.active || introspection.sub !== session.oidcSubject
+      || !validExpiry || !validClient || !validIssuer) {
+      this.sessions.delete(cookie.sessionId)
+      return null
+    }
+    return session
+  }
+
+  private pruneExpiredSessions(now: number): void {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.expiresAt <= now) this.sessions.delete(sessionId)
+    }
+  }
+
+  private retainSession(sessionId: string, session: AccountSession): void {
+    this.pruneExpiredSessions(Date.now())
+    const sameSubject = [...this.sessions.entries()]
+      .filter(([, candidate]) => candidate.issuer === session.issuer
+        && candidate.oidcSubject === session.oidcSubject)
+      .sort(([leftId, left], [rightId, right]) => left.issuedAt - right.issuedAt
+        || (leftId < rightId ? -1 : leftId > rightId ? 1 : 0))
+    const evictions = sameSubject.length - this.config.maxSessionsPerSubject + 1
+    for (let index = 0; index < evictions; index += 1) {
+      this.sessions.delete(sameSubject[index]![0])
+    }
+    if (this.sessions.size >= this.config.maxActiveSessions) {
+      throw new OidcUnavailable('OIDC active session limit reached')
+    }
+    this.sessions.set(sessionId, session)
+  }
+
+  private publishSession(response: ServerResponse, sessionId: string, accountSession: AccountSession,
+    sessionCookieValue: string, maxAgeSeconds: number, returnTo: string): void {
+    this.retainSession(sessionId, accountSession)
+    try {
+      clearCookies(response, [this.transactionName], this.secureCookies)
+      response.appendHeader('set-cookie', `${this.sessionName}=${sessionCookieValue}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${String(maxAgeSeconds)}${this.secureCookies ? '; Secure' : ''}`)
+      redirect(response, returnTo)
+    } catch (error) {
+      this.sessions.delete(sessionId)
+      throw error
+    }
+  }
+
+  private async forgetSession(request: IncomingMessage): Promise<void> {
+    const cookie = await this.readSessionCookie(request)
+    if (cookie !== null) this.sessions.delete(cookie.sessionId)
   }
 
   private installRoutes(): void {
@@ -444,6 +545,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       unregister()
       for (const controller of active) controller.abort()
       active.clear()
+      this.sessions.clear()
     }, 'registry-app: OIDC account routes')
   }
 
@@ -453,6 +555,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       if (url.pathname === START_PATH && request.method === 'GET') return await this.start(url, response, signal)
       if (url.pathname === CALLBACK_PATH && request.method === 'GET') return await this.callback(url, request, response, signal)
       if (url.pathname === LOGOUT_PATH && request.method === 'POST') {
+        try { await this.forgetSession(request) } catch { /* Cookie deletion must not depend on provider availability. */ }
         clearCookies(response, [this.sessionName, this.transactionName], this.secureCookies)
         redirect(response, '/#/sign-in')
         return
@@ -512,11 +615,14 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       maxAge: this.config.maxAuthenticationAgeSeconds,
     })
     const claims = tokens.claims()
+    const accessToken = tokens.access_token
     const externalSubject = claims?.sub
     const externalMemberId = claims?.[this.config.memberIdClaim]
     if (typeof externalSubject !== 'string' || externalSubject.length === 0
       || Buffer.byteLength(externalSubject, 'utf8') > 512 || !externalSubject.isWellFormed()
-      || typeof externalMemberId !== 'string' || !IDENTIFIER.test(externalMemberId)) {
+      || typeof externalMemberId !== 'string' || !IDENTIFIER.test(externalMemberId)
+      || typeof accessToken !== 'string' || accessToken.length === 0
+      || Buffer.byteLength(accessToken, 'utf8') > 16_384 || !accessToken.isWellFormed()) {
       throw new OidcUnavailable('OIDC member mapping unavailable')
     }
     const displayNameClaim = typeof claims?.name === 'string' ? claims.name
@@ -555,29 +661,35 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       }
     }
     const now = Date.now()
-    const tokenExpiry = typeof claims?.exp === 'number' && Number.isSafeInteger(claims.exp)
+    const idTokenExpiry = typeof claims?.exp === 'number' && Number.isSafeInteger(claims.exp)
       ? claims.exp * 1000 : now + this.config.sessionTtlMs
-    const expiresAt = Math.min(now + this.config.sessionTtlMs, tokenExpiry)
+    const accessTokenSeconds = tokens.expiresIn()
+    const accessTokenExpiry = accessTokenSeconds === undefined ? now + this.config.sessionTtlMs
+      : Number.isSafeInteger(accessTokenSeconds) && accessTokenSeconds > 0
+        ? now + accessTokenSeconds * 1000 : now
+    const expiresAt = Math.min(now + this.config.sessionTtlMs, idTokenExpiry, accessTokenExpiry)
     if (expiresAt <= now) throw new OidcUnavailable('OIDC token expired')
+    let sessionId: string
+    do { sessionId = randomBytes(32).toString('base64url') } while (this.sessions.has(sessionId))
+    const accountSession: AccountSession = tenantAccount === undefined
+      ? { version: 1, issuer: this.config.issuer, oidcSubject: externalSubject, accessToken,
+        memberId: externalMemberId, issuedAt: now, expiresAt }
+      : { version: 2, issuer: this.config.issuer, oidcSubject: externalSubject, accessToken,
+        subject: externalSubject, accountId: tenantAccount.accountId, memberId: tenantAccount.memberId,
+        displayName: tenantAccount.displayName, issuedAt: now, expiresAt }
     const secret = await this.secret(this.config.sessionSecretEnv)
     let session: string
     try {
-      session = seal(secret, tenantAccount === undefined
-        ? { version: 1, issuer: this.config.issuer, memberId: externalMemberId,
-          issuedAt: now, expiresAt } satisfies LegacySessionCookie
-        : { version: 2, issuer: this.config.issuer, subject: externalSubject,
-          accountId: tenantAccount.accountId, memberId: tenantAccount.memberId,
-          displayName: tenantAccount.displayName, issuedAt: now, expiresAt } satisfies TenantSessionCookie,
-      this.config.maxCookieBytes)
+      session = seal(secret, { version: 3, sessionId, issuedAt: now, expiresAt } satisfies SessionCookie,
+        this.config.maxCookieBytes)
     } finally { secret.fill(0) }
-    clearCookies(response, [this.transactionName], this.secureCookies)
-    response.appendHeader('set-cookie', `${this.sessionName}=${session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${String(Math.ceil((expiresAt - now) / 1000))}${this.secureCookies ? '; Secure' : ''}`)
     const hasNoOrganization = tenantAccount !== undefined
       && (await router!.listOrganizations(tenantAccount.accountId)).length === 0
     // Invitation bearer tokens remain in sessionStorage; never preserve them in the OIDC query/cookie.
     const invitationReturn = transaction.returnTo === '/#/join'
     const returnTo = hasNoOrganization && !invitationReturn ? '/#/new-organization' : transaction.returnTo
-    redirect(response, returnTo)
+    this.publishSession(response, sessionId, accountSession, session,
+      Math.ceil((expiresAt - now) / 1000), returnTo)
   }
 
   private async client(signal: AbortSignal): Promise<Configuration> {

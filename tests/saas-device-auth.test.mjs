@@ -755,7 +755,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       const dispatched = await exchange(receiverSocket, 10, { type: 'import-dispatch' })
       assert.equal(dispatched.type, 'import-dispatch')
       assert.equal(dispatched.delivery.operationId, queuedImport.operationId)
-      assert.equal(dispatched.delivery.expectedSessionId, sessionId)
+      assert.equal('expectedSessionId' in dispatched.delivery, false)
       assert.equal(dispatched.delivery.organizationId, organizationA)
       assert.equal(dispatched.delivery.targetInstanceId, ticket.challenge.instanceId)
       assert.equal(dispatched.delivery.checkpointHash, checkpoint.checkpointHash)

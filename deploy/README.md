@@ -14,6 +14,8 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 
 脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并在 3183 通过 Caddy 的本地内部 CA 提供设备同步 WSS；Registry 使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema。凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。脚本返回 WSS 地址和根证书路径；本地 Harness 必须显式信任该证书，例如把返回路径设置为 `NODE_EXTRA_CA_CERTS`。这些服务只绑定回环地址，内部 CA 只用于本机验收，不能替代公网受信任证书。Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织，也可通过 Owner／Admin 生成的一次性链接加入已有组织。
 
+浏览器登录必须使用支持 Token Introspection 的 OIDC 服务。Registry Cookie 只保存经过 HMAC 的随机会话 ID 和期限，Access Token 仅保留在当前 Registry 进程的有界内存中；每个新的受保护 HTTP 请求都会向身份服务重新确认 `active`、`sub`，并在响应提供时核对 `exp`、`client_id` 和 `iss`。停用用户或不一致响应会立即删除本地会话，身份服务超时或协议失败会拒绝受保护请求。`maxActiveSessions` 是单进程硬上限，满额时新会话失败关闭；`maxSessionsPerSubject` 限制同一 OIDC 主体的并发会话，超额时按签发时间和会话 ID 确定性淘汰最旧会话。当前只支持单副本，Registry 重启会使全部浏览器会话失效并要求重新登录。正式身份服务必须实测用户停用后下一次 introspection 返回非活动状态，不能只凭发现文档存在该端点就宣称验收完成。
+
 普通服务器或已有身份服务可以直接使用 OIDC patch：
 
 ```sh
@@ -176,7 +178,7 @@ node deploy/registry/verify-registry-restore.mjs verify  https://restored-regist
 
 | 类别 | 必需输入 | 当前缺少时的行为 |
 | --- | --- | --- |
-| 账号、组织与身份 | 正式 OIDC issuer、client ID、client secret、允许的回调地址，以及能稳定映射到成员 ID 的不可变 claim；旧单组织迁移时还需明确旧组织 ID、初始 Owner 主体和显示名称 | 保持身份未配置；本地 Keycloak 只能用于本机验收；不会自动认领旧组织 |
+| 账号、组织与身份 | 正式 OIDC issuer、client ID、client secret、允许的回调地址、可即时反映用户停用的 Token Introspection，以及能稳定映射到成员 ID 的不可变 claim；旧单组织迁移时还需明确旧组织 ID、初始 Owner 主体和显示名称 | 保持身份未配置；缺少或无法验证 introspection 时受保护请求失败关闭；本地 Keycloak 只能用于本机验收；不会自动认领旧组织 |
 | Harness | 每台实例的独立设备私钥、独立设备 secret、确认后的 `dsh1` token；仅授予需要的 `disclosure.sync`／`a2a.receive` scope；公网 WSS 地址与设备公钥登记 | 不能连接生产 Registry；不会退化为人工配对码、网页账号或共享测试密钥 |
 | 密钥管理 | 选定的生产 KMS／秘密管理服务、披露数据密钥的生成、作用域授权、轮换、恢复和销毁流程 | 不发布生产披露；不从仓库或普通 `.env` 读取披露私钥 |
 | 公网部署 | 正式域名、DNS 控制权、ACME 邮箱、HTTPS 告警接收地址、异机备份位置、Linux 服务账号和 PostgreSQL 生产连接信息 | 只允许回环本地运行；不宣称已公网可用 |

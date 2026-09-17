@@ -267,7 +267,6 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
             disclosureId: brandString<DisclosureId>(record.disclosureId),
             sourceInstanceId: brandString<DshInstanceId>(record.sourceInstanceId),
             checkpointHash: brandString<DisclosureHash>(record.checkpointHash),
-            expectedSessionId: stableSessionId(record.targetInstanceId, record.operationId),
             prefix: snapshot.prefix,
             source: { instanceName: record.sourceInstanceId,
               conversationTitle: String(snapshot.prefix.conversationId) },
@@ -295,7 +294,7 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
             return
           }
           if (outcome.status === 'completed') {
-            if (outcome.sessionId !== selected.expectedSessionId) {
+            if (outcome.sessionId !== stableSessionId(record.targetInstanceId, record.operationId)) {
               await this.fail(record)
               throw new RegistryIngestError('invalid-input')
             }

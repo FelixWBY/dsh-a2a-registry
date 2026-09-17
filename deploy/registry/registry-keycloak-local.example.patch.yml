@@ -60,6 +60,9 @@
       organizationId: local-oidc-org
       memberIdClaim: preferred_username
       scopes: openid profile email
+      sessionValidation: introspection
+      maxActiveSessions: 1024
+      maxSessionsPerSubject: 8
       sessionTtlMs: 3600000
       transactionTtlMs: 300000
       maxAuthenticationAgeSeconds: 3600
