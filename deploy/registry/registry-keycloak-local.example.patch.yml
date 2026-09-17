@@ -18,6 +18,9 @@
       config:
         connectionString: !!js process.env.DSH_REGISTRY_POSTGRES_URL
         schema: registry_saas_local
+        schemaMode: validate
+        # Temporary local-only bridge while legacy schemas share this database.
+        allowUnsafeSharedDatabase: true
         maxConnections: 4
         idleTimeoutMs: 30000
         statementTimeoutMs: 15000
@@ -39,6 +42,8 @@
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
       schema: registry_saas_local
+      schemaMode: validate
+      allowUnsafeSharedDatabase: true
       legacyOrganizationName: 本地迁移组织
       maxConnections: 2
       maxOrganizationsPerAccount: 5

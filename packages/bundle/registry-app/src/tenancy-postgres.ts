@@ -37,10 +37,58 @@ const DEFAULT_INVITATION_TTL_SECONDS = 3 * 24 * 60 * 60
 const MIN_INVITATION_TTL_SECONDS = 5 * 60
 const MAX_INVITATION_TTL_SECONDS = 7 * 24 * 60 * 60
 const MAX_PENDING_INVITATIONS = 100
+const TENANCY_TABLES = [
+  'tenancy_meta',
+  'accounts',
+  'account_identities',
+  'organizations',
+  'organization_memberships',
+  'organization_creations',
+  'organization_invitations',
+] as const
+const REGISTRY_META_TABLES = ['storage_meta', 'tenancy_meta'] as const
+const REGISTRY_BUSINESS_TABLES = [
+  'units', 'unit_globals', 'unit_records',
+  'accounts', 'account_identities', 'organizations', 'organization_memberships',
+  'organization_creations', 'organization_invitations',
+] as const
+const TENANT_SCOPED_TABLES = [
+  'organizations',
+  'organization_memberships',
+  'organization_creations',
+  'organization_invitations',
+] as const
+const TENANCY_POLICIES = [
+  { table: 'organizations', name: 'organizations_select', command: 'r', using: true, check: false },
+  { table: 'organizations', name: 'organizations_insert', command: 'a', using: false, check: true },
+  { table: 'organizations', name: 'organizations_update', command: 'w', using: true, check: true },
+  { table: 'organization_memberships', name: 'organization_memberships_select', command: 'r',
+    using: true, check: false },
+  { table: 'organization_memberships', name: 'organization_memberships_insert', command: 'a',
+    using: false, check: true },
+  { table: 'organization_memberships', name: 'organization_memberships_update', command: 'w',
+    using: true, check: true },
+  { table: 'organization_creations', name: 'organization_creations_select', command: 'r',
+    using: true, check: false },
+  { table: 'organization_creations', name: 'organization_creations_insert', command: 'a',
+    using: false, check: true },
+  { table: 'organization_invitations', name: 'organization_invitations_select', command: 'r',
+    using: true, check: false },
+  { table: 'organization_invitations', name: 'organization_invitations_insert', command: 'a',
+    using: false, check: true },
+  { table: 'organization_invitations', name: 'organization_invitations_update', command: 'w',
+    using: true, check: true },
+] as const
+
+export type PostgresRegistryTenancySchemaMode = 'migrate' | 'validate'
 
 export interface PostgresRegistryTenancyConfig {
   readonly connectionString: string
   readonly schema?: string
+  /** `migrate` owns offline DDL; `validate` is the least-privilege online startup path. */
+  readonly schemaMode?: PostgresRegistryTenancySchemaMode
+  /** Local migration escape hatch; production must leave this false. */
+  readonly allowUnsafeSharedDatabase?: boolean
   /** This independent pool is deliberately small; a transaction-mode pooler may sit in front of it. */
   readonly maxConnections?: number
   readonly idleTimeoutMs?: number
@@ -108,6 +156,37 @@ interface InvitationRow {
   readonly created_by_member_id: string
   readonly claimed_by_account_id: string | null
   readonly claimed_by_member_id?: string | null
+}
+
+interface TenancyTableRow {
+  readonly relname: string
+  readonly relrowsecurity: boolean
+  readonly relforcerowsecurity: boolean
+  readonly owner_member: boolean
+  readonly can_select: boolean
+  readonly can_insert: boolean
+  readonly can_update: boolean
+  readonly can_delete: boolean
+  readonly reachable_insert: boolean
+  readonly reachable_update: boolean
+  readonly reachable_delete: boolean
+  readonly reachable_truncate: boolean
+  readonly reachable_references: boolean
+  readonly reachable_trigger: boolean
+  readonly reachable_maintain: boolean
+}
+
+interface TenancyPolicyRow {
+  readonly table_name: string
+  readonly policy_name: string
+  readonly command: string
+  readonly permissive: boolean
+  readonly public_only: boolean
+  readonly has_using: boolean
+  readonly has_check: boolean
+  readonly role_ids: string
+  readonly using_definition: string | null
+  readonly check_definition: string | null
 }
 
 function quoteIdentifier(value: string): string {
@@ -244,11 +323,111 @@ function postgresCode(error: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-/** Dedicated PostgreSQL implementation; construction waits for the complete schema and RLS policy transaction. */
+function policyFingerprint(rows: readonly TenancyPolicyRow[]): string {
+  const definitions = [...rows].sort((left, right) => {
+    const table = left.table_name.localeCompare(right.table_name)
+    return table === 0 ? left.policy_name.localeCompare(right.policy_name) : table
+  }).map(row => JSON.stringify([
+    row.table_name,
+    row.policy_name,
+    row.command,
+    row.permissive,
+    row.role_ids,
+    row.using_definition,
+    row.check_definition,
+  ])).join('\n')
+  return createHash('sha256').update('registry-tenancy-policy-v1\0', 'utf8').update(definitions, 'utf8').digest('hex')
+}
+
+async function requireExactRegistryObjectPrivileges(client: PoolClient, schemaName: string): Promise<void> {
+  const state = await client.query<{ readonly unsafe: boolean }>(
+    `with runtime_role as (
+       select oid from pg_roles where rolname = current_user
+     )
+     select not exists (select 1 from runtime_role)
+       or exists (
+         select 1
+         from pg_class relation
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         cross join runtime_role
+         where namespace.nspname = $1 and relation.relkind in ('r', 'p', 'v', 'm', 'f')
+           and (
+             pg_get_userbyid(relation.relowner) <> 'registry_migrator'
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) acl
+               where acl.grantee not in (relation.relowner, runtime_role.oid)
+                 or (acl.grantee = runtime_role.oid and (
+                   acl.is_grantable
+                   or case
+                     when relation.relname = any($2::text[]) then acl.privilege_type <> 'SELECT'
+                     when relation.relname = any($3::text[]) then not (
+                       acl.privilege_type = any(array['SELECT', 'INSERT', 'UPDATE', 'DELETE']::text[])
+                     )
+                     else true
+                   end
+                 ))
+             )
+             or exists (
+               select 1
+               from pg_attribute attribute
+               cross join lateral aclexplode(attribute.attacl) acl
+               where attribute.attrelid = relation.oid and attribute.attnum > 0
+                 and not attribute.attisdropped and acl.grantee <> relation.relowner
+             )
+             or case
+               when relation.relname = any($2::text[]) then
+                 not has_table_privilege(runtime_role.oid, relation.oid, 'SELECT')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'INSERT')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'UPDATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'DELETE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRUNCATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'REFERENCES')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRIGGER')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'MAINTAIN')
+               when relation.relname = any($3::text[]) then
+                 not has_table_privilege(runtime_role.oid, relation.oid, 'SELECT')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'INSERT')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'UPDATE')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'DELETE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRUNCATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'REFERENCES')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRIGGER')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'MAINTAIN')
+               else has_table_privilege(runtime_role.oid, relation.oid,
+                 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN')
+             end
+           )
+       )
+       or exists (
+         select 1
+         from pg_sequence sequence
+         join pg_class relation on relation.oid = sequence.seqrelid
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         cross join runtime_role
+         where namespace.nspname = $1
+           and (
+             pg_get_userbyid(relation.relowner) <> 'registry_migrator'
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('S', relation.relowner))) acl
+               where acl.grantee <> relation.relowner
+             )
+             or has_sequence_privilege(runtime_role.oid, relation.oid, 'USAGE, SELECT, UPDATE')
+           )
+       ) as unsafe`,
+    [schemaName, [...REGISTRY_META_TABLES], [...REGISTRY_BUSINESS_TABLES]],
+  )
+  if (state.rows.length !== 1 || state.rows[0]?.unsafe) throw new RegistryTenancyError('unavailable')
+}
+
+/** Dedicated PostgreSQL implementation; construction waits for schema migration or read-only validation. */
 export class PostgresRegistryTenancy implements RegistryTenancyStore {
   private readonly pool: Pool
   private readonly schemaName: string
   private readonly schema: string
+  private readonly schemaMode: PostgresRegistryTenancySchemaMode
+  private readonly allowUnsafeSharedDatabase: boolean
   private readonly maxOrganizationsPerAccount: number
   private closed = false
   private closing: Promise<void> | undefined
@@ -268,6 +447,11 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
     }
     this.schemaName = config.schema ?? 'registry'
     this.schema = quoteIdentifier(this.schemaName)
+    this.schemaMode = config.schemaMode ?? 'migrate'
+    if (this.schemaMode !== 'migrate' && this.schemaMode !== 'validate') {
+      throw new RegistryTenancyError('invalid-input')
+    }
+    this.allowUnsafeSharedDatabase = config.allowUnsafeSharedDatabase ?? false
     this.maxOrganizationsPerAccount = maxOrganizationsPerAccount
     this.pool = new Pool({
       connectionString: config.connectionString,
@@ -280,16 +464,30 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
     })
   }
 
-  /** Open only after DDL, role checks and FORCE RLS policies commit together. */
+  /** Open after either the offline migration or the read-only online validation has completed. */
   static async open(config: PostgresRegistryTenancyConfig): Promise<PostgresRegistryTenancy> {
     const store = new PostgresRegistryTenancy(config)
     try {
-      await store.initialize()
+      if (store.schemaMode === 'migrate') await store.applySchemaMigration()
+      else await store.validateSchema()
       return store
     } catch (error) {
       await store.pool.end().catch(() => {})
       if (error instanceof RegistryTenancyError) throw error
       throw new RegistryTenancyError('unavailable')
+    }
+  }
+
+  /** Explicit one-shot entry point for an offline migration CLI. It never returns a live store. */
+  static async migrateSchema(config: Omit<PostgresRegistryTenancyConfig, 'schemaMode'>): Promise<void> {
+    const store = new PostgresRegistryTenancy({ ...config, schemaMode: 'migrate' })
+    try {
+      await store.applySchemaMigration()
+    } catch (error) {
+      if (error instanceof RegistryTenancyError) throw error
+      throw new RegistryTenancyError('unavailable')
+    } finally {
+      await store.pool.end().catch(() => {})
     }
   }
 
@@ -830,26 +1028,181 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
     return this.closing
   }
 
-  private async initialize(): Promise<void> {
+  /** Production startup is catalog-only and runs inside a read-only transaction. */
+  private async validateSchema(): Promise<void> {
+    const client = await this.pool.connect()
+    let begun = false
+    try {
+      await client.query('begin read only')
+      begun = true
+      const runtimeIdentity = await client.query<{ readonly expected: boolean }>(
+        `select current_user = 'registry_app' as expected`)
+      if (runtimeIdentity.rows.length !== 1 || runtimeIdentity.rows[0]?.expected !== true) {
+        throw new RegistryTenancyError('unavailable')
+      }
+      const namespace = await client.query<{
+        readonly acl_is_exact: boolean
+        readonly can_create: boolean
+        readonly can_use: boolean
+        readonly oid: number
+        readonly owner_is_migrator: boolean
+      }>(`select n.oid, has_schema_privilege(current_user, n.oid, 'CREATE') as can_create,
+                 has_schema_privilege(current_user, n.oid, 'USAGE') as can_use,
+                 pg_get_userbyid(n.nspowner) = 'registry_migrator' as owner_is_migrator,
+                 not exists (
+                   select 1
+                   from aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) acl
+                   where acl.grantee not in (
+                       n.nspowner, (select oid from pg_roles where rolname = current_user)
+                     )
+                     or (acl.grantee = (select oid from pg_roles where rolname = current_user)
+                       and (acl.privilege_type <> 'USAGE' or acl.is_grantable))
+                 ) as acl_is_exact
+          from pg_namespace as n where n.nspname = $1`, [this.schemaName])
+      const selectedNamespace = namespace.rows[0]
+      if (namespace.rows.length !== 1 || selectedNamespace?.can_create || selectedNamespace?.can_use !== true
+        || selectedNamespace.owner_is_migrator !== true || selectedNamespace.acl_is_exact !== true) {
+        throw new RegistryTenancyError('unavailable')
+      }
+      await this.requireSafeRuntimeRole(client, selectedNamespace.oid, this.allowUnsafeSharedDatabase)
+      await requireExactRegistryObjectPrivileges(client, this.schemaName)
+      const tables = await client.query<TenancyTableRow>(
+        `select c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                pg_has_role(current_user, c.relowner, 'MEMBER') as owner_member,
+                has_table_privilege(current_user, c.oid, 'SELECT') as can_select,
+                has_table_privilege(current_user, c.oid, 'INSERT') as can_insert,
+                has_table_privilege(current_user, c.oid, 'UPDATE') as can_update,
+                has_table_privilege(current_user, c.oid, 'DELETE') as can_delete,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and (has_table_privilege(role.oid, c.oid, 'INSERT')
+                         or has_any_column_privilege(role.oid, c.oid, 'INSERT'))
+                ) as reachable_insert,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and (has_table_privilege(role.oid, c.oid, 'UPDATE')
+                         or has_any_column_privilege(role.oid, c.oid, 'UPDATE'))
+                ) as reachable_update,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and has_table_privilege(role.oid, c.oid, 'DELETE')
+                ) as reachable_delete,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and has_table_privilege(role.oid, c.oid, 'TRUNCATE')
+                ) as reachable_truncate,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and (has_table_privilege(role.oid, c.oid, 'REFERENCES')
+                         or has_any_column_privilege(role.oid, c.oid, 'REFERENCES'))
+                ) as reachable_references,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and has_table_privilege(role.oid, c.oid, 'TRIGGER')
+                ) as reachable_trigger,
+                exists (
+                  select 1 from pg_roles as role
+                  where (role.rolname = current_user
+                         or pg_has_role(current_user, role.oid, 'MEMBER')
+                         or pg_has_role(current_user, role.oid, 'SET'))
+                    and has_table_privilege(role.oid, c.oid, 'MAINTAIN')
+                ) as reachable_maintain
+         from pg_class as c
+         join pg_namespace as n on n.oid = c.relnamespace
+         where n.nspname = $1 and c.relname = any($2::text[]) and c.relkind in ('r', 'p')`,
+        [this.schemaName, [...TENANCY_TABLES]],
+      )
+      if (tables.rows.length !== TENANCY_TABLES.length) throw new RegistryTenancyError('unavailable')
+      const tableByName = new Map(tables.rows.map(row => [row.relname, row]))
+      for (const tableName of TENANCY_TABLES) {
+        const table = tableByName.get(tableName)
+        if (table === undefined || table.owner_member) throw new RegistryTenancyError('unavailable')
+        const hasUnsafeDdl = table.reachable_truncate || table.reachable_references
+          || table.reachable_trigger || table.reachable_maintain
+        if (tableName === 'tenancy_meta') {
+          if (!table.can_select || table.reachable_insert || table.reachable_update
+            || table.reachable_delete || hasUnsafeDdl) {
+            throw new RegistryTenancyError('unavailable')
+          }
+        } else if (!table.can_select || !table.can_insert || !table.can_update || !table.can_delete
+          || hasUnsafeDdl) {
+          throw new RegistryTenancyError('unavailable')
+        }
+      }
+      for (const tableName of TENANT_SCOPED_TABLES) {
+        const table = tableByName.get(tableName)
+        if (table?.relrowsecurity !== true || table.relforcerowsecurity !== true) {
+          throw new RegistryTenancyError('unavailable')
+        }
+      }
+      const version = await client.query<{
+        readonly policy_fingerprint: string | null
+        readonly schema_version: number
+      }>(`select schema_version, policy_fingerprint
+          from ${this.schema}.tenancy_meta where singleton = true`)
+      const selectedVersion = version.rows[0]
+      if (version.rows.length !== 1 || selectedVersion?.schema_version !== SCHEMA_VERSION
+        || selectedVersion.policy_fingerprint === null) {
+        throw new RegistryTenancyError('unavailable')
+      }
+      const policies = await this.readPolicies(client)
+      this.requireExpectedPolicies(policies)
+      if (policyFingerprint(policies) !== selectedVersion.policy_fingerprint) {
+        throw new RegistryTenancyError('unavailable')
+      }
+      await client.query('commit')
+      begun = false
+    } catch (error) {
+      if (begun) {
+        try { await client.query('rollback') } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], 'Registry tenancy schema validation rollback failed')
+        }
+      }
+      throw error
+    } finally { client.release() }
+  }
+
+  private async applySchemaMigration(): Promise<void> {
     const client = await this.pool.connect()
     let begun = false
     try {
       await client.query('begin')
       begun = true
       await this.setContext(client, CONTROL_ACCOUNT_CONTEXT, EMPTY_ORGANIZATION_CONTEXT)
-      const role = await client.query<{ readonly rolsuper: boolean; readonly rolbypassrls: boolean }>(
-        'select rolsuper, rolbypassrls from pg_roles where rolname = current_user')
-      if (role.rows.length !== 1 || role.rows[0]?.rolsuper || role.rows[0]?.rolbypassrls) {
-        throw new RegistryTenancyError('unavailable')
-      }
-      await this.advisoryLock(client, `registry-tenancy-schema\0${this.schema}`)
+      await this.requireSafeMigrationRole(client)
+      const schemaLock = await client.query<{ readonly acquired: boolean }>(
+        `select pg_try_advisory_xact_lock(
+           hashtextextended('dsh-registry-schema:' || $1::text, 0)
+         ) as acquired`, [this.schemaName])
+      if (schemaLock.rows[0]?.acquired !== true) throw new RegistryTenancyError('unavailable')
       const namespace = await client.query<{ readonly present: boolean }>(
         'select exists (select 1 from pg_namespace where nspname = $1) as present', [this.schemaName])
       if (namespace.rows[0]?.present !== true) await client.query(`create schema ${this.schema}`)
       await client.query(`create table if not exists ${this.schema}.tenancy_meta (
         singleton boolean primary key default true check (singleton),
-        schema_version integer not null check (schema_version > 0)
+        schema_version integer not null check (schema_version > 0),
+        policy_fingerprint text check (policy_fingerprint is null or policy_fingerprint ~ '^[0-9a-f]{64}$')
       )`)
+      await client.query(`alter table ${this.schema}.tenancy_meta add column if not exists policy_fingerprint text
+        check (policy_fingerprint is null or policy_fingerprint ~ '^[0-9a-f]{64}$')`)
       await client.query(`insert into ${this.schema}.tenancy_meta (singleton, schema_version) values (true, $1)
         on conflict (singleton) do nothing`, [SCHEMA_VERSION])
       const version = await client.query<{ readonly schema_version: number }>(
@@ -955,8 +1308,11 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
         on ${this.schema}.organization_invitations (organization_id, claimed_by_account_id)
         where status = 'pending' and claimed_by_account_id is not null`)
       await this.installPolicies(client)
-      await client.query(`update ${this.schema}.tenancy_meta set schema_version = $1 where singleton = true`,
-        [SCHEMA_VERSION])
+      const policies = await this.readPolicies(client)
+      this.requireExpectedPolicies(policies)
+      await client.query(`update ${this.schema}.tenancy_meta
+        set schema_version = $1, policy_fingerprint = $2 where singleton = true`,
+      [SCHEMA_VERSION, policyFingerprint(policies)])
       await client.query('commit')
       begun = false
     } catch (error) {
@@ -967,6 +1323,76 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
       }
       throw error
     } finally { client.release() }
+  }
+
+  private async requireSafeMigrationRole(client: PoolClient): Promise<void> {
+    const role = await client.query<{ readonly dangerous: boolean }>(
+      `select exists (
+         select 1 from pg_roles as role
+         where (role.rolname = current_user
+                or pg_has_role(current_user, role.oid, 'MEMBER')
+                or pg_has_role(current_user, role.oid, 'SET'))
+           and (role.rolsuper or role.rolbypassrls or role.rolcreatedb
+                or role.rolcreaterole or role.rolreplication
+                or (role.rolname <> current_user and role.rolname <> 'pg_read_all_stats'))
+       ) as dangerous`)
+    if (role.rows.length !== 1 || role.rows[0]?.dangerous !== false) {
+      throw new RegistryTenancyError('unavailable')
+    }
+  }
+
+  private async requireSafeRuntimeRole(client: PoolClient, schemaOid: number,
+    allowUnsafeSharedDatabase: boolean): Promise<void> {
+    const result = await client.query<{ readonly unsafe: boolean }>(
+      `select exists (
+         select 1 from pg_roles as role
+         where (pg_has_role(current_user, role.oid, 'MEMBER')
+                or pg_has_role(current_user, role.oid, 'SET'))
+           and (role.rolname <> current_user
+                or role.rolsuper or role.rolbypassrls or role.rolcreatedb or role.rolcreaterole
+                or role.rolreplication or role.rolname = 'pg_read_all_stats'
+                or has_database_privilege(role.oid, current_database(), 'CREATE')
+                or has_database_privilege(role.oid, current_database(), 'TEMP')
+                or has_schema_privilege(role.oid, $1::oid, 'CREATE')
+                or (not $2::boolean and exists (
+                  select 1 from pg_namespace as namespace
+                  where has_schema_privilege(role.oid, namespace.oid, 'CREATE')
+                )))
+       ) as unsafe`, [schemaOid, allowUnsafeSharedDatabase])
+    if (result.rows.length !== 1 || result.rows[0]?.unsafe !== false) {
+      throw new RegistryTenancyError('unavailable')
+    }
+  }
+
+  private async readPolicies(client: PoolClient): Promise<readonly TenancyPolicyRow[]> {
+    const result = await client.query<TenancyPolicyRow>(
+      `select c.relname as table_name, p.polname as policy_name, p.polcmd::text as command,
+              p.polpermissive as permissive,
+              (cardinality(p.polroles) = 1 and 0::oid = any(p.polroles)) as public_only,
+              p.polqual is not null as has_using,
+              p.polwithcheck is not null as has_check,
+              p.polroles::text as role_ids,
+              p.polqual::text as using_definition,
+              p.polwithcheck::text as check_definition
+       from pg_policy as p
+       join pg_class as c on c.oid = p.polrelid
+       join pg_namespace as n on n.oid = c.relnamespace
+       where n.nspname = $1 and c.relname = any($2::text[])`,
+      [this.schemaName, [...TENANT_SCOPED_TABLES]],
+    )
+    return result.rows
+  }
+
+  private requireExpectedPolicies(policies: readonly TenancyPolicyRow[]): void {
+    if (policies.length !== TENANCY_POLICIES.length) throw new RegistryTenancyError('unavailable')
+    const policyByKey = new Map(policies.map(row => [`${row.table_name}\0${row.policy_name}`, row]))
+    for (const expected of TENANCY_POLICIES) {
+      const policy = policyByKey.get(`${expected.table}\0${expected.name}`)
+      if (policy === undefined || policy.command !== expected.command || !policy.permissive || !policy.public_only
+        || policy.has_using !== expected.using || policy.has_check !== expected.check) {
+        throw new RegistryTenancyError('unavailable')
+      }
+    }
   }
 
   private async installPolicies(client: PoolClient): Promise<void> {

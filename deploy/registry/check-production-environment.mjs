@@ -93,7 +93,7 @@ function postgresUrl(value) {
   let parsed
   try { parsed = new URL(value) } catch {
     issue('DSH_REGISTRY_POSTGRES_URL must be an absolute PostgreSQL URL')
-    return
+    return undefined
   }
   if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
     issue('DSH_REGISTRY_POSTGRES_URL must use postgresql://')
@@ -101,6 +101,7 @@ function postgresUrl(value) {
   if (parsed.hostname.length === 0 || parsed.username.length === 0 || parsed.password.length === 0
     || parsed.pathname.length <= 1) issue('DSH_REGISTRY_POSTGRES_URL must include host, user, password and database')
   if (parsed.hash.length > 0) issue('DSH_REGISTRY_POSTGRES_URL must not contain a fragment')
+  return parsed
 }
 
 function syncUrl(name, value, domain) {
@@ -163,7 +164,15 @@ if (checkRegistry) {
 }
 
 const selectedPostgresUrl = checkRegistry ? process.env.DSH_REGISTRY_POSTGRES_URL?.trim() ?? '' : ''
-if (selectedPostgresUrl.length > 0) postgresUrl(selectedPostgresUrl)
+if (selectedPostgresUrl.length > 0) {
+  const parsedPostgresUrl = postgresUrl(selectedPostgresUrl)
+  if (parsedPostgresUrl !== undefined && parsedPostgresUrl.username.toLowerCase() !== 'registry_app') {
+    issue('DSH_REGISTRY_POSTGRES_URL must authenticate as the dedicated registry_app runtime role')
+  }
+}
+if (checkRegistry && (process.env.DSH_REGISTRY_POSTGRES_MIGRATOR_URL?.trim().length ?? 0) > 0) {
+  issue('DSH_REGISTRY_POSTGRES_MIGRATOR_URL must not be present in the Registry runtime environment')
+}
 
 if (checkHarness) {
   const instanceId = required('DSH_INSTANCE_ID')

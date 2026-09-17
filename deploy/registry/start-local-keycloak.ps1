@@ -1,6 +1,7 @@
 param(
   [string]$NodePath = '',
-  [switch]$RegistryOnly
+  [switch]$RegistryOnly,
+  [switch]$UpgradeDatabase
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +10,7 @@ $artifactRoot = Join-Path $repositoryRoot '.artifacts\registry-oidc-local'
 $privateConfigPath = Join-Path $artifactRoot 'private-runtime.json'
 $postgresConfigPath = Join-Path $repositoryRoot '.artifacts\postgres\private\connection.env'
 $postgresComposePath = Join-Path $repositoryRoot 'deploy\postgres\compose.yaml'
+$roleSplitPath = Join-Path $repositoryRoot 'deploy\postgres\split-registry-runtime-role.sql'
 $composePath = Join-Path $PSScriptRoot 'keycloak-local.compose.yaml'
 if ($NodePath -eq '') {
   $NodePath = (Get-Command node -ErrorAction Stop).Source
@@ -61,6 +63,9 @@ function Enable-SelfRegistration([string]$username, [string]$password) {
 if (Get-NetTCPConnection -LocalPort 3181 -State Listen -ErrorAction SilentlyContinue) {
   throw 'TCP port 3181 is already in use'
 }
+if ($UpgradeDatabase -and (Get-NetTCPConnection -LocalPort 3081 -State Listen -ErrorAction SilentlyContinue)) {
+  throw 'Database upgrade requires the Registry processes on ports 3081 and 3181 to be stopped'
+}
 
 if ($null -eq $NodePath -or -not (Test-Path -LiteralPath $NodePath)) {
   throw 'Node.js 24 or newer was not found; pass -NodePath with its absolute node.exe path'
@@ -73,8 +78,14 @@ if (-not (Test-Path -LiteralPath $postgresConfigPath)) {
 }
 $databaseUrlLine = Get-Content -LiteralPath $postgresConfigPath `
   | Where-Object { $_.StartsWith('DATABASE_URL=') } | Select-Object -First 1
+$migratorUrlLine = Get-Content -LiteralPath $postgresConfigPath `
+  | Where-Object { $_.StartsWith('DSH_REGISTRY_POSTGRES_MIGRATOR_URL=') } | Select-Object -First 1
 if ($null -eq $databaseUrlLine -or $databaseUrlLine.Length -le 'DATABASE_URL='.Length) {
   throw 'Local PostgreSQL connection configuration is unavailable'
+}
+if ($UpgradeDatabase -and ($null -eq $migratorUrlLine `
+  -or $migratorUrlLine.Length -le 'DSH_REGISTRY_POSTGRES_MIGRATOR_URL='.Length)) {
+  throw 'Local PostgreSQL migrator configuration is unavailable; run scripts/local-postgres.ps1 Start'
 }
 if (-not (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
   $dockerCandidates = @(
@@ -87,10 +98,30 @@ if (-not (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
 }
 & docker.exe --context desktop-linux info --format '{{.ServerVersion}}' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'The local Docker Desktop Linux engine is not ready' }
-& docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
-  psql -U postgres -d registry -v ON_ERROR_STOP=1 `
-  -c 'CREATE SCHEMA IF NOT EXISTS registry_saas_local AUTHORIZATION registry_app' | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the isolated local SaaS PostgreSQL schema' }
+if ($UpgradeDatabase) {
+  & docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
+    psql -U postgres -d registry -v ON_ERROR_STOP=1 `
+    -c 'CREATE SCHEMA IF NOT EXISTS registry_saas_local AUTHORIZATION registry_migrator' | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the isolated local SaaS PostgreSQL schema' }
+  $roleSplitSql = Get-Content -LiteralPath $roleSplitPath -Raw
+  $roleSplitSql | & docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
+    psql -U postgres -d registry -v ON_ERROR_STOP=1 --set=target_schema=registry_saas_local | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot separate local PostgreSQL migration and runtime ownership' }
+  $env:DSH_REGISTRY_POSTGRES_MIGRATOR_URL = $migratorUrlLine.Substring(
+    'DSH_REGISTRY_POSTGRES_MIGRATOR_URL='.Length)
+  try {
+    & $NodePath --import tsx/esm (Join-Path $PSScriptRoot 'migrate-postgres-schemas.mjs') `
+      --schema registry_saas_local --execute --confirm-runtime-stopped | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Local PostgreSQL offline schema migration failed' }
+  } finally {
+    Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL -ErrorAction SilentlyContinue
+  }
+  $roleSplitSql | & docker.exe --context desktop-linux compose -f $postgresComposePath exec -T postgres `
+    psql -U postgres -d registry -v ON_ERROR_STOP=1 --set=target_schema=registry_saas_local | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot finalize local PostgreSQL runtime privileges' }
+}
+# Never let an operator's offline credential leak into the online Registry child process.
+Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $artifactRoot 'home') -Force | Out-Null

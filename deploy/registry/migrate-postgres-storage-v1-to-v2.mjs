@@ -4,16 +4,13 @@ import { Pool } from 'pg'
 
 const SCHEMA_NAME = /^[a-z][a-z0-9_]*$/u
 const IDENTIFIER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u
-const MIGRATION_LOCK_KEY = createHash('sha256')
-  .update('dsh-a2a-registry-postgres-storage-v1-v2', 'utf8')
-  .digest().readBigInt64BE(0).toString()
 const REGISTRY_APPLICATIONS = ['dsh-a2a-registry', 'dsh-a2a-registry-tenancy']
 
 const HELP = `
 为一个明确的 PostgreSQL schema 规划或执行 Registry storage v1 -> v2 原地迁移。
 
 默认只做 plan 并回滚；追加 --execute 才会写入。连接串只从
-DSH_REGISTRY_POSTGRES_URL 读取，不接受命令行连接串。
+DSH_REGISTRY_POSTGRES_MIGRATOR_URL 读取，不接受命令行连接串或在线账号。
 
 用法：
   node deploy/registry/migrate-postgres-storage-v1-to-v2.mjs \\
@@ -153,22 +150,35 @@ async function activeRegistryConnections(client) {
   const result = await client.query(
     `select count(*)::integer as count from pg_stat_activity
      where datname = current_database() and pid <> pg_backend_pid()
-       and application_name = any($1::text[])`, [REGISTRY_APPLICATIONS])
+       and backend_type = 'client backend'
+       and (usename = 'registry_app' or application_name = any($1::text[]))`, [REGISTRY_APPLICATIONS])
   return result.rows[0]?.count ?? 0
 }
 
 async function requireSafeRole(client) {
   const result = await client.query(
-    'select rolsuper, rolbypassrls from pg_roles where rolname = current_user')
-  if (result.rows.length !== 1 || result.rows[0]?.rolsuper || result.rows[0]?.rolbypassrls) {
-    fail('migration requires a non-superuser role without BYPASSRLS')
+    `select exists (
+       select 1 from pg_roles as role
+       where (role.rolname = current_user
+              or pg_has_role(current_user, role.oid, 'MEMBER')
+              or pg_has_role(current_user, role.oid, 'SET'))
+         and (role.rolsuper or role.rolbypassrls or role.rolcreatedb
+              or role.rolcreaterole or role.rolreplication
+              or (role.rolname <> current_user and role.rolname <> 'pg_read_all_stats'))
+     ) as dangerous,
+     pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER') as can_read_all_stats`)
+  if (result.rows.length !== 1 || result.rows[0]?.dangerous !== false
+    || result.rows[0]?.can_read_all_stats !== true) {
+    fail('migration role must not have cluster administration, replication, or BYPASSRLS and must have pg_read_all_stats')
   }
 }
 
-async function acquireMigrationLock(client) {
+async function acquireMigrationLock(client, schema) {
   const result = await client.query(
-    'select pg_try_advisory_xact_lock($1::bigint) as acquired', [MIGRATION_LOCK_KEY])
-  if (result.rows[0]?.acquired !== true) fail('another Registry storage migration is running')
+    `select pg_try_advisory_xact_lock(
+       hashtextextended('dsh-registry-schema:' || $1::text, 0)
+     ) as acquired`, [schema])
+  if (result.rows[0]?.acquired !== true) fail('another offline operation is changing the target schema')
 }
 
 async function requireRelations(client, schema) {
@@ -343,7 +353,7 @@ async function run(input, connectionString) {
     await client.query("set local lock_timeout = '2s'")
     await client.query("set local statement_timeout = '60s'")
     await requireSafeRole(client)
-    await acquireMigrationLock(client)
+    await acquireMigrationLock(client, input.schema)
 
     if (!input.execute) {
       const before = await preflight(client, input)
@@ -433,9 +443,17 @@ async function main() {
     process.stdout.write(`${HELP}\n`)
     return
   }
-  const connectionString = process.env.DSH_REGISTRY_POSTGRES_URL
+  const connectionString = process.env.DSH_REGISTRY_POSTGRES_MIGRATOR_URL
   if (connectionString === undefined || connectionString.length === 0) {
-    fail('DSH_REGISTRY_POSTGRES_URL is required')
+    fail('DSH_REGISTRY_POSTGRES_MIGRATOR_URL is required')
+  }
+  let parsed
+  try { parsed = new URL(connectionString) } catch { fail('PostgreSQL migrator URL is invalid') }
+  if (!['postgres:', 'postgresql:'].includes(parsed.protocol)
+    || parsed.username.toLowerCase() !== 'registry_migrator' || parsed.password.length === 0
+    || parsed.hostname.length === 0 || parsed.pathname.length <= 1
+    || parsed.search.length > 0 || parsed.hash.length > 0) {
+    fail('PostgreSQL migration requires the dedicated registry_migrator URL')
   }
   process.stdout.write(`${JSON.stringify(await run(input, connectionString))}\n`)
 }

@@ -42,7 +42,7 @@ export type { RegistryAccount, RegistryAccountId, RegistryLegacyOrganizationInpu
   RegistryOrganizationMembershipState, RegistryOrganizationRole, RegistryOrganizationState,
   RegistryTenancyErrorCode, RegistryTenancyStore } from './tenancy.ts'
 export { PostgresRegistryTenancy } from './tenancy-postgres.ts'
-export type { PostgresRegistryTenancyConfig } from './tenancy-postgres.ts'
+export type { PostgresRegistryTenancyConfig, PostgresRegistryTenancySchemaMode } from './tenancy-postgres.ts'
 export { DefaultRegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 export type { RegistryTenantRuntimeLease, RegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 export type { RegistryAuthorizedPrefixSnapshot, RegistryDisclosureReader,
@@ -124,6 +124,8 @@ const schema: z<Config> = z.object({
   saas: z.union([z.object({
     databaseUrlEnv: z.string().role('credential-ref').required(),
     schema: z.string().default('registry'),
+    schemaMode: z.union([z.const('migrate'), z.const('validate')]).default('migrate'),
+    allowUnsafeSharedDatabase: z.boolean().default(false),
     legacyOrganizationName: z.string().required(),
     maxConnections: z.natural().min(1).max(16).default(4),
     maxOrganizationsPerAccount: z.natural().min(1).max(100).default(5),
@@ -229,6 +231,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const tenancy = await PostgresRegistryTenancy.open({
         connectionString: databaseUrl.value,
         ...(config.saas.schema === undefined ? {} : { schema: config.saas.schema }),
+        ...(config.saas.schemaMode === undefined ? {} : { schemaMode: config.saas.schemaMode }),
+        ...(config.saas.allowUnsafeSharedDatabase === undefined ? {}
+          : { allowUnsafeSharedDatabase: config.saas.allowUnsafeSharedDatabase }),
         ...(config.saas.maxConnections === undefined ? {} : { maxConnections: config.saas.maxConnections }),
         ...(config.saas.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: config.saas.idleTimeoutMs }),
         ...(config.saas.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: config.saas.statementTimeoutMs }),

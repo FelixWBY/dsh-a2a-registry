@@ -12,6 +12,7 @@ if ($Action -in @('Prepare', 'Start')) {
   if ($LASTEXITCODE -ne 0) { throw 'Cannot secure the local secrets directory.' }
   $adminFile = Join-Path $private 'admin-password'
   $appFile = Join-Path $private 'app-password'
+  $migratorFile = Join-Path $private 'migrator-password'
   if ((Test-Path $adminFile) -xor (Test-Path $appFile)) {
     throw 'One password file is missing. Restore the original credentials; do not regenerate against an existing volume.'
   }
@@ -36,9 +37,22 @@ if ($Action -in @('Prepare', 'Start')) {
       }
     } finally { $rng.Dispose() }
   }
+  if (-not (Test-Path $migratorFile)) {
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+      $bytes = New-Object byte[] 32
+      $rng.GetBytes($bytes)
+      $password = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
+      [IO.File]::WriteAllText($migratorFile, $password, (New-Object Text.UTF8Encoding $false))
+    } finally { $rng.Dispose() }
+  }
   $appPassword = [IO.File]::ReadAllText($appFile).Trim()
+  $migratorPassword = [IO.File]::ReadAllText($migratorFile).Trim()
   $urlFile = Join-Path $private 'connection.env'
-  [IO.File]::WriteAllText($urlFile, "DATABASE_URL=postgresql://registry_app:$appPassword@127.0.0.1:5432/registry`n", (New-Object Text.UTF8Encoding $false))
+  [IO.File]::WriteAllText($urlFile, (
+    "DATABASE_URL=postgresql://registry_app:$appPassword@127.0.0.1:5432/registry`n" +
+    "DSH_REGISTRY_POSTGRES_MIGRATOR_URL=postgresql://registry_migrator:$migratorPassword@127.0.0.1:5432/registry`n"
+  ), (New-Object Text.UTF8Encoding $false))
   Write-Host 'Local credentials prepared; not printed or loaded into Registry automatically.'
   if ($Action -eq 'Prepare') { exit 0 }
 }
@@ -61,6 +75,48 @@ switch ($Action) {
   'Start' {
     & docker.exe @dockerArgs up -d --wait --wait-timeout 120
     if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL failed to start. Check Docker Desktop and compose logs; do not delete the data volume.' }
+    @'
+\getenv app_password REGISTRY_APP_PASSWORD
+\getenv migrator_password REGISTRY_MIGRATOR_PASSWORD
+begin;
+select format('create role registry_app login password %L nosuperuser nocreatedb nocreaterole noreplication nobypassrls', :'app_password')
+where not exists (select 1 from pg_roles where rolname = 'registry_app') \gexec
+select format('create role registry_migrator login password %L nosuperuser nocreatedb nocreaterole noreplication nobypassrls', :'migrator_password')
+where not exists (select 1 from pg_roles where rolname = 'registry_migrator') \gexec
+alter role registry_app login password :'app_password'
+  nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+alter role registry_migrator login password :'migrator_password'
+  nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+revoke registry_migrator from registry_app;
+revoke registry_app from registry_migrator;
+revoke all on database registry from public;
+revoke create, temporary on database registry from registry_app;
+grant connect on database registry to registry_app, registry_migrator;
+grant pg_read_all_stats to registry_migrator;
+revoke pg_read_all_stats from registry_app;
+revoke all on schema public from public;
+create schema if not exists registry authorization registry_migrator;
+select format('alter schema registry owner to registry_migrator')
+where (select nspowner <> (select oid from pg_roles where rolname = 'registry_migrator')
+       from pg_namespace where nspname = 'registry')
+  and not exists (
+    select 1 from pg_class as relation
+    join pg_namespace as namespace on namespace.oid = relation.relnamespace
+    where namespace.nspname = 'registry'
+  ) \gexec
+grant usage on schema registry to registry_app;
+alter default privileges for role registry_migrator in schema registry
+  revoke all privileges on tables from public, registry_app;
+alter default privileges for role registry_migrator in schema registry
+  revoke all privileges on sequences from public, registry_app;
+alter role registry_migrator in database registry set search_path = registry;
+alter role registry_app in database registry set search_path = registry;
+commit;
+'@ | & docker.exe @dockerArgs exec -T `
+      -e 'REGISTRY_APP_PASSWORD_FILE=/run/secrets/postgres_app_password' `
+      -e 'REGISTRY_MIGRATOR_PASSWORD_FILE=/run/secrets/postgres_migrator_password' postgres sh -c `
+      'export REGISTRY_APP_PASSWORD=$(cat "$REGISTRY_APP_PASSWORD_FILE"); export REGISTRY_MIGRATOR_PASSWORD=$(cat "$REGISTRY_MIGRATOR_PASSWORD_FILE"); exec psql -U postgres -d registry -v ON_ERROR_STOP=1'
+    if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL role and schema reconciliation failed.' }
     'SELECT current_database(), current_user, current_schema();' | & docker.exe @dockerArgs exec -T postgres sh -c 'export PGPASSWORD=$(cat /run/secrets/postgres_app_password); exec psql -h 127.0.0.1 -U registry_app -d registry -v ON_ERROR_STOP=1'
     if ($LASTEXITCODE -ne 0) { throw 'Application login verification failed.' }
     Write-Host 'PostgreSQL ready at 127.0.0.1:5432. Start Registry with deploy/registry/registry-postgres.example.patch.yml.'

@@ -8,12 +8,10 @@
       config:
         connectionString: !!js process.env.DSH_REGISTRY_POSTGRES_URL
         schema: registry
+        schemaMode: validate
         maxConnections: 8
         idleTimeoutMs: 30000
         statementTimeoutMs: 15000
-        # 首次把已有 v1 数据升级到 v2 时，所有旧数据明确归入这个组织。
-        # 确认 schema v2 与租户读取无误后可删除此项。
-        legacyTenantId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
 
 - id: registry-storage-domain
   config:
@@ -24,6 +22,7 @@
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
       schema: registry
+      schemaMode: validate
       legacyOrganizationName: !!js process.env.DSH_REGISTRY_ORGANIZATION_NAME
       maxConnections: 4
       maxOrganizationsPerAccount: 5

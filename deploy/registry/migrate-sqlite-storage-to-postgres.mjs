@@ -18,6 +18,7 @@ const schema = args.includes('--schema') ? value('--schema') : 'registry'
 if (!/^[a-z][a-z0-9_]*$/u.test(schema)) throw new Error('invalid PostgreSQL schema')
 const connectionString = process.env.DSH_REGISTRY_POSTGRES_URL
 if (!connectionString) throw new Error('DSH_REGISTRY_POSTGRES_URL is required')
+const globalTenantId = ''
 
 const sqlite = new DatabaseSync(sourcePath, { readOnly: true })
 const pool = new Pool({ connectionString, max: 1, statement_timeout: 30_000,
@@ -26,10 +27,27 @@ let backend
 try {
   const integrity = sqlite.prepare('pragma quick_check').get()
   if (integrity?.quick_check !== 'ok') throw new Error('source SQLite quick_check failed')
-  const target = await pool.query(`select to_regclass($1) as relation`, [`${schema}.units`])
-  if (target.rows[0]?.relation !== null) {
-    const count = await pool.query(`select count(*)::integer as count from "${schema}".units`)
-    if (count.rows[0]?.count !== 0) throw new Error('target PostgreSQL storage is not empty')
+  const targetClient = await pool.connect()
+  try {
+    await targetClient.query('begin isolation level repeatable read read only')
+    await targetClient.query(`select set_config('app.tenant_id', $1, true)`, [globalTenantId])
+    const target = await targetClient.query(`select to_regclass($1) as relation`, [`${schema}.units`])
+    if (target.rows[0]?.relation === null) {
+      throw new Error('target PostgreSQL storage is not initialized; run the offline schema migration before copying SQLite data')
+    }
+    const count = await targetClient.query(
+      `select count(*)::integer as count from "${schema}".units where tenant_id = $1`,
+      [globalTenantId],
+    )
+    if (count.rows[0]?.count !== 0) throw new Error('target PostgreSQL global tenant is not empty')
+    await targetClient.query('commit')
+  } catch (error) {
+    try { await targetClient.query('rollback') } catch (rollbackError) {
+      throw new AggregateError([error, rollbackError], 'target PostgreSQL preflight rollback failed')
+    }
+    throw error
+  } finally {
+    targetClient.release()
   }
   await pool.end()
 
@@ -44,10 +62,10 @@ try {
     if (owner === undefined) throw new Error('source SQLite contains an unowned unit table')
     tableNames.get(owner).push(row.name.slice(`u_${owner}_`.length))
   }
-  const descriptors = units.map(unit => ({ name: unit.name, version: unit.version,
+  const descriptors = units.map(unit => ({ tenantId: globalTenantId, name: unit.name, version: unit.version,
     tables: tableNames.get(unit.name), hasGlobal: globals.has(unit.name) }))
   backend = new PostgresStorageBackend({ connectionString, schema, maxConnections: 2,
-    idleTimeoutMs: 30_000, statementTimeoutMs: 30_000 })
+    idleTimeoutMs: 30_000, statementTimeoutMs: 30_000, schemaMode: 'validate' })
   let records = 0
   for (const descriptor of descriptors) {
     const unit = await backend.kv.open(descriptor)

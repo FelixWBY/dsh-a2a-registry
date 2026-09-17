@@ -1,5 +1,4 @@
 /** PostgreSQL-backed tenant-scoped KV storage for independently deployed Registry domains. */
-import { createHash } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { Pool, type PoolClient } from 'pg'
@@ -12,12 +11,30 @@ export const STORAGE_POSTGRES_SCHEMA_VERSION = 2
 
 const GLOBAL_TENANT_ID = ''
 const TENANT_POLICY = 'tenant_isolation'
+const STORAGE_TABLES = ['storage_meta', 'units', 'unit_globals', 'unit_records'] as const
+const TENANT_TABLES = ['units', 'unit_globals', 'unit_records'] as const
+const REGISTRY_META_TABLES = ['storage_meta', 'tenancy_meta'] as const
+const REGISTRY_BUSINESS_TABLES = [
+  'units', 'unit_globals', 'unit_records',
+  'accounts', 'account_identities', 'organizations', 'organization_memberships',
+  'organization_creations', 'organization_invitations',
+] as const
+
+export type PostgresSchemaMode = 'migrate' | 'validate'
 
 export interface Config {
   /** PostgreSQL connection string supplied by the deployment secret store. */
   connectionString: string
-  /** Dedicated application schema owned by the non-superuser Registry role. */
+  /** Dedicated application schema. The online role must not own it. */
   schema?: string
+  /**
+   * `migrate` retains the legacy bootstrap/upgrade behavior for compatibility.
+   * Internet-facing Registry processes must set `validate`: that path is a
+   * read-only schema check and can never run DDL.
+   */
+  schemaMode?: PostgresSchemaMode
+  /** Local migration escape hatch; production must leave this false. */
+  allowUnsafeSharedDatabase?: boolean
   /**
    * Explicit destination for every row in a populated schema-v1 database.
    * It is used only by the transactional v1-to-v2 migration and never inferred
@@ -33,20 +50,20 @@ export interface Config {
 export const Config: z<Config> = z.object({
   connectionString: z.string().required(),
   schema: z.string().default('registry'),
+  schemaMode: z.union(['migrate', 'validate'] as const).default('migrate'),
+  allowUnsafeSharedDatabase: z.boolean().default(false),
   legacyTenantId: z.string(),
   maxConnections: z.number().min(1).max(32).step(1).default(8),
   idleTimeoutMs: z.number().min(1_000).max(600_000).step(1).default(30_000),
   statementTimeoutMs: z.number().min(1_000).max(120_000).step(1).default(15_000),
 })
 
+export type PostgresSchemaMigrationConfig = Omit<Config, 'schemaMode'>
+export type PostgresSchemaValidationConfig = Omit<Config, 'schemaMode' | 'legacyTenantId'>
+
 function quoteIdentifier(value: string): string {
   if (!UNIT_NAME_RE.test(value)) throw new Error(`PostgreSQL schema '${value}' violates ${UNIT_NAME_RE}`)
   return `"${value}"`
-}
-
-function schemaAdvisoryLockKey(value: string): string {
-  const digest = createHash('sha256').update('dsh-storage-postgres-schema-v2\0', 'utf8').update(value, 'utf8').digest()
-  return digest.readBigInt64BE(0).toString()
 }
 
 function captureJson(value: unknown): string {
@@ -71,6 +88,494 @@ async function rollback(client: PoolClient, original: unknown): Promise<never> {
     throw new AggregateError([original, rollbackError], 'PostgreSQL transaction rollback failed')
   }
   throw original
+}
+
+function createPostgresPool(config: Pick<Config, 'connectionString' | 'maxConnections' | 'idleTimeoutMs' | 'statementTimeoutMs'>,
+  applicationName: string, maxConnections = config.maxConnections ?? 8): Pool {
+  return new Pool({
+    connectionString: config.connectionString,
+    max: maxConnections,
+    idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
+    connectionTimeoutMillis: 10_000,
+    statement_timeout: config.statementTimeoutMs ?? 15_000,
+    idle_in_transaction_session_timeout: 30_000,
+    application_name: applicationName,
+  })
+}
+
+async function assertSafeRoleChain(client: PoolClient, allowedGroupRoles: readonly string[]): Promise<void> {
+  const role = await client.query<{ readonly dangerous: boolean }>(
+    `select exists (
+       select 1 from pg_roles candidate
+       where (candidate.rolname = current_user
+              or pg_has_role(current_user, candidate.oid, 'MEMBER')
+              or pg_has_role(current_user, candidate.oid, 'SET'))
+         and (candidate.rolsuper or candidate.rolbypassrls or candidate.rolcreatedb
+           or candidate.rolcreaterole or candidate.rolreplication
+           or (candidate.rolname <> current_user and not (candidate.rolname = any($1::text[]))))
+     ) as dangerous`, [allowedGroupRoles],
+  )
+  if (role.rows.length !== 1 || role.rows[0]?.dangerous) {
+    throw new Error('PostgreSQL storage role chain contains an administrative or unexpected group role')
+  }
+}
+
+async function assertRuntimeDatabasePrivileges(client: PoolClient,
+  allowUnsafeSharedDatabase: boolean): Promise<void> {
+  const privileges = await client.query<{ readonly unsafe: boolean }>(
+    `select exists (
+       select 1 from pg_roles candidate
+       where (candidate.rolname = current_user
+              or pg_has_role(current_user, candidate.oid, 'MEMBER')
+              or pg_has_role(current_user, candidate.oid, 'SET'))
+         and (candidate.rolname <> current_user
+           or candidate.rolname = 'pg_read_all_stats'
+           or has_database_privilege(candidate.oid, current_database(), 'CREATE')
+           or has_database_privilege(candidate.oid, current_database(), 'TEMP')
+           or (not $1::boolean and exists (
+             select 1 from pg_namespace namespace
+             where has_schema_privilege(candidate.oid, namespace.oid, 'CREATE')
+           )))
+     ) as unsafe`, [allowUnsafeSharedDatabase],
+  )
+  if (privileges.rows.length !== 1 || privileges.rows[0]?.unsafe) {
+    throw new Error('PostgreSQL runtime role chain must not have database/schema CREATE, TEMP, or all-session stats privileges')
+  }
+}
+
+async function assertExactRegistryObjectPrivileges(client: PoolClient, schemaName: string): Promise<void> {
+  const state = await client.query<{ readonly unsafe: boolean }>(
+    `with runtime_role as (
+       select oid from pg_roles where rolname = current_user
+     )
+     select not exists (select 1 from runtime_role)
+       or exists (
+         select 1
+         from pg_class relation
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         cross join runtime_role
+         where namespace.nspname = $1 and relation.relkind in ('r', 'p', 'v', 'm', 'f')
+           and (
+             pg_get_userbyid(relation.relowner) <> 'registry_migrator'
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) acl
+               where acl.grantee not in (relation.relowner, runtime_role.oid)
+                 or (acl.grantee = runtime_role.oid and (
+                   acl.is_grantable
+                   or case
+                     when relation.relname = any($2::text[]) then acl.privilege_type <> 'SELECT'
+                     when relation.relname = any($3::text[]) then not (
+                       acl.privilege_type = any(array['SELECT', 'INSERT', 'UPDATE', 'DELETE']::text[])
+                     )
+                     else true
+                   end
+                 ))
+             )
+             or exists (
+               select 1
+               from pg_attribute attribute
+               cross join lateral aclexplode(attribute.attacl) acl
+               where attribute.attrelid = relation.oid and attribute.attnum > 0
+                 and not attribute.attisdropped and acl.grantee <> relation.relowner
+             )
+             or case
+               when relation.relname = any($2::text[]) then
+                 not has_table_privilege(runtime_role.oid, relation.oid, 'SELECT')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'INSERT')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'UPDATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'DELETE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRUNCATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'REFERENCES')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRIGGER')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'MAINTAIN')
+               when relation.relname = any($3::text[]) then
+                 not has_table_privilege(runtime_role.oid, relation.oid, 'SELECT')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'INSERT')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'UPDATE')
+                 or not has_table_privilege(runtime_role.oid, relation.oid, 'DELETE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRUNCATE')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'REFERENCES')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'TRIGGER')
+                 or has_table_privilege(runtime_role.oid, relation.oid, 'MAINTAIN')
+               else has_table_privilege(runtime_role.oid, relation.oid,
+                 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN')
+             end
+           )
+       )
+       or exists (
+         select 1
+         from pg_sequence sequence
+         join pg_class relation on relation.oid = sequence.seqrelid
+         join pg_namespace namespace on namespace.oid = relation.relnamespace
+         cross join runtime_role
+         where namespace.nspname = $1
+           and (
+             pg_get_userbyid(relation.relowner) <> 'registry_migrator'
+             or exists (
+               select 1
+               from aclexplode(coalesce(relation.relacl, acldefault('S', relation.relowner))) acl
+               where acl.grantee <> relation.relowner
+             )
+             or has_sequence_privilege(runtime_role.oid, relation.oid, 'USAGE, SELECT, UPDATE')
+           )
+       ) as unsafe`,
+    [schemaName, [...REGISTRY_META_TABLES], [...REGISTRY_BUSINESS_TABLES]],
+  )
+  if (state.rows.length !== 1 || state.rows[0]?.unsafe) {
+    throw new Error('PostgreSQL schema objects must be owned by registry_migrator and expose only exact registry_app ACLs')
+  }
+}
+
+async function migrateV1(client: PoolClient, schema: string, legacyTenantId: string | undefined): Promise<void> {
+  const retained = await client.query<{ has_data: boolean }>(
+    `select exists (select 1 from ${schema}.units) as has_data`,
+  )
+  if (retained.rows[0]?.has_data && legacyTenantId === undefined) {
+    throw new StorageError('version-mismatch',
+      'PostgreSQL schema v1 contains data; configure legacyTenantId explicitly before migration')
+  }
+  const tenantId = legacyTenantId ?? GLOBAL_TENANT_ID
+  await client.query(`alter table ${schema}.units add column tenant_id text`)
+  await client.query(`alter table ${schema}.unit_globals add column tenant_id text`)
+  await client.query(`alter table ${schema}.unit_records add column tenant_id text`)
+  await client.query(`update ${schema}.units set tenant_id = $1`, [tenantId])
+  await client.query(`update ${schema}.unit_globals set tenant_id = $1`, [tenantId])
+  await client.query(`update ${schema}.unit_records set tenant_id = $1`, [tenantId])
+  await client.query(`alter table ${schema}.units alter column tenant_id set not null`)
+  await client.query(`alter table ${schema}.unit_globals alter column tenant_id set not null`)
+  await client.query(`alter table ${schema}.unit_records alter column tenant_id set not null`)
+  await client.query(`alter table ${schema}.unit_globals drop constraint unit_globals_unit_fkey`)
+  await client.query(`alter table ${schema}.unit_records drop constraint unit_records_unit_fkey`)
+  await client.query(`alter table ${schema}.unit_globals drop constraint unit_globals_pkey`)
+  await client.query(`alter table ${schema}.unit_records drop constraint unit_records_pkey`)
+  await client.query(`alter table ${schema}.units drop constraint units_pkey`)
+  await client.query(`alter table ${schema}.units
+    add constraint units_pkey primary key (tenant_id, name)`)
+  await client.query(`alter table ${schema}.unit_globals
+    add constraint unit_globals_pkey primary key (tenant_id, unit),
+    add constraint unit_globals_unit_fkey foreign key (tenant_id, unit)
+      references ${schema}.units (tenant_id, name) on delete cascade`)
+  await client.query(`alter table ${schema}.unit_records
+    add constraint unit_records_pkey primary key (tenant_id, unit, table_name, key),
+    add constraint unit_records_unit_fkey foreign key (tenant_id, unit)
+      references ${schema}.units (tenant_id, name) on delete cascade`)
+  await client.query(`update ${schema}.storage_meta set schema_version = $1 where singleton = true`,
+    [STORAGE_POSTGRES_SCHEMA_VERSION])
+}
+
+async function createV2Tables(client: PoolClient, schema: string): Promise<void> {
+  await client.query(`create table if not exists ${schema}.units (
+    tenant_id text not null,
+    name text not null,
+    version integer not null check (version >= 0),
+    constraint units_pkey primary key (tenant_id, name)
+  )`)
+  await client.query(`create table if not exists ${schema}.unit_globals (
+    tenant_id text not null,
+    unit text not null,
+    value jsonb not null,
+    constraint unit_globals_pkey primary key (tenant_id, unit),
+    constraint unit_globals_unit_fkey foreign key (tenant_id, unit)
+      references ${schema}.units (tenant_id, name) on delete cascade
+  )`)
+  await client.query(`create table if not exists ${schema}.unit_records (
+    tenant_id text not null,
+    unit text not null,
+    table_name text not null,
+    key text not null,
+    value jsonb not null,
+    constraint unit_records_pkey primary key (tenant_id, unit, table_name, key),
+    constraint unit_records_unit_fkey foreign key (tenant_id, unit)
+      references ${schema}.units (tenant_id, name) on delete cascade
+  )`)
+}
+
+async function installTenantPolicies(client: PoolClient, schema: string): Promise<void> {
+  for (const table of TENANT_TABLES) {
+    await client.query(`alter table ${schema}.${table} enable row level security`)
+    await client.query(`alter table ${schema}.${table} force row level security`)
+    await client.query(`drop policy if exists ${TENANT_POLICY} on ${schema}.${table}`)
+    await client.query(`create policy ${TENANT_POLICY} on ${schema}.${table}
+      using (tenant_id = current_setting('app.tenant_id', true))
+      with check (tenant_id = current_setting('app.tenant_id', true))`)
+  }
+}
+
+async function migratePostgresSchema(pool: Pool, schemaName: string, legacyTenantId: string | undefined): Promise<void> {
+  const schema = quoteIdentifier(schemaName)
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    const lock = await client.query<{ acquired: boolean }>(
+      `select pg_try_advisory_xact_lock(
+         hashtextextended('dsh-registry-schema:' || $1::text, 0)
+       ) as acquired`, [schemaName])
+    if (lock.rows[0]?.acquired !== true) {
+      throw new Error(`PostgreSQL schema '${schemaName}' is already being changed by another offline operation`)
+    }
+    await assertSafeRoleChain(client, ['pg_read_all_stats'])
+    await client.query(`create table if not exists ${schema}.storage_meta (
+      singleton boolean primary key default true check (singleton), schema_version integer not null check (schema_version > 0)
+    )`)
+    await client.query(`insert into ${schema}.storage_meta (singleton, schema_version) values (true, $1)
+      on conflict (singleton) do nothing`, [STORAGE_POSTGRES_SCHEMA_VERSION])
+    const meta = await client.query<{ schema_version: number }>(
+      `select schema_version from ${schema}.storage_meta where singleton = true`,
+    )
+    const version = meta.rows[0]?.schema_version
+    if (meta.rows.length !== 1 || (version !== 1 && version !== STORAGE_POSTGRES_SCHEMA_VERSION)) {
+      throw new StorageError('version-mismatch', 'PostgreSQL storage schema version is incompatible with this build')
+    }
+    if (version === 1) await migrateV1(client, schema, legacyTenantId)
+    await createV2Tables(client, schema)
+    await installTenantPolicies(client, schema)
+    await client.query('commit')
+  } catch (error) {
+    await rollback(client, error)
+  } finally {
+    client.release()
+  }
+}
+
+function schemaValidationError(reason: string): StorageError {
+  return new StorageError('version-mismatch', `PostgreSQL storage schema validation failed: ${reason}`)
+}
+
+function normalizePolicyExpression(expression: string): string {
+  let normalized = expression.replace(/\s+/g, '').replace(/::text/g, '')
+  if (normalized.startsWith('(') && normalized.endsWith(')')) normalized = normalized.slice(1, -1)
+  return normalized
+}
+
+async function validatePostgresSchema(pool: Pool, schemaName: string,
+  allowUnsafeSharedDatabase = false): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query('begin isolation level repeatable read read only')
+    const runtimeIdentity = await client.query<{ readonly expected: boolean }>(
+      `select current_user = 'registry_app' as expected`)
+    if (runtimeIdentity.rows.length !== 1 || runtimeIdentity.rows[0]?.expected !== true) {
+      throw new Error('PostgreSQL runtime connection must authenticate as registry_app')
+    }
+    await assertSafeRoleChain(client, [])
+    await assertRuntimeDatabasePrivileges(client, allowUnsafeSharedDatabase)
+
+    const schemaAccess = await client.query<{
+      readonly acl_is_exact: boolean
+      readonly can_create: boolean
+      readonly can_use: boolean
+      readonly owner_is_migrator: boolean
+    }>(
+      `select exists (
+         select 1 from pg_roles candidate
+         where pg_has_role(current_user, candidate.oid, 'MEMBER')
+           and has_schema_privilege(candidate.oid, namespace.oid, 'CREATE')
+       ) as can_create,
+       has_schema_privilege(current_user, namespace.oid, 'USAGE') as can_use,
+       pg_get_userbyid(namespace.nspowner) = 'registry_migrator' as owner_is_migrator,
+       not exists (
+         select 1
+         from aclexplode(coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))) acl
+         where acl.grantee not in (
+             namespace.nspowner, (select oid from pg_roles where rolname = current_user)
+           )
+           or (acl.grantee = (select oid from pg_roles where rolname = current_user)
+             and (acl.privilege_type <> 'USAGE' or acl.is_grantable))
+       ) as acl_is_exact
+       from pg_namespace namespace where namespace.nspname = $1`,
+      [schemaName],
+    )
+    if (schemaAccess.rows.length !== 1) throw schemaValidationError('configured schema does not exist')
+    const selectedSchema = schemaAccess.rows[0]
+    if (selectedSchema?.can_create || !selectedSchema?.can_use
+      || !selectedSchema?.owner_is_migrator || !selectedSchema?.acl_is_exact) {
+      throw new Error('PostgreSQL storage schema must be migrator-owned and grant only USAGE to registry_app')
+    }
+    await assertExactRegistryObjectPrivileges(client, schemaName)
+
+    const tables = await client.query<{
+      readonly table_name: string
+      readonly row_security: boolean
+      readonly force_row_security: boolean
+      readonly may_assume_owner: boolean
+      readonly can_select: boolean
+      readonly can_insert: boolean
+      readonly can_update: boolean
+      readonly can_delete: boolean
+      readonly reachable_insert: boolean
+      readonly reachable_update: boolean
+      readonly reachable_delete: boolean
+      readonly reachable_truncate: boolean
+      readonly reachable_references: boolean
+      readonly reachable_trigger: boolean
+      readonly reachable_maintain: boolean
+    }>(
+      `select c.relname as table_name, c.relrowsecurity as row_security,
+              c.relforcerowsecurity as force_row_security,
+              pg_has_role(current_user, c.relowner, 'MEMBER') as may_assume_owner,
+              has_table_privilege(current_user, c.oid, 'SELECT') as can_select,
+              has_table_privilege(current_user, c.oid, 'INSERT') as can_insert,
+              has_table_privilege(current_user, c.oid, 'UPDATE') as can_update,
+              has_table_privilege(current_user, c.oid, 'DELETE') as can_delete,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and (has_table_privilege(candidate.oid, c.oid, 'INSERT')
+                       or has_any_column_privilege(candidate.oid, c.oid, 'INSERT'))
+              ) as reachable_insert,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and (has_table_privilege(candidate.oid, c.oid, 'UPDATE')
+                       or has_any_column_privilege(candidate.oid, c.oid, 'UPDATE'))
+              ) as reachable_update,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and has_table_privilege(candidate.oid, c.oid, 'DELETE')
+              ) as reachable_delete,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and has_table_privilege(candidate.oid, c.oid, 'TRUNCATE')
+              ) as reachable_truncate,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and (has_table_privilege(candidate.oid, c.oid, 'REFERENCES')
+                       or has_any_column_privilege(candidate.oid, c.oid, 'REFERENCES'))
+              ) as reachable_references,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and has_table_privilege(candidate.oid, c.oid, 'TRIGGER')
+              ) as reachable_trigger,
+              exists (
+                select 1 from pg_roles candidate
+                where (candidate.rolname = current_user
+                       or pg_has_role(current_user, candidate.oid, 'MEMBER')
+                       or pg_has_role(current_user, candidate.oid, 'SET'))
+                  and has_table_privilege(candidate.oid, c.oid, 'MAINTAIN')
+              ) as reachable_maintain
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = $1 and c.relname = any($2::text[]) and c.relkind in ('r', 'p')
+       order by c.relname`,
+      [schemaName, [...STORAGE_TABLES]],
+    )
+    if (tables.rows.length !== STORAGE_TABLES.length
+      || STORAGE_TABLES.some(name => !tables.rows.some(row => row.table_name === name))) {
+      throw schemaValidationError('required v2 tables are missing')
+    }
+    if (tables.rows.some(row => row.may_assume_owner)) {
+      throw new Error('PostgreSQL runtime role must not own or be a member of an owner role for storage tables')
+    }
+    for (const relation of tables.rows) {
+      const hasUnsafeDdl = relation.reachable_truncate || relation.reachable_references
+        || relation.reachable_trigger || relation.reachable_maintain
+      if (relation.table_name === 'storage_meta') {
+        if (!relation.can_select || relation.reachable_insert || relation.reachable_update
+          || relation.reachable_delete || hasUnsafeDdl) {
+          throw schemaValidationError("table 'storage_meta' must grant only SELECT to the runtime role")
+        }
+      } else if (!relation.can_select || !relation.can_insert || !relation.can_update || !relation.can_delete
+        || hasUnsafeDdl) {
+        throw schemaValidationError(`table '${relation.table_name}' must grant runtime CRUD and forbid DDL privileges`)
+      }
+    }
+    for (const table of TENANT_TABLES) {
+      const relation = tables.rows.find(row => row.table_name === table)
+      if (!relation?.row_security || !relation.force_row_security) {
+        throw schemaValidationError(`table '${table}' must enable and force row-level security`)
+      }
+    }
+
+    const meta = await client.query<{ readonly schema_version: number }>(
+      `select schema_version from ${quoteIdentifier(schemaName)}.storage_meta where singleton = true`,
+    )
+    if (meta.rows.length !== 1 || meta.rows[0]?.schema_version !== STORAGE_POSTGRES_SCHEMA_VERSION) {
+      throw schemaValidationError(`schema version must equal ${STORAGE_POSTGRES_SCHEMA_VERSION}`)
+    }
+
+    const tenantColumns = await client.query<{ readonly table_name: string }>(
+      `select c.relname as table_name
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       join pg_attribute a on a.attrelid = c.oid
+       where n.nspname = $1 and c.relname = any($2::text[]) and c.relkind in ('r', 'p')
+         and a.attname = 'tenant_id' and a.atttypid = 'text'::regtype and a.attnotnull and not a.attisdropped`,
+      [schemaName, [...TENANT_TABLES]],
+    )
+    if (tenantColumns.rows.length !== TENANT_TABLES.length) {
+      throw schemaValidationError('tenant tables must contain a non-null text tenant_id column')
+    }
+
+    const policies = await client.query<{
+      readonly table_name: string
+      readonly policy_name: string
+      readonly all_commands: boolean
+      readonly permissive: boolean
+      readonly public_only: boolean
+      readonly qualification: string
+      readonly check_expression: string
+    }>(
+      `select c.relname as table_name, p.polname as policy_name, p.polcmd = '*' as all_commands,
+              p.polpermissive as permissive, p.polroles = array[0::oid] as public_only,
+              coalesce(pg_get_expr(p.polqual, p.polrelid), '') as qualification,
+              coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') as check_expression
+       from pg_policy p join pg_class c on c.oid = p.polrelid
+       join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = $1 and c.relname = any($2::text[])
+       order by c.relname, p.polname`,
+      [schemaName, [...TENANT_TABLES]],
+    )
+    const expectedExpression = "tenant_id=current_setting('app.tenant_id',true)"
+    for (const table of TENANT_TABLES) {
+      const policy = policies.rows.filter(row => row.table_name === table)
+      if (policy.length !== 1 || policy[0]?.policy_name !== TENANT_POLICY || !policy[0]?.all_commands
+        || !policy[0]?.permissive || !policy[0]?.public_only
+        || normalizePolicyExpression(policy[0]?.qualification ?? '') !== expectedExpression
+        || normalizePolicyExpression(policy[0]?.check_expression ?? '') !== expectedExpression) {
+        throw schemaValidationError(`table '${table}' does not have the exact tenant-isolation policy`)
+      }
+    }
+    await client.query('commit')
+  } catch (error) {
+    await rollback(client, error)
+  } finally {
+    client.release()
+  }
+}
+
+/** Run schema creation/upgrades as an explicit offline operation, then close every connection. */
+export async function migratePostgresStorageSchema(config: PostgresSchemaMigrationConfig): Promise<void> {
+  const pool = createPostgresPool(config, 'dsh-a2a-registry-schema-migrator', 1)
+  try {
+    await migratePostgresSchema(pool, config.schema ?? 'registry', config.legacyTenantId)
+  } finally {
+    await pool.end()
+  }
+}
+
+/** Run the same read-only schema/role checks used by an online `validate` backend. */
+export async function validatePostgresStorageSchema(config: PostgresSchemaValidationConfig): Promise<void> {
+  const pool = createPostgresPool(config, 'dsh-a2a-registry-schema-validator', 1)
+  try {
+    await validatePostgresSchema(pool, config.schema ?? 'registry', config.allowUnsafeSharedDatabase ?? false)
+  } finally {
+    await pool.end()
+  }
 }
 
 async function tenantTransaction<T>(pool: Pool, tenantId: string,
@@ -209,7 +714,6 @@ export class PostgresStorageBackend implements StorageBackend {
   readonly kv: KvFacet = { open: descriptor => this.openUnit(descriptor) }
   private readonly pool: Pool
   private readonly schema: string
-  private readonly schemaLockKey: string
   private readonly ready: Promise<void>
   private readonly units = new Map<string, Promise<PostgresKvUnit>>()
   private closing?: Promise<void>
@@ -217,127 +721,18 @@ export class PostgresStorageBackend implements StorageBackend {
   constructor(config: Config) {
     const schemaName = config.schema ?? 'registry'
     this.schema = quoteIdentifier(schemaName)
-    this.schemaLockKey = schemaAdvisoryLockKey(schemaName)
-    this.pool = new Pool({
-      connectionString: config.connectionString,
-      max: config.maxConnections ?? 8,
-      idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
-      connectionTimeoutMillis: 10_000,
-      statement_timeout: config.statementTimeoutMs ?? 15_000,
-      idle_in_transaction_session_timeout: 30_000,
-      application_name: 'dsh-a2a-registry',
-    })
-    this.ready = this.initialize(config.legacyTenantId)
+    const schemaMode = config.schemaMode ?? 'migrate'
+    if (schemaMode !== 'migrate' && schemaMode !== 'validate') {
+      throw new Error("PostgreSQL schemaMode must be either 'migrate' or 'validate'")
+    }
+    if (schemaMode === 'validate' && config.legacyTenantId !== undefined) {
+      throw new Error('PostgreSQL legacyTenantId is valid only when schemaMode is migrate')
+    }
+    this.pool = createPostgresPool(config, 'dsh-a2a-registry')
+    this.ready = schemaMode === 'validate'
+      ? validatePostgresSchema(this.pool, schemaName, config.allowUnsafeSharedDatabase ?? false)
+      : migratePostgresSchema(this.pool, schemaName, config.legacyTenantId)
     this.ready.catch(() => {})
-  }
-
-  private async initialize(legacyTenantId: string | undefined): Promise<void> {
-    const client = await this.pool.connect()
-    try {
-      await client.query('begin')
-      await client.query('select pg_advisory_xact_lock($1::bigint)', [this.schemaLockKey])
-      const role = await client.query<{ readonly rolsuper: boolean; readonly rolbypassrls: boolean }>(
-        'select rolsuper, rolbypassrls from pg_roles where rolname = current_user',
-      )
-      if (role.rows.length !== 1 || role.rows[0]?.rolsuper || role.rows[0]?.rolbypassrls) {
-        throw new Error('PostgreSQL storage requires a non-superuser role without BYPASSRLS')
-      }
-      await client.query(`create table if not exists ${this.schema}.storage_meta (
-        singleton boolean primary key default true check (singleton), schema_version integer not null check (schema_version > 0)
-      )`)
-      await client.query(`insert into ${this.schema}.storage_meta (singleton, schema_version) values (true, $1)
-        on conflict (singleton) do nothing`, [STORAGE_POSTGRES_SCHEMA_VERSION])
-      const meta = await client.query<{ schema_version: number }>(
-        `select schema_version from ${this.schema}.storage_meta where singleton = true`,
-      )
-      const version = meta.rows[0]?.schema_version
-      if (meta.rows.length !== 1 || (version !== 1 && version !== STORAGE_POSTGRES_SCHEMA_VERSION)) {
-        throw new StorageError('version-mismatch', 'PostgreSQL storage schema version is incompatible with this build')
-      }
-      if (version === 1) await this.migrateV1(client, legacyTenantId)
-      await this.createV2Tables(client)
-      await this.installTenantPolicies(client)
-      await client.query('commit')
-    } catch (error) {
-      await rollback(client, error)
-    } finally {
-      client.release()
-    }
-  }
-
-  private async migrateV1(client: PoolClient, legacyTenantId: string | undefined): Promise<void> {
-    const retained = await client.query<{ has_data: boolean }>(
-      `select exists (select 1 from ${this.schema}.units) as has_data`,
-    )
-    if (retained.rows[0]?.has_data && legacyTenantId === undefined) {
-      throw new StorageError('version-mismatch',
-        'PostgreSQL schema v1 contains data; configure legacyTenantId explicitly before migration')
-    }
-    const tenantId = legacyTenantId ?? GLOBAL_TENANT_ID
-    await client.query(`alter table ${this.schema}.units add column tenant_id text`)
-    await client.query(`alter table ${this.schema}.unit_globals add column tenant_id text`)
-    await client.query(`alter table ${this.schema}.unit_records add column tenant_id text`)
-    await client.query(`update ${this.schema}.units set tenant_id = $1`, [tenantId])
-    await client.query(`update ${this.schema}.unit_globals set tenant_id = $1`, [tenantId])
-    await client.query(`update ${this.schema}.unit_records set tenant_id = $1`, [tenantId])
-    await client.query(`alter table ${this.schema}.units alter column tenant_id set not null`)
-    await client.query(`alter table ${this.schema}.unit_globals alter column tenant_id set not null`)
-    await client.query(`alter table ${this.schema}.unit_records alter column tenant_id set not null`)
-    await client.query(`alter table ${this.schema}.unit_globals drop constraint unit_globals_unit_fkey`)
-    await client.query(`alter table ${this.schema}.unit_records drop constraint unit_records_unit_fkey`)
-    await client.query(`alter table ${this.schema}.unit_globals drop constraint unit_globals_pkey`)
-    await client.query(`alter table ${this.schema}.unit_records drop constraint unit_records_pkey`)
-    await client.query(`alter table ${this.schema}.units drop constraint units_pkey`)
-    await client.query(`alter table ${this.schema}.units
-      add constraint units_pkey primary key (tenant_id, name)`)
-    await client.query(`alter table ${this.schema}.unit_globals
-      add constraint unit_globals_pkey primary key (tenant_id, unit),
-      add constraint unit_globals_unit_fkey foreign key (tenant_id, unit)
-        references ${this.schema}.units (tenant_id, name) on delete cascade`)
-    await client.query(`alter table ${this.schema}.unit_records
-      add constraint unit_records_pkey primary key (tenant_id, unit, table_name, key),
-      add constraint unit_records_unit_fkey foreign key (tenant_id, unit)
-        references ${this.schema}.units (tenant_id, name) on delete cascade`)
-    await client.query(`update ${this.schema}.storage_meta set schema_version = $1 where singleton = true`,
-      [STORAGE_POSTGRES_SCHEMA_VERSION])
-  }
-
-  private async createV2Tables(client: PoolClient): Promise<void> {
-    await client.query(`create table if not exists ${this.schema}.units (
-      tenant_id text not null,
-      name text not null,
-      version integer not null check (version >= 0),
-      constraint units_pkey primary key (tenant_id, name)
-    )`)
-    await client.query(`create table if not exists ${this.schema}.unit_globals (
-      tenant_id text not null,
-      unit text not null,
-      value jsonb not null,
-      constraint unit_globals_pkey primary key (tenant_id, unit),
-      constraint unit_globals_unit_fkey foreign key (tenant_id, unit)
-        references ${this.schema}.units (tenant_id, name) on delete cascade
-    )`)
-    await client.query(`create table if not exists ${this.schema}.unit_records (
-      tenant_id text not null,
-      unit text not null,
-      table_name text not null,
-      key text not null,
-      value jsonb not null,
-      constraint unit_records_pkey primary key (tenant_id, unit, table_name, key),
-      constraint unit_records_unit_fkey foreign key (tenant_id, unit)
-        references ${this.schema}.units (tenant_id, name) on delete cascade
-    )`)
-  }
-
-  private async installTenantPolicies(client: PoolClient): Promise<void> {
-    for (const table of ['units', 'unit_globals', 'unit_records']) {
-      await client.query(`alter table ${this.schema}.${table} enable row level security`)
-      await client.query(`alter table ${this.schema}.${table} force row level security`)
-      await client.query(`drop policy if exists ${TENANT_POLICY} on ${this.schema}.${table}`)
-      await client.query(`create policy ${TENANT_POLICY} on ${this.schema}.${table}
-        using (tenant_id = current_setting('app.tenant_id', true))
-        with check (tenant_id = current_setting('app.tenant_id', true))`)
-    }
   }
 
   private openUnit(descriptor: KvUnitDescriptor): Promise<KvUnit> {
