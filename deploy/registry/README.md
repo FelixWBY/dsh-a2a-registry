@@ -6,6 +6,21 @@
 
 SaaS 设备同步使用 v5 绑定内建认证：Harness 在本机生成 Ed25519 密钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。成员审批并由 Harness 签名确认后，本机保存 `dsh1` 设备 token 和私钥；连接 WSS 时仍须签署 Registry 的一次性随机挑战。人工配对码、网页账号会话和共享测试密钥都不能替代设备凭据。
 
+## 正式 OIDC 验收
+
+选定正式身份服务并创建机密客户端后，先由部署平台把 client secret 注入一个专用进程环境变量，再运行在线符合性检查。命令行只接收环境变量名，不能接收 secret 值；检查器不会显示 client ID、secret、端点响应正文或随机探测 token：
+
+```powershell
+npm run verify:production-oidc -- `
+  --issuer https://identity.example.com/realms/registry `
+  --client-id dsh-a2a-registry `
+  --client-secret-env DSH_REGISTRY_OIDC_CLIENT_SECRET
+```
+
+检查器要求发现文档中的 `issuer` 与命令行逐字匹配，Authorization、Token、Introspection 和 JWKS URL 均为无用户信息、无片段的 HTTPS 地址；受信任身份服务可以把这些端点部署在不同 HTTPS origin。发现文档必须支持 Authorization Code、PKCE `S256`，并在声明 grant 或 scope 列表时分别包含 `authorization_code` 和 `openid`。随后检查器只生成一个新的随机不存在 token，使用与当前 Registry 运行时一致的 `client_secret_post` 调用 Introspection；只接受 HTTP 200、`application/json` 和精确的 `{"active":false}`，重定向、超时、超限正文、额外状态字段及任何协议错误都失败关闭。
+
+该过程不打开登录页、不执行用户登录，也不会申请、读取或保存真实 token。`--allow-loopback-http` 只供仓库内回环 mock 和本机身份服务验收，正式验收禁止使用。通过只证明发现文档、PKCE、客户端认证和不存在 token 的失败关闭契约可用；部署者仍须另外完成真实注册／登录／退出，以及管理员停用真实测试账号后“下一次请求立即失效”的演练，才能关闭 P-ID。
+
 ## 设备自助绑定
 
 在 Harness 主机使用 Node.js 24 运行绑定工具。状态和输出必须使用绝对路径，所在目录须提前建立；工具不会覆盖已有文件。`start` 默认申请披露同步与 A2A 接收两项权限，并用 `wx` 独占方式创建状态文件；POSIX 主机会固定为 0600。Windows 不支持用 Node mode 位设置 NTFS DACL，必须在运行前把父目录的 ACL 限制为当前 Harness 服务账号（以及必要的 `SYSTEM`／管理员恢复账号），不能依赖 `chmod`。绑定工具和 Harness 启动器共用同一套 Windows 路径门禁：只接受本地固定盘、非卷根、逐级不含 junction／符号链接等重解析点的路径；凭据父目录必须关闭继承，父目录和文件不能含 Deny 条目，所有者和全部 Allow 条目只能是当前账号、`SYSTEM` 或本机管理员，并且当前账号必须拥有修改权限。门禁还会沿整条祖先目录链拒绝可由其他账号删除、换名或改写 ACL 的命名空间，防止检查后替换父目录。任何一项不满足时，`start` 会在创建状态文件和访问 Registry 前失败，`confirm` 会在读取状态或发出确认请求前失败，`export-env` 会在读取状态和创建环境文件前失败：

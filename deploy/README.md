@@ -16,6 +16,17 @@ pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node
 
 浏览器登录必须使用支持 Token Introspection 的 OIDC 服务。Registry Cookie 只保存经过 HMAC 的随机会话 ID 和期限，Access Token 仅保留在当前 Registry 进程的有界内存中；每个新的受保护 HTTP 请求都会向身份服务重新确认 `active`、`sub`，并在响应提供时核对 `exp`、`client_id` 和 `iss`。停用用户或不一致响应会立即删除本地会话，身份服务超时或协议失败会拒绝受保护请求。`maxActiveSessions` 是单进程硬上限，满额时新会话失败关闭；`maxSessionsPerSubject` 限制同一 OIDC 主体的并发会话，超额时按签发时间和会话 ID 确定性淘汰最旧会话。当前只支持单副本，Registry 重启会使全部浏览器会话失效并要求重新登录。正式身份服务必须实测用户停用后下一次 introspection 返回非活动状态，不能只凭发现文档存在该端点就宣称验收完成。
 
+正式身份服务接线前先运行无真实用户、无真实 token 的在线符合性检查。client secret 只能由部署秘密管理注入指定环境变量，命令行只传该变量名：
+
+```sh
+npm run verify:production-oidc -- \
+  --issuer https://identity.example.com/realms/registry \
+  --client-id dsh-a2a-registry \
+  --client-secret-env DSH_REGISTRY_OIDC_CLIENT_SECRET
+```
+
+该检查严格核对发现文档 issuer、必需 HTTPS 端点、Authorization Code、PKCE S256 和可选 grant／scope 声明，再用随机不存在 token 验证 Introspection 只返回精确的非活动对象；不会跟随重定向，也不会把 secret、响应正文或随机 token 写入输出。身份服务可以把受信任端点部署在不同 HTTPS origin。`--allow-loopback-http` 只允许本机回环测试，不能出现在生产验收。工具通过仍不等于真实身份闭环完成；正式注册、登录、退出和管理员停用后下一请求失效必须另行实测。
+
 普通服务器或已有身份服务使用仓库内已经过配置图门禁的基础层和 PostgreSQL 层，再叠加部署者自己的最终 overlay。先把空的 `registry-production.example.patch.yml` 复制到 `/etc/dsh/registry-production.patch.yml`；以后只在这份部署文件中增加经过审查的 KMS、支付或其他生产 provider：
 
 ```sh
@@ -37,6 +48,7 @@ npm start -- \
 
 ```sh
 node deploy/registry/check-production-environment.mjs registry
+node deploy/registry/verify-production-oidc.mjs --issuer https://identity.example.com/realms/registry --client-id dsh-a2a-registry --client-secret-env DSH_REGISTRY_OIDC_CLIENT_SECRET
 node --import tsx/esm deploy/registry/verify-public-registry.mjs
 node --import tsx/esm deploy/registry/verify-registry-device.mjs
 ```
