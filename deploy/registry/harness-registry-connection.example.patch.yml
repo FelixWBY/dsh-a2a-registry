@@ -1,0 +1,31 @@
+# Connection-only Harness overlay. It authenticates one pre-enrolled device and
+# keeps Presence/reconnect active without enabling disclosure publication,
+# imports, questions, KMS access, or any remote tool execution.
+
+- id: web-runtime
+  inject: [webStartup, credentials]
+  config:
+    openBrowser: !!js ctx.webStartup.openBrowser
+    printUrl: true
+    surfaceContext: true
+    trustedHosts: !!js ctx.webStartup.trustedHosts
+    productionRegistryConnection:
+      mode: production
+      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
+      instanceId: !!js process.env.DSH_INSTANCE_ID
+      tokenEnv: DSH_REGISTRY_DEVICE_TOKEN
+      privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY
+      transport:
+        url: !!js process.env.DSH_REGISTRY_SYNC_URL
+        handshakeTimeoutMs: 10000
+        requestTimeoutMs: 10000
+        heartbeatIntervalMs: 10000
+        pollIntervalMs: 1000
+        maxFrameBytes: 1048576
+        maxSendBufferBytes: 2097152
+        maxConnections: 16
+        maxPendingQuestionOperations: 16
+        retryBaseMs: 500
+        retryCapMs: 30000
+        retryJitterMin: 0.5
+        retryJitterMax: 1

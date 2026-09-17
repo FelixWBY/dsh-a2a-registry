@@ -8,6 +8,8 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $artifactRoot = Join-Path $repositoryRoot '.artifacts\registry-oidc-local'
 $privateConfigPath = Join-Path $artifactRoot 'private-runtime.json'
+$tlsDataPath = Join-Path $artifactRoot 'caddy-data'
+$caCertificatePath = Join-Path $tlsDataPath 'caddy\pki\authorities\local\root.crt'
 $postgresConfigPath = Join-Path $repositoryRoot '.artifacts\postgres\private\connection.env'
 $postgresComposePath = Join-Path $repositoryRoot 'deploy\postgres\compose.yaml'
 $roleSplitPath = Join-Path $repositoryRoot 'deploy\postgres\split-registry-runtime-role.sql'
@@ -44,6 +46,25 @@ function Wait-Http([string]$uri, [int]$attempts = 60) {
     Start-Sleep -Seconds 1
   }
   throw "Service did not become ready: $uri"
+}
+
+function Wait-File([string]$path, [int]$attempts = 60) {
+  for ($attempt = 0; $attempt -lt $attempts; $attempt += 1) {
+    if ((Test-Path -LiteralPath $path -PathType Leaf) -and (Get-Item -LiteralPath $path).Length -gt 0) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  }
+  throw "Service did not create the expected file: $path"
+}
+
+function Wait-Https([string]$uri, [string]$caCertificate, [int]$attempts = 60) {
+  for ($attempt = 0; $attempt -lt $attempts; $attempt += 1) {
+    & curl.exe --silent --fail --cacert $caCertificate --noproxy localhost --output NUL $uri 2>$null
+    if ($LASTEXITCODE -eq 0) { return }
+    Start-Sleep -Seconds 1
+  }
+  throw "TLS service did not become ready: $uri"
 }
 
 function Enable-SelfRegistration([string]$username, [string]$password) {
@@ -125,6 +146,7 @@ Remove-Item Env:\DSH_REGISTRY_POSTGRES_MIGRATOR_URL -ErrorAction SilentlyContinu
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $artifactRoot 'home') -Force | Out-Null
+New-Item -ItemType Directory -Path $tlsDataPath -Force | Out-Null
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 & icacls.exe $artifactRoot /inheritance:r /grant:r "*$($identity):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot secure the local OIDC artifacts directory' }
@@ -148,17 +170,19 @@ $env:KC_BOOTSTRAP_ADMIN_PASSWORD = $privateConfig.adminPassword
 $env:DSH_LOCAL_OIDC_CLIENT_SECRET = $privateConfig.clientSecret
 $env:DSH_LOCAL_OIDC_USER_PASSWORD = $privateConfig.password
 $env:DSH_LOCAL_REGISTRY_ORIGIN = 'http://127.0.0.1:3181'
+$env:DSH_LOCAL_CADDY_DATA = $tlsDataPath
 
-$keycloakStarted = $false
+$localStackStarted = $false
 if (-not $RegistryOnly) {
   & docker.exe --context desktop-linux compose -f $composePath up -d
-  if ($LASTEXITCODE -ne 0) { throw 'Local Keycloak container failed to start' }
-  $keycloakStarted = $true
+  if ($LASTEXITCODE -ne 0) { throw 'Local Keycloak and Caddy containers failed to start' }
+  $localStackStarted = $true
 }
 
 $registry = $null
 try {
   Wait-Http 'http://127.0.0.1:3182/realms/dsh-local/.well-known/openid-configuration'
+  Wait-File $caCertificatePath
   Enable-SelfRegistration $privateConfig.adminUsername $privateConfig.adminPassword
 
   $env:DSH_HOME = Join-Path $artifactRoot 'home'
@@ -172,17 +196,21 @@ try {
     -WindowStyle Hidden -PassThru
 
   Wait-Http 'http://127.0.0.1:3181/readyz'
+  Wait-Https 'https://localhost:3183/readyz' $caCertificatePath
 } catch {
   if ($null -ne $registry -and -not $registry.HasExited) { Stop-Process -Id $registry.Id }
-  if ($keycloakStarted) { & docker.exe --context desktop-linux compose -f $composePath stop | Out-Null }
+  if ($localStackStarted) { & docker.exe --context desktop-linux compose -f $composePath stop | Out-Null }
   throw
 }
 
 [pscustomobject]@{
-  keycloakContainer = (& docker.exe --context desktop-linux compose -f $composePath ps --format json | ConvertFrom-Json).Name
+  keycloakContainer = (& docker.exe --context desktop-linux compose -f $composePath ps keycloak --format json | ConvertFrom-Json).Name
+  caddyContainer = (& docker.exe --context desktop-linux compose -f $composePath ps caddy --format json | ConvertFrom-Json).Name
   registryPid = $registry.Id
   issuer = 'http://127.0.0.1:3182/realms/dsh-local'
   registry = 'http://127.0.0.1:3181/#/sign-in'
+  sync = 'wss://localhost:3183/a2a/v1/sync'
+  caCertificate = $caCertificatePath
   username = $privateConfig.username
   privateConfig = $privateConfigPath
 } | ConvertTo-Json

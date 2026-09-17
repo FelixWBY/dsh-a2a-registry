@@ -1,5 +1,5 @@
-# Local OIDC acceptance profile. It uses a real Keycloak authorization-code
-# flow but remains non-production because both services use loopback HTTP.
+# Local OIDC/WSS acceptance profile. Keycloak uses loopback HTTP while Caddy
+# terminates a development-only internal CA certificate for device sync.
 
 - id: registry-webserver
   config:
@@ -104,11 +104,37 @@
           memberId: registry-owner
           displayName: Registry Owner
       bindings:
-        audience: wss://registry.local.invalid/a2a/v1/sync
+        audience: wss://localhost:3183/a2a/v1/sync
         ttlMs: 600000
         maxRecordBytes: 8192
         maxBindings: 20
         maxNameBytes: 128
+      sync:
+        audience: wss://localhost:3183/a2a/v1/sync
+        tlsTermination: loopback-proxy
+        maxConnections: 32
+        maxFrameBytes: 262144
+        maxSendBufferBytes: 524288
+        handshakeTimeoutMs: 10000
+        idleTimeoutMs: 30000
+        admission:
+          upgrades: { capacity: 40, refillPerSecond: 10 }
+          frames:
+            requests: { capacity: 200, refillPerSecond: 50 }
+            bytes: { capacity: 8388608, refillPerSecond: 2097152 }
+          handshakes: { capacity: 40, refillPerSecond: 10 }
+          organizations:
+            maxEntries: 64
+            requests: { capacity: 200, refillPerSecond: 50 }
+            bytes: { capacity: 8388608, refillPerSecond: 2097152 }
+          instances:
+            maxEntries: 256
+            requests: { capacity: 100, refillPerSecond: 25 }
+            bytes: { capacity: 4194304, refillPerSecond: 1048576 }
+          disclosures:
+            maxEntries: 2048
+            requests: { capacity: 50, refillPerSecond: 10 }
+            bytes: { capacity: 2097152, refillPerSecond: 524288 }
 
 - id: ui-registry
   config:

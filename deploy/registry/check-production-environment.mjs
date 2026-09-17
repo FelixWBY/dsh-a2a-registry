@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createPrivateKey } from 'node:crypto'
 import { isIP } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
 
@@ -46,6 +47,48 @@ function required(name, options = {}) {
 function identifier(name, value) {
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u.test(value)) {
     issue(`${name} must be a valid DSH identifier`)
+  }
+}
+
+function canonicalBase64Url(value, expectedBytes) {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return false
+  const decoded = Buffer.from(value, 'base64url')
+  return (expectedBytes === undefined || decoded.byteLength === expectedBytes)
+    && decoded.toString('base64url') === value
+}
+
+function deviceToken(value, expectedOrganizationId) {
+  const parts = value.split('.')
+  if (parts.length !== 4 || parts[0] !== 'dsh1'
+    || !canonicalBase64Url(parts[1]) || !canonicalBase64Url(parts[3], 32)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(parts[2])) {
+    issue('DSH_REGISTRY_DEVICE_TOKEN must be one canonical dsh1 device credential')
+    return
+  }
+  const organizationId = Buffer.from(parts[1], 'base64url').toString('utf8')
+  if (Buffer.from(organizationId, 'utf8').toString('base64url') !== parts[1]
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u.test(organizationId)
+    || organizationId !== expectedOrganizationId) {
+    issue('DSH_REGISTRY_DEVICE_TOKEN must select DSH_REGISTRY_ORGANIZATION_ID')
+  }
+}
+
+function devicePrivateKey(value) {
+  if (!canonicalBase64Url(value)) {
+    issue('DSH_REGISTRY_DEVICE_PRIVATE_KEY must be canonical base64url Ed25519 PKCS8')
+    return
+  }
+  const bytes = Buffer.from(value, 'base64url')
+  try {
+    const key = createPrivateKey({ key: bytes, format: 'der', type: 'pkcs8' })
+    const canonical = key.export({ format: 'der', type: 'pkcs8' })
+    if (key.asymmetricKeyType !== 'ed25519' || !Buffer.isBuffer(canonical) || !canonical.equals(bytes)) {
+      issue('DSH_REGISTRY_DEVICE_PRIVATE_KEY must be canonical base64url Ed25519 PKCS8')
+    }
+  } catch {
+    issue('DSH_REGISTRY_DEVICE_PRIVATE_KEY must be canonical base64url Ed25519 PKCS8')
+  } finally {
+    bytes.fill(0)
   }
 }
 
@@ -147,9 +190,10 @@ if (checkEdge) {
   }
 }
 
+let selectedOrganizationId = ''
 if (checkRegistry || checkHarness) {
-  const organizationId = required('DSH_REGISTRY_ORGANIZATION_ID')
-  if (organizationId.length > 0) identifier('DSH_REGISTRY_ORGANIZATION_ID', organizationId)
+  selectedOrganizationId = required('DSH_REGISTRY_ORGANIZATION_ID')
+  if (selectedOrganizationId.length > 0) identifier('DSH_REGISTRY_ORGANIZATION_ID', selectedOrganizationId)
 }
 
 if (checkRegistry) {
@@ -223,6 +267,12 @@ const secrets = [
   ] : []),
 ]
 for (const [name, minimumBytes] of secrets) required(name, { secret: true, minimumBytes })
+if (checkHarness) {
+  const token = process.env.DSH_REGISTRY_DEVICE_TOKEN?.trim() ?? ''
+  const privateKey = process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY?.trim() ?? ''
+  if (token.length > 0 && selectedOrganizationId.length > 0) deviceToken(token, selectedOrganizationId)
+  if (privateKey.length > 0) devicePrivateKey(privateKey)
+}
 
 if (issues.length > 0) {
   process.stderr.write(`registry-production-environment: failed (${issues.length})\n`)

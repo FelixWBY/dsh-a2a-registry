@@ -1,0 +1,18 @@
+{
+	admin off
+}
+
+https://localhost {
+	tls internal
+	encode gzip
+	route {
+		@sync path /a2a/v1/sync
+		reverse_proxy @sync host.docker.internal:3181 {
+			health_uri /readyz
+			health_interval 10s
+			health_timeout 2s
+		}
+		respond /readyz 204
+		respond 404
+	}
+}

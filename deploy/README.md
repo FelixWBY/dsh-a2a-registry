@@ -12,7 +12,7 @@
 pwsh -File deploy/registry/start-local-keycloak.ps1 -NodePath C:\tools\node\node.exe
 ```
 
-脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema；凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。服务只绑定回环地址，Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织，也可通过 Owner／Admin 生成的一次性链接加入已有组织。
+脚本在 3182 启动固定版本的 Keycloak 开发容器，在 3181 启动本仓库的 Registry，并在 3183 通过 Caddy 的本地内部 CA 提供设备同步 WSS；Registry 使用本地 PostgreSQL 中隔离的 `registry_saas_local` schema。凭据首次随机生成并保存在限制访问且被忽略的 `.artifacts/registry-oidc-local/private-runtime.json`，不会输出密码。脚本返回 WSS 地址和根证书路径；本地 Harness 必须显式信任该证书，例如把返回路径设置为 `NODE_EXTRA_CA_CERTS`。这些服务只绑定回环地址，内部 CA 只用于本机验收，不能替代公网受信任证书。Keycloak 允许本地自助注册；首次登录后可在 Registry 自助创建组织，也可通过 Owner／Admin 生成的一次性链接加入已有组织。
 
 普通服务器或已有身份服务可以直接使用 OIDC patch：
 
@@ -38,7 +38,11 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 
 ## Harness 接入
 
-Harness 仍是单独安装的外部程序。`registry/harness-production-publication.example.patch.yml`、`registry/harness.env.example` 与 `registry/dsh-harness.service.example` 属于外部 Harness 的配置参考；其中 `/opt/deepseek-harness` 是 Harness 自身的安装路径，不是 Registry 的构建依赖。
+Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 Harness 自身的安装路径，不是 Registry 的构建依赖。
+
+`registry/enroll-registry-device.mjs` 提供设备自助绑定：`start` 在 Harness 侧生成并保留 Ed25519 私钥和设备 secret，只向 Registry 提交公钥与 secret 摘要；组织成员在返回的审批地址核对临时配对码后，运行 `confirm` 完成挑战签名，再用 `export-env` 导出连接所需的五项环境变量。状态文件和导出文件都包含长期敏感凭据，必须放入受限目录或部署秘密管理，不能提交到 Git。
+
+`registry/harness-registry-connection.example.patch.yml` 是最小连接模板，只启用生产设备鉴权、在线状态和断线重连，不会启用披露发布、导入、提问、KMS 或任何远程工具执行。它可以先用于验证真实绑定和 WSS 链路。`registry/harness-production-publication.example.patch.yml` 才是完整披露链路的配置参考，但仍须由部署者提供生产披露授权、密钥发布／刷新、导入和提问实现。`registry/harness.env.example` 与 `registry/dsh-harness.service.example` 分别提供环境变量和进程托管参考。
 
 设备在发起绑定前自行生成 Ed25519 私钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。人工配对码只用于成员审核，不能当设备 token。绑定确认后，Harness 使用由组织 ID、绑定 ID 和原始 secret 组成的 `dsh1` token 发起 WSS 连接，并对每次 Registry 随机挑战签名；Registry 在每个操作前重新检查绑定、成员、scope 和密钥。生产发布、导入和提问还需具备相应设备 scope 与数据密钥；网页 OIDC 账号会话不能替代设备凭据。
 

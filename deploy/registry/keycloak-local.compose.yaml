@@ -24,6 +24,25 @@ services:
         max-size: 10m
         max-file: "3"
 
+  caddy:
+    # Local acceptance only: its private CA is intentionally not a production trust anchor.
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3183:443"
+    volumes:
+      - ./Caddyfile.keycloak-local:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ${DSH_LOCAL_CADDY_DATA:?required}
+        target: /data
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 volumes:
   keycloak_data:
     name: dsh-registry-keycloak-local-data
