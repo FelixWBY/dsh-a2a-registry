@@ -13,10 +13,12 @@ function sealedCookie(secret, value) {
 
 test('an opaque OIDC session is rejected on the first request after introspection becomes inactive', async (t) => {
   let active = true
+  let discoveries = 0
   let introspections = 0
   const provider = createServer((request, response) => {
     const origin = `http://127.0.0.1:${provider.address().port}`
     if (request.url === '/.well-known/openid-configuration') {
+      discoveries += 1
       response.writeHead(200, { 'content-type': 'application/json' })
       response.end(JSON.stringify({
         issuer: origin,
@@ -86,6 +88,7 @@ test('an opaque OIDC session is rejected on the first request after introspectio
   assert.equal((await authenticator.authenticateIdentity(request(), new AbortController().signal))?.subject, 'subject-1')
   active = false
   assert.equal(await authenticator.authenticateIdentity(request(), new AbortController().signal), null)
+  assert.equal(discoveries, 1)
   assert.equal(introspections, 2)
   assert.equal(authenticator.sessions.size, 0)
 })

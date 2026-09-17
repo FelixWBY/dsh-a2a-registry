@@ -22,7 +22,7 @@ import {
   randomState,
   tokenIntrospection,
   type CustomFetch,
-  type Configuration,
+  Configuration,
 } from 'openid-client'
 import { RegistryAccountAuthenticator, type RegistryAuthenticatedAccount,
   type RegistryAuthenticatedIdentity } from './account-auth.ts'
@@ -315,6 +315,7 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
   private readonly secureCookies: boolean
   private readonly sessionName: string
   private readonly transactionName: string
+  private serverMetadataPromise: Promise<ReturnType<Configuration['serverMetadata']>> | undefined
   private readonly sessions = new Map<string, AccountSession>()
   private readonly requestSessions = new WeakMap<IncomingMessage, Promise<AccountSession | null>>()
   private readonly requestAccounts = new WeakMap<IncomingMessage,
@@ -703,12 +704,27 @@ export class RegistryOidcAccountAuthenticator extends RegistryAccountAuthenticat
       if (init?.signal !== undefined && init.signal !== null) signals.push(init.signal)
       return globalThis.fetch(input, { ...init, signal: AbortSignal.any(signals) } as RequestInit)
     }
-    const options = {
+    const configuration = new Configuration(await this.serverMetadata(signal, fetchWithSignal), this.config.clientId,
+      { client_secret: credential.value, [clockTolerance]: this.config.clockToleranceSeconds })
+    configuration[customFetch] = fetchWithSignal
+    if (this.config.mode === 'loopback-development') allowInsecureRequests(configuration)
+    return configuration
+  }
+
+  private async serverMetadata(signal: AbortSignal,
+    fetchWithSignal: CustomFetch): Promise<ReturnType<Configuration['serverMetadata']>> {
+    signal.throwIfAborted()
+    const existing = this.serverMetadataPromise
+    if (existing !== undefined) return existing
+    const pending = discovery(new URL(this.config.issuer), this.config.clientId, undefined, undefined, {
       [customFetch]: fetchWithSignal,
       ...(this.config.mode === 'loopback-development' ? { execute: [allowInsecureRequests] } : {}),
+    }).then(configuration => configuration.serverMetadata())
+    this.serverMetadataPromise = pending
+    try { return await pending } catch (error) {
+      if (this.serverMetadataPromise === pending) this.serverMetadataPromise = undefined
+      throw error
     }
-    return discovery(new URL(this.config.issuer), this.config.clientId,
-      { client_secret: credential.value, [clockTolerance]: this.config.clockToleranceSeconds }, undefined, options)
   }
 
   private async secret(reference: string): Promise<Buffer> {
