@@ -39,6 +39,8 @@ export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, Regist
   RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName, RegistryBillingVerifiedEvent,
   RegistryBillingWebhookHeaders, RegistryBillingWebhookInput } from './billing.ts'
 export { RegistryDisclosureContentProvider } from './disclosure-content-provider.ts'
+export { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
+export type { RegistryDisclosureKeyProtection, RegistryDisclosureKeyReceipt } from './disclosure-key-provider.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
 export { RegistryTenancyError } from './tenancy.ts'
