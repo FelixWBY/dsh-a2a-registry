@@ -111,7 +111,7 @@ Remove-Item Env:NODE_OPTIONS, Env:NODE_PATH -ErrorAction SilentlyContinue
 
 上述产物必须在真实设备切换前由 `start-bound-harness.ps1` 完成本机 Web 启动验收；它只证明 CLI 与 connection-only 配置可以合成，不证明依赖安装脚本无关。后续完整 Agent／PTY／本机持久化链路若需要 `node-pty`、`koffi` 等安装产物，必须另做“无秘密构建账号生成并签名 → 最终服务账号只物化和复核”的两阶段交付，再实跑相应功能；当前准备器不提供脚本开启开关，也不得在已经保存设备密钥的服务账号中执行第三方安装脚本。
 
-Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动连接专用 overlay。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和 overlay 一起放进受保护目录。启动器显式绑定 `127.0.0.1:3080`，不会停止或替换占用该端口的进程。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
+Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动连接专用 overlay。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和 overlay 一起放进受保护目录。启动器只绑定 `127.0.0.1`，端口默认是 3080，也可用 `-Port` 选择 1–65535 范围内的独立空闲端口；它不会停止或替换占用端口的进程。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 
 先在真实 Harness 服务账号下创建三个私有目录，并在写入 enrollment 状态／环境文件前关闭继承。启动器会再次检查目录与环境文件的实际 ACL：Allow 条目只可属于当前账号、`SYSTEM` 或本机管理员，私有目录本身必须已关闭继承。日志可能包含一次性 Web 启动 URL，也按凭据处理。以下示例只授权当前账号与 `SYSTEM`；如确需管理员恢复权限，可另外授予 `*S-1-5-32-544`：
 
@@ -129,7 +129,7 @@ foreach ($directory in @($privateRoot, $dshHome, $logDir)) {
 
 受保护运行包与 `.dsh-private` 必须是两个独立目录；运行包不读取、复制或创建 enrollment、设备密钥、CA、真实 `DSH_HOME` 或日志。Node.js、Harness、启动器、overlay 与 CA 证书都是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录和 CA 父目录还必须关闭 ACL 继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此只在未占用的新版本目录发布，并以准备器和启动器的 ACL 检查结果为准。
 
-确认线协议检查通过、运行包的 `runtime-files.sha256` 已保存、3080 空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行：
+确认线协议检查通过、运行包的 `runtime-files.sha256` 已保存、所选端口空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行。下例使用 3180，避免影响已运行在 3080 的 Harness：
 
 ```powershell
 pwsh -NoProfile -File "$runtimeRoot\launcher\start-bound-harness.ps1" `
@@ -138,10 +138,11 @@ pwsh -NoProfile -File "$runtimeRoot\launcher\start-bound-harness.ps1" `
   -EnvFile 'C:\dsh-private\harness-registry.env' `
   -CaCertificate 'C:\dsh-private\registry-ca.pem' `
   -DshHome 'C:\dsh-private\home' `
-  -LogDirectory 'C:\dsh-private\logs'
+  -LogDirectory 'C:\dsh-private\logs' `
+  -Port 3180
 ```
 
-启动器最多等待 30 秒，只有新 PID 真正拥有 `127.0.0.1:3080` 监听时才报告成功；失败清理也只针对该新 PID。成功输出包含 PID、overlay、DSH_HOME 与 stdout／stderr 路径，但“本地监听就绪”不等于 Registry Presence 已完成 WSS 认证；还必须在注册站节点页确认该实例在线。停止时按该 PID 精确结束 Harness；不要按进程名批量终止，也不要把日志或私有目录提交到 Git。
+启动器最多等待 30 秒，只有新 PID 真正拥有所选 `127.0.0.1:<端口>` 监听时才报告成功；失败清理也只针对该新 PID。成功输出包含 URL、PID、overlay、DSH_HOME 与 stdout／stderr 路径，但“本地监听就绪”不等于 Registry Presence 已完成 WSS 认证；还必须在注册站节点页确认该实例在线。停止时按该 PID 精确结束 Harness；不要按进程名批量终止，也不要把日志或私有目录提交到 Git。
 
 PostgreSQL 必须在停服后按 `deploy/postgres/split-registry-runtime-role.sql`、独立 `registry_migrator` 的 `migrate-postgres-schemas.mjs`、同一权限脚本的顺序执行完整 `split → migrate → split`。在线 Registry 只注入 `registry_app` URL，并以 `schemaMode: validate` 做只读启动校验；迁移 URL 不得进入服务环境。
 

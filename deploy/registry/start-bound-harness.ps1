@@ -15,7 +15,10 @@ param(
   [string]$DshHome,
 
   [Parameter(Mandatory = $true)]
-  [string]$LogDirectory
+  [string]$LogDirectory,
+
+  [ValidateRange(1, 65535)]
+  [int]$Port = 3080
 )
 
 $ErrorActionPreference = 'Stop'
@@ -247,8 +250,8 @@ Assert-OutsideDirectory $EnvFile $HarnessRoot 'EnvFile'
 Assert-OutsideDirectory $DshHome $HarnessRoot 'DshHome'
 Assert-OutsideDirectory $LogDirectory $HarnessRoot 'LogDirectory'
 
-if (Test-PortInUse 3080) {
-  throw 'TCP 端口 3080 已被占用；启动器不会停止或替换现有进程。'
+if (Test-PortInUse $Port) {
+  throw "TCP 端口 $Port 已被占用；启动器不会停止或替换现有进程。"
 }
 
 Assert-PrivateAcl $envParent 'EnvFile 父目录' $true
@@ -294,7 +297,7 @@ try {
     '--patch', "`"$overlayPath`"",
     '--no-open',
     '--host', '127.0.0.1',
-    '--port', '3080'
+    '--port', "$Port"
   )
   try {
     $process = Start-WhitelistedProcess @{
@@ -318,7 +321,7 @@ try {
       if ($process.HasExited) {
         throw "Harness 在本地监听就绪前退出；请检查日志路径：$stdoutPath 和 $stderrPath"
       }
-      if (Test-ProcessOwnsLoopbackListener $process.Id 3080) {
+      if (Test-ProcessOwnsLoopbackListener $process.Id $Port) {
         $process.Refresh()
         if (-not $process.HasExited) {
           $ready = $true
@@ -328,7 +331,7 @@ try {
       Start-Sleep -Milliseconds 250
     }
     if (-not $ready) {
-      throw "Harness 未在 30 秒内以新 PID 监听 127.0.0.1:3080；请检查日志路径：$stdoutPath 和 $stderrPath"
+      throw "Harness 未在 30 秒内以新 PID 监听 127.0.0.1:$Port；请检查日志路径：$stdoutPath 和 $stderrPath"
     }
   } catch {
     try {
@@ -354,6 +357,7 @@ try {
 Write-Output 'bound-harness-launcher: 本地 Harness 监听已就绪。'
 Write-Output 'Registry Presence: 未在本启动器中验证，请在注册站确认实例在线。'
 Write-Output "PID: $($process.Id)"
+Write-Output "URL: http://127.0.0.1:$Port/"
 Write-Output "DSH_HOME: $DshHome"
 Write-Output "overlay: $overlayPath"
 Write-Output "stdout: $stdoutPath"

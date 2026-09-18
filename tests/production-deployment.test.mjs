@@ -152,6 +152,9 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
 
   const launcher = readFileSync(new URL(
     '../deploy/registry/start-bound-harness.ps1', import.meta.url), 'utf8')
+  assert.match(launcher, /\[ValidateRange\(1, 65535\)\][\s\S]*\[int\]\$Port = 3080/u)
+  assert.match(launcher, /Test-PortInUse \$Port/u)
+  assert.match(launcher, /Test-ProcessOwnsLoopbackListener \$process\.Id \$Port/u)
   const namespaceCheck = launcher.indexOf(
     "Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $NodePath) 'NodePath 父目录'")
   const nodeProbe = launcher.indexOf("$nodeVersion = @(& $NodePath -p 'process.versions.node'")
