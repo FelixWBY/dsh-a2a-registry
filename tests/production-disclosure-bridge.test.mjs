@@ -11,7 +11,8 @@ import { RegistryIngestError } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import { RegistryDisclosureKeyProvider } from '@deepseek-ai/dsh-registry-app/src/disclosure-key-provider.ts'
 import { Config as RegistryAppConfig } from '@deepseek-ai/dsh-registry-app/src/index.ts'
 import { REGISTRY_PRODUCTION_DISCLOSURE_BRIDGE_PATH,
-  RegistryProductionDisclosureBridge } from '@deepseek-ai/dsh-registry-app/src/production-disclosure-bridge.ts'
+  RegistryProductionDisclosureBridge,
+  installRegistryProductionDisclosureBridge } from '@deepseek-ai/dsh-registry-app/src/production-disclosure-bridge.ts'
 import { RegistryTenancyError } from '@deepseek-ai/dsh-registry-app/src/tenancy.ts'
 
 const organizationId = 'bridge-organization'
@@ -164,6 +165,24 @@ function deferred() {
   const promise = new Promise((settle, fail) => { resolve = settle; reject = fail })
   return { promise, resolve, reject }
 }
+
+test('bridge installer accepts the initialized router owned by the still-loading Registry runtime', async () => {
+  const ctx = new Context()
+  let bridge
+  try {
+    await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0, compression: 'none' })
+    await ctx.plugin((providerContext) => { new MemoryKeyProvider(providerContext, {}) }).await()
+    assert.equal(ctx.get('registryTenantRouter'), undefined)
+    const resolvedRouter = {
+      acquireRuntime() { return Promise.reject(new Error('not used during installation')) },
+    }
+    bridge = installRegistryProductionDisclosureBridge(ctx, baseConfig, resolvedRouter)
+    assert.ok(bridge instanceof RegistryProductionDisclosureBridge)
+  } finally {
+    await bridge?.close()
+    await ctx.fiber.dispose()
+  }
+})
 
 async function rawIncompleteRequest(runtime, request) {
   const target = new URL(runtime.url)

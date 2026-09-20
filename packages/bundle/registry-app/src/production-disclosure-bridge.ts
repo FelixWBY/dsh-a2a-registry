@@ -659,8 +659,13 @@ export class RegistryProductionDisclosureBridge {
 
 /** Install the optional SaaS bridge only when every authentication and KMS owner is available. */
 export function installRegistryProductionDisclosureBridge(ctx: Context,
-  config: RegistryProductionDisclosureBridgeConfig): RegistryProductionDisclosureBridge {
-  const router = ctx.get('registryTenantRouter')
+  config: RegistryProductionDisclosureBridgeConfig,
+  resolvedRouter?: RegistryTenantRuntimeRouter): RegistryProductionDisclosureBridge {
+  // The SaaS runtime creates and fully initializes its router in this same
+  // plugin fiber. That fiber is not ACTIVE until apply() returns, so its own
+  // freshly provided service is intentionally passed directly instead of
+  // weakening strict service lookup for every external caller.
+  const router = resolvedRouter ?? ctx.get('registryTenantRouter')
   const keyProvider = ctx.get('registryDisclosureKeyProvider')
   if (router === undefined || keyProvider === undefined) {
     throw new Error('Registry production disclosure bridge requires tenant routing and a key provider')

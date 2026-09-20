@@ -254,6 +254,7 @@ export const Config: z<Config> = z.transform(schema, (value) => {
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   let saasReadiness: RegistryReadinessProbe | undefined
+  let productionBridgeRouter: DefaultRegistryTenantRuntimeRouter | undefined
   if (config.saas?.billingProvider) {
     const provider = ctx.get('registryBillingProvider')
     if (provider === undefined) throw new Error('Registry SaaS billing provider is enabled but unavailable')
@@ -335,6 +336,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         router = new DefaultRegistryTenantRuntimeRouter(ctx, tenancy, structuredClone(config.ingest),
           config.ingest.organizationId, config.saas.maxActiveOrganizations)
         const activeRouter = router
+        productionBridgeRouter = activeRouter
         withdrawRouter = ctx.provide('registryTenantRouter', activeRouter)
         if (ctx.get('registryDisclosureOperations') !== undefined || ctx.get('registryImportBroker') !== undefined
           || ctx.get('registryQuestionBroker') !== undefined) {
@@ -410,7 +412,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
   if (config.productionDisclosureBridge !== undefined) {
-    const bridge = installRegistryProductionDisclosureBridge(ctx, structuredClone(config.productionDisclosureBridge))
+    const bridge = installRegistryProductionDisclosureBridge(ctx,
+      structuredClone(config.productionDisclosureBridge), productionBridgeRouter)
     ctx.effect(() => () => bridge.close(), 'registry-app: production disclosure bridge lifetime')
   }
   if (config.oidc !== undefined) {
