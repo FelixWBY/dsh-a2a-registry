@@ -12,9 +12,6 @@ if (!['edge', 'registry', 'harness', 'all'].includes(scope) || extraArguments.le
 const checkEdge = scope === 'edge' || scope === 'all'
 const checkRegistry = scope === 'registry' || scope === 'all'
 const checkHarness = scope === 'harness' || scope === 'all'
-const modelCredentialByProvider = new Map([
-  ['deepseek-official', 'DEEPSEEK_API_KEY'],
-])
 
 function issue(message) {
   issues.push(message)
@@ -51,20 +48,6 @@ function identifier(name, value) {
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u.test(value)) {
     issue(`${name} must be a valid DSH identifier`)
   }
-}
-
-function modelRoute(name, value) {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$/u.test(value)) {
-    issue(`${name} must be a valid Harness model route`)
-  }
-}
-
-function environmentVariableName(name, value) {
-  const valid = /^[A-Z_][A-Z0-9_]{0,127}$/u.test(value)
-  if (!valid) {
-    issue(`${name} must name one inherited environment variable`)
-  }
-  return valid
 }
 
 function canonicalBase64Url(value, expectedBytes) {
@@ -301,24 +284,6 @@ if (checkRegistry && (process.env.REGISTRY_BACKUP_PASSWORD?.trim().length ?? 0) 
 if (checkHarness) {
   const instanceId = required('DSH_INSTANCE_ID')
   if (instanceId.length > 0) identifier('DSH_INSTANCE_ID', instanceId)
-  const modelProvider = required('DSH_A2A_MODEL_PROVIDER')
-  if (modelProvider.length > 0) modelRoute('DSH_A2A_MODEL_PROVIDER', modelProvider)
-  const expectedModelCredentialEnv = modelCredentialByProvider.get(modelProvider)
-  if (modelProvider.length > 0 && expectedModelCredentialEnv === undefined) {
-    issue('DSH_A2A_MODEL_PROVIDER is not supported by the production credential gate')
-  }
-  const model = required('DSH_A2A_MODEL')
-  if (model.length > 0) modelRoute('DSH_A2A_MODEL', model)
-  const modelCredentialEnv = required('DSH_A2A_MODEL_CREDENTIAL_ENV')
-  if (modelCredentialEnv.length > 0) {
-    const validCredentialEnv = environmentVariableName('DSH_A2A_MODEL_CREDENTIAL_ENV', modelCredentialEnv)
-    if (validCredentialEnv && expectedModelCredentialEnv !== undefined
-      && modelCredentialEnv !== expectedModelCredentialEnv) {
-      issue('DSH_A2A_MODEL_CREDENTIAL_ENV does not match the selected provider credential mapping')
-    } else if (validCredentialEnv && expectedModelCredentialEnv !== undefined) {
-      required(modelCredentialEnv, { secret: true, minimumBytes: 16 })
-    }
-  }
 }
 
 if (checkRegistry) {

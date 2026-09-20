@@ -1,24 +1,17 @@
-# Production Harness-to-Registry A2A foundation. The bundled HTTPS bridge
-# supplies productionDisclosureAuthority and registryDisclosureKeyPublisher
-# through the Registry-owned endpoint and the independently enrolled dshb1
-# credential. The Registry import consumer also provides the production
-# sessionDisclosureRefresh implementation over that authenticated WSS channel.
+# Production Harness-to-Registry A2A foundation. The Web app owns the HTTPS
+# authority/key bridge, durable publication runtime, and authenticated WSS
+# import/refresh attachment. The independently enrolled dshb1 credential is
+# used only by the HTTPS bridge; the dsh1 credential remains WSS-only.
 
 - id: web-runtime
   inject:
     - webStartup
     - credentials
-    - productionDisclosureAuthority
-    - registryDisclosureKeyPublisher
   config:
     openBrowser: !!js ctx.webStartup.openBrowser
     printUrl: true
     surfaceContext: true
     trustedHosts: !!js ctx.webStartup.trustedHosts
-    a2aDisclosureDecryption:
-      maxPlaintextBytes: 65536
-      maxCiphertextBytes: 262144
-      maxTrustedKeys: 4
     productionRegistryConnection:
       mode: production
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
@@ -59,12 +52,23 @@
         maxPlaintextBytes: 65536
         maxCiphertextBytes: 262144
         maxTrustedKeys: 4
+    productionRegistryDisclosureImport:
+      pollIntervalMs: 1000
+      limits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+      cryptoLimits:
+        maxPlaintextBytes: 65536
+        maxCiphertextBytes: 262144
+        maxTrustedKeys: 4
+      maxRetainedBytes: 16777216
 
-# The same pre-enrolled device consumes Registry-authorized imports and answers
-# questions with one explicitly configured local model. The imported A2A turn
-# uses the Harness no-tool execution policy; no remote tool execution is enabled.
-# This also supplies the one real receiver report source carried by the
-# independent Presence connection above. No loopback transport is enabled.
+# Session Controller exposes the local disclosure preview and receives the
+# production publication/refresh services installed by the Web app. Automatic
+# Registry question consumption is intentionally omitted until its production
+# adapter is present in this Harness build.
 - id: session-controller
   config:
     disclosurePreview:
@@ -77,42 +81,3 @@
         maxToolSummaryCharacters: 4000
         maxEventBytes: 160000
         blockedText: []
-    registryDisclosureImport:
-      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
-      targetInstanceId: !!js process.env.DSH_INSTANCE_ID
-      pollIntervalMs: 1000
-      maxRetainedBytes: 16777216
-      limits:
-        maxEvents: 100
-        maxEncryptedBytes: 8388608
-        maxTextBytes: 1048576
-        maxDisplayCharacters: 2000
-    registryA2aConsumer:
-      handling: automatic
-      localModel:
-        provider: !!js process.env.DSH_A2A_MODEL_PROVIDER
-        model: !!js process.env.DSH_A2A_MODEL
-      modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV
-      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
-      sourceInstanceId: !!js process.env.DSH_INSTANCE_ID
-      pollIntervalMs: 1000
-      requestTimeoutMs: 10000
-      maxResponseBytes: 8388608
-      maxClaims: 100
-      mailboxLimits:
-        maxTextBytes: 65536
-        maxTextCharacters: 32000
-        maxCiphertextBytes: 262144
-        maxAggregateBytes: 1048576
-        maxRequests: 100
-        maxRetainedRequests: 10000
-        maxPendingOperations: 10
-        maxLifetimeMs: 604800000
-      contextLimits:
-        maxEvents: 100
-        maxEncryptedBytes: 8388608
-        maxTextBytes: 1048576
-        maxDisplayCharacters: 2000
-      maxQuestionBytes: 65536
-      maxQuestionCharacters: 32000
-      maxMessageBytes: 1048576

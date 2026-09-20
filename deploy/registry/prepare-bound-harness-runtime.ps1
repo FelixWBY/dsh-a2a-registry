@@ -224,10 +224,13 @@ function Assert-ConnectionOnlyComposition([string]$Output) {
     }
   }
   foreach ($forbidden in @(
-      'testOnlyDisclosurePublication:', 'productionDisclosurePublication:',
-      'registryDisclosureImport:', 'registryA2aConsumer:',
+      'testOnlyDisclosurePublication:', 'productionDisclosureHttpsBridge:',
+      'productionDisclosurePublication:', 'registryDisclosureImport:',
+      'productionRegistryDisclosureImport:', 'registryA2aConsumer:',
       'productionDisclosureAuthority', 'registryDisclosureKeyPublisher',
-      'a2aDisclosureDecryption:'
+      'a2aDisclosureDecryption:', 'loopbackDisclosureImport:',
+      'loopbackA2aConsumer:', 'loopbackDisclosureRefresh:',
+      'registryUrl:', 'sharedSecretEnv:'
     )) {
     if ($Output.Contains($forbidden, [StringComparison]::Ordinal)) {
       throw "connection-only 配置合成意外启用：$forbidden"

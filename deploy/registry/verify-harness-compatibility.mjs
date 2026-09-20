@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs'
+import {
+  accessSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { generateInstanceKeyPair, signDisclosureCheckpoint,
   signDisclosureEvent } from '@deepseek-ai/dsh-a2a-device-identity'
@@ -16,6 +25,12 @@ import {
 const MAX_FRAME_BYTES = 1_048_576
 const CHILD_TIMEOUT_MS = 30_000
 const CHILD_MAX_BUFFER_BYTES = 16 * 1024 * 1024
+const BUILT_WORKSPACE_FALLBACK_PACKAGES = [
+  ['@deepseek-ai/dsh-a2a-disclosure-outbox', 'packages/a2a/disclosure-outbox'],
+  ['@deepseek-ai/dsh-a2a-disclosure-policy', 'packages/a2a/disclosure-policy'],
+  ['@deepseek-ai/dsh-a2a-disclosure-producer', 'packages/a2a/disclosure-producer'],
+  ['@deepseek-ai/dsh-storage-json', 'packages/storage/storage-json'],
+]
 const USAGE = 'usage: node --import tsx/esm deploy/registry/verify-harness-compatibility.mjs'
   + ' --harness-root <path> --node-path <path> --overlay <path> --publication-overlay <path>'
 
@@ -76,8 +91,8 @@ function systemEnvironment(extra = {}) {
 }
 
 function firstDiagnostic(result) {
-  const line = String(result.stderr ?? '').trim().split(/\r?\n/u)[0]
-  return line === undefined || line === '' ? '' : `: ${line.slice(0, 500)}`
+  const diagnostic = String(result.stderr ?? '').trim().split(/\r?\n/u).slice(0, 12).join('\n')
+  return diagnostic === '' ? '' : `:\n${diagnostic.slice(0, 2_000)}`
 }
 
 function runTargetNode(nodePath, args, options, label) {
@@ -92,6 +107,63 @@ function runTargetNode(nodePath, args, options, label) {
   if (result.error !== undefined) fail(`${label} could not run: ${result.error.message}`)
   if (result.status !== 0) fail(`${label} failed${firstDiagnostic(result)}`)
   return result.stdout
+}
+
+function readJsonFile(path, label) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    fail(`${label} is not valid JSON: ${path}`)
+  }
+}
+
+/**
+ * Prepare a temporary resolver for newly added workspace packages whose pnpm links may be stale.
+ * Every fallback must still be a declared Web dependency with a matching package name and built entry.
+ */
+export function prepareBuiltWorkspaceFallback(harnessRoot) {
+  const consumerPath = join(harnessRoot, 'packages/bundle/web-app/package.json')
+  requireFile(consumerPath, 'Harness Web package manifest')
+  const consumer = readJsonFile(consumerPath, 'Harness Web package manifest')
+  const declared = { ...consumer.peerDependencies, ...consumer.dependencies }
+  const entries = {}
+  for (const [name, relativeRoot] of BUILT_WORKSPACE_FALLBACK_PACKAGES) {
+    if (typeof declared[name] !== 'string' || !declared[name].startsWith('workspace:')) {
+      fail(`Harness Web package does not declare required workspace dependency ${name}`)
+    }
+    const packageRoot = join(harnessRoot, relativeRoot)
+    const manifestPath = join(packageRoot, 'package.json')
+    requireFile(manifestPath, `Harness workspace package ${name} manifest`)
+    const manifest = readJsonFile(manifestPath, `Harness workspace package ${name} manifest`)
+    const exportedEntry = manifest.exports?.['.']?.default
+    if (manifest.name !== name || typeof manifest.main !== 'string' || manifest.main.length === 0
+      || exportedEntry !== `./${manifest.main}`) {
+      fail(`Harness workspace package ${name} has an invalid name or built entry`)
+    }
+    const entryPath = join(packageRoot, exportedEntry)
+    requireFile(entryPath, `Harness workspace package ${name} built entry`)
+    entries[name] = pathToFileURL(realpathSync.native(entryPath)).href
+  }
+
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-harness-workspace-resolver-'))
+  const preloadPath = join(directory, 'register-workspace-fallback.mjs')
+  writeFileSync(preloadPath, [
+    "import { registerHooks } from 'node:module'",
+    `const entries = Object.freeze(${JSON.stringify(entries)})`,
+    'registerHooks({',
+    '  resolve(specifier, context, nextResolve) {',
+    '    try { return nextResolve(specifier, context) } catch (error) {',
+    "      if (error?.code !== 'ERR_MODULE_NOT_FOUND' || entries[specifier] === undefined) throw error",
+    '      return nextResolve(entries[specifier], context)',
+    '    }',
+    '  },',
+    '})',
+    '',
+  ].join('\n'), { encoding: 'utf8', mode: 0o600 })
+  return {
+    directory,
+    preload: ['--import', pathToFileURL(preloadPath).href],
+  }
 }
 
 function requireTargetNode(nodePath, harnessRoot) {
@@ -476,29 +548,78 @@ const connectionOverlaySchemaProbe = (webAppSpecifier, appBootSpecifier) => Stri
   process.stdout.write('overlay-schema-compatible\n')
 `
 
-const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifier,
+/** Exercise the target Web app's cross-field Registry composition contract.
+ * @param {(connection: object, bridge: object, publication: object, disclosureImport: object) => void} validate
+ * Target Harness composition validator.
+ * @param {object} resolvedWeb Fully schema-resolved publication Web config. */
+export function assertPublicationCompositionValidator(validate, resolvedWeb) {
+  validate(
+    resolvedWeb.productionRegistryConnection,
+    resolvedWeb.productionDisclosureHttpsBridge,
+    resolvedWeb.productionDisclosurePublication,
+    resolvedWeb.productionRegistryDisclosureImport,
+  )
+  const rejected = (candidate) => {
+    try {
+      validate(
+        candidate.productionRegistryConnection,
+        candidate.productionDisclosureHttpsBridge,
+        candidate.productionDisclosurePublication,
+        candidate.productionRegistryDisclosureImport,
+      )
+      return false
+    } catch {
+      return true
+    }
+  }
+  const insufficientCapacity = {
+    ...resolvedWeb,
+    productionRegistryConnection: {
+      ...resolvedWeb.productionRegistryConnection,
+      transport: {
+        ...resolvedWeb.productionRegistryConnection.transport,
+        maxConnections: resolvedWeb.productionDisclosurePublication.producer.maxPublications + 2,
+      },
+    },
+  }
+  if (!rejected(insufficientCapacity)) {
+    throw new Error('target Harness composition validator accepted insufficient transport capacity')
+  }
+  const wrongAuthority = {
+    ...resolvedWeb,
+    productionDisclosureHttpsBridge: {
+      ...resolvedWeb.productionDisclosureHttpsBridge,
+      url: 'https://other.invalid/a2a/v1/disclosure-publication',
+    },
+  }
+  if (!rejected(wrongAuthority)) {
+    throw new Error('target Harness composition validator accepted a foreign bridge authority')
+  }
+}
+
+export const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifier,
   appBootSpecifier) => String.raw`
   import { resolve } from 'node:path'
-  import { Config as WebConfigSchema } from ${JSON.stringify(webAppSpecifier)}
+  import { Config as WebConfigSchema, validateProductionRegistryComposition }
+    from ${JSON.stringify(webAppSpecifier)}
   import { SessionController } from ${JSON.stringify(sessionControllerSpecifier)}
   import { loadOverlayPatches } from ${JSON.stringify(appBootSpecifier)}
   const exactKeys = (value, keys) => value !== null && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
   const expression = (value, source) => exactKeys(value, ['__jsExpr']) && value.__jsExpr === source
+  ${assertPublicationCompositionValidator.toString()}
   const patches = loadOverlayPatches('registry-harness-publication-compatibility', process.argv[1])
   if (!Array.isArray(patches) || patches.length !== 2) process.exit(3)
   const web = patches.find(row => row?.id === 'web-runtime')
   const session = patches.find(row => row?.id === 'session-controller')
   if (!exactKeys(web, ['id', 'inject', 'config'])
-    || !Array.isArray(web.inject) || web.inject.length !== 4
+    || !Array.isArray(web.inject) || web.inject.length !== 2
     || web.inject[0] !== 'webStartup' || web.inject[1] !== 'credentials'
-    || web.inject[2] !== 'productionDisclosureAuthority'
-    || web.inject[3] !== 'registryDisclosureKeyPublisher'
     || !exactKeys(session, ['id', 'config'])) process.exit(3)
   const webConfig = web.config
   if (!exactKeys(webConfig, ['openBrowser', 'printUrl', 'surfaceContext', 'trustedHosts',
-    'a2aDisclosureDecryption', 'productionRegistryConnection', 'productionDisclosureHttpsBridge',
-    'productionDisclosurePublication'])
+    'productionRegistryConnection', 'productionDisclosureHttpsBridge',
+    'productionDisclosurePublication', 'productionRegistryDisclosureImport'])
     || !expression(webConfig.openBrowser, 'ctx.webStartup.openBrowser')
     || webConfig.printUrl !== true || webConfig.surfaceContext !== true
     || !expression(webConfig.trustedHosts, 'ctx.webStartup.trustedHosts')) process.exit(3)
@@ -524,6 +645,14 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
   if (!exactKeys(publication, ['mode', 'storageRoot', 'producer', 'crypto'])
     || publication.mode !== 'production'
     || !expression(publication.storageRoot, 'process.env.DSH_DISCLOSURE_STATE_PATH')) process.exit(3)
+  const disclosureImport = webConfig.productionRegistryDisclosureImport
+  if (!exactKeys(disclosureImport, ['pollIntervalMs', 'limits', 'cryptoLimits', 'maxRetainedBytes'])
+    || disclosureImport.pollIntervalMs !== 1000
+    || disclosureImport.maxRetainedBytes !== 16777216
+    || !exactKeys(disclosureImport.limits,
+      ['maxEvents', 'maxEncryptedBytes', 'maxTextBytes', 'maxDisplayCharacters'])
+    || !exactKeys(disclosureImport.cryptoLimits,
+      ['maxPlaintextBytes', 'maxCiphertextBytes', 'maxTrustedKeys'])) process.exit(3)
   const resolvedWeb = WebConfigSchema({
     ...webConfig,
     openBrowser: false,
@@ -549,48 +678,16 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
       !== 'https://registry.invalid/a2a/v1/disclosure-publication'
     || resolvedWeb.productionDisclosureHttpsBridge.tokenEnv !== 'DSH_REGISTRY_DISCLOSURE_TOKEN'
     || resolvedWeb.productionDisclosurePublication?.mode !== 'production'
-    || resolvedWeb.productionDisclosurePublication.storageRoot !== resolve('compatibility-disclosure-state')) {
+    || resolvedWeb.productionDisclosurePublication.storageRoot !== resolve('compatibility-disclosure-state')
+    || resolvedWeb.productionRegistryDisclosureImport?.pollIntervalMs !== 1000
+    || resolvedWeb.productionRegistryDisclosureImport.maxRetainedBytes !== 16777216) {
     process.exit(3)
   }
+  assertPublicationCompositionValidator(validateProductionRegistryComposition, resolvedWeb)
   const sessionConfig = session.config
-  if (!exactKeys(sessionConfig, ['disclosurePreview', 'registryDisclosureImport', 'registryA2aConsumer'])) {
-    process.exit(3)
-  }
-  const selectedImport = sessionConfig.registryDisclosureImport
-  const selectedQuestion = sessionConfig.registryA2aConsumer
-  if (!expression(selectedImport?.organizationId, 'process.env.DSH_REGISTRY_ORGANIZATION_ID')
-    || !expression(selectedImport?.targetInstanceId, 'process.env.DSH_INSTANCE_ID')
-    || !expression(selectedQuestion?.organizationId, 'process.env.DSH_REGISTRY_ORGANIZATION_ID')
-    || !expression(selectedQuestion?.sourceInstanceId, 'process.env.DSH_INSTANCE_ID')
-    || selectedQuestion?.handling !== 'automatic'
-    || !exactKeys(selectedQuestion.localModel, ['provider', 'model'])
-    || !expression(selectedQuestion.localModel.provider, 'process.env.DSH_A2A_MODEL_PROVIDER')
-    || !expression(selectedQuestion.localModel.model, 'process.env.DSH_A2A_MODEL')
-    || !expression(selectedQuestion.modelCredentialEnv,
-      'process.env.DSH_A2A_MODEL_CREDENTIAL_ENV')) process.exit(3)
-  const resolvedSession = SessionController.Config({
-    ...sessionConfig,
-    registryDisclosureImport: {
-      ...selectedImport,
-      organizationId: 'compatibility-organization',
-      targetInstanceId: 'compatibility-target',
-    },
-    registryA2aConsumer: {
-      ...selectedQuestion,
-      organizationId: 'compatibility-organization',
-      sourceInstanceId: 'compatibility-target',
-      localModel: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      modelCredentialEnv: 'DEEPSEEK_API_KEY',
-    },
-  })
-  if (resolvedSession.registryDisclosureImport?.organizationId !== 'compatibility-organization'
-    || resolvedSession.registryDisclosureImport?.targetInstanceId !== 'compatibility-target'
-    || resolvedSession.registryA2aConsumer?.organizationId !== 'compatibility-organization'
-    || resolvedSession.registryA2aConsumer?.sourceInstanceId !== 'compatibility-target'
-    || resolvedSession.registryA2aConsumer?.handling !== 'automatic'
-    || resolvedSession.registryA2aConsumer.localModel.provider !== 'deepseek-official'
-    || resolvedSession.registryA2aConsumer.localModel.model !== 'deepseek-v4-flash'
-    || resolvedSession.registryA2aConsumer.modelCredentialEnv !== 'DEEPSEEK_API_KEY') process.exit(3)
+  if (!exactKeys(sessionConfig, ['disclosurePreview'])) process.exit(3)
+  const resolvedSession = SessionController.Config(sessionConfig)
+  if (resolvedSession.disclosurePreview === undefined) process.exit(3)
   process.stdout.write('publication-overlay-schema-compatible\n')
 `
 
@@ -661,25 +758,28 @@ export function assertConnectionOnlyComposition(output) {
     'productionDisclosureHttpsBridge:',
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
+    'productionRegistryDisclosureImport:',
     'registryA2aConsumer:',
     'productionDisclosureAuthority',
     'registryDisclosureKeyPublisher',
     'a2aDisclosureDecryption:',
+    'loopbackDisclosureImport:',
+    'loopbackA2aConsumer:',
+    'loopbackDisclosureRefresh:',
+    'registryUrl:',
+    'sharedSecretEnv:',
   ]) {
     if (output.includes(forbidden)) fail(`connection-only overlay unexpectedly enabled ${forbidden}`)
   }
 }
 
-/** Assert the full production template composes connection, publication, import and question consumers. */
+/** Assert the production template composes connection, publication and import without unsupported consumers. */
 export function assertPublicationComposition(output) {
   const web = compositionSection(output, 'web-runtime')
   const session = compositionSection(output, 'session-controller')
   requireCompositionFields(web, [
     "name: '@deepseek-ai/dsh-web-app'",
     '- credentials',
-    '- productionDisclosureAuthority',
-    '- registryDisclosureKeyPublisher',
-    'a2aDisclosureDecryption:',
     'productionRegistryConnection:',
     'productionDisclosureHttpsBridge:',
     'url: !!js process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL',
@@ -689,6 +789,8 @@ export function assertPublicationComposition(output) {
     'tokenEnv: DSH_REGISTRY_DEVICE_TOKEN',
     'privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY',
     'url: !!js process.env.DSH_REGISTRY_SYNC_URL',
+    'productionRegistryDisclosureImport:',
+    'maxRetainedBytes: 16777216',
   ], 'publication web-runtime')
   const bridge = compositionMapping(web, 'productionDisclosureHttpsBridge')
   requireCompositionMappingFields(bridge, [
@@ -700,30 +802,22 @@ export function assertPublicationComposition(output) {
     'maxAudienceEntries: 10000',
     'maxDisplayNameCharacters: 256',
   ], 'publication disclosure bridge')
+  const disclosureImport = compositionMapping(web, 'productionRegistryDisclosureImport')
+  requireCompositionMappingFields(disclosureImport, [
+    'pollIntervalMs: 1000',
+    'maxRetainedBytes: 16777216',
+  ], 'publication Registry disclosure import')
   requireCompositionFields(session, [
     "name: '@deepseek-ai/dsh-api-session-controller'",
     'disclosurePreview:',
-    'registryDisclosureImport:',
-    'organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID',
-    'targetInstanceId: !!js process.env.DSH_INSTANCE_ID',
-    'maxRetainedBytes: 16777216',
-    'registryA2aConsumer:',
-    'sourceInstanceId: !!js process.env.DSH_INSTANCE_ID',
   ], 'publication session-controller')
-  const question = compositionMapping(session, 'registryA2aConsumer')
-  requireCompositionMappingFields(question, [
-    'handling: automatic',
-    'modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV',
-    'organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID',
-    'sourceInstanceId: !!js process.env.DSH_INSTANCE_ID',
-  ], 'publication question consumer')
-  const localModel = compositionMapping(question, 'localModel', 6)
-  requireCompositionMappingFields(localModel, [
-    'provider: !!js process.env.DSH_A2A_MODEL_PROVIDER',
-    'model: !!js process.env.DSH_A2A_MODEL',
-  ], 'publication local model', 8)
   for (const forbidden of [
     'testOnlyDisclosurePublication:',
+    'a2aDisclosureDecryption:',
+    'registryDisclosureImport:',
+    'registryA2aConsumer:',
+    'productionDisclosureAuthority',
+    'registryDisclosureKeyPublisher',
     'loopbackDisclosureImport:',
     'loopbackA2aConsumer:',
     'loopbackDisclosureRefresh:',
@@ -736,11 +830,12 @@ export function assertPublicationComposition(output) {
   }
 }
 
-function verifyCliComposition(nodePath, harnessRoot, overlayPath, kind) {
+function verifyCliComposition(nodePath, harnessRoot, overlayPath, kind, preload) {
   const sandbox = mkdtempSync(join(tmpdir(), 'dsh-harness-compatibility-'))
   const cliPath = join(harnessRoot, 'apps/cli/lib/bin.js')
   try {
     const output = runTargetNode(nodePath, [
+      ...preload,
       cliPath,
       '--profile', 'web',
       '--patch', overlayPath,
@@ -790,72 +885,78 @@ async function main(args) {
   ]) requireFile(join(harnessRoot, relative), `Harness ${relative}`)
 
   requireTargetNode(nodePath, harnessRoot)
-  const fixtures = JSON.stringify(wireFixtures())
-  const targets = [
-    {
-      label: 'source',
-      codecCwd: harnessRoot,
-      codecSpecifier: './packages/a2a/registry-sync/src/index.ts',
-      webCwd: harnessRoot,
-      webSpecifier: './packages/bundle/web-app/src/index.ts',
-      sessionSpecifier: './packages/api/session-controller/src/index.ts',
-      appBootSpecifier: './packages/boot/app-boot/src/index.ts',
-      preload: ['--import', 'tsx/esm'],
-    },
-    {
-      label: 'built runtime',
-      codecCwd: join(harnessRoot, 'packages/a2a/registry-sync'),
-      codecSpecifier: '@deepseek-ai/dsh-a2a-registry-sync',
-      webCwd: join(harnessRoot, 'packages/bundle/web-app'),
-      webSpecifier: '@deepseek-ai/dsh-web-app',
-      sessionSpecifier: '@deepseek-ai/dsh-api-session-controller',
-      appBootSpecifier: '@deepseek-ai/dsh-app-boot',
-      preload: [],
-    },
-  ]
-  for (const target of targets) {
-    const encoded = runTargetNode(nodePath,
-      [...target.preload, '--input-type=module', '--eval', codecProbe(target.codecSpecifier)], {
-        cwd: target.codecCwd,
-        env: systemEnvironment(),
-        input: fixtures,
-      }, `Harness ${target.label} bidirectional Registry codec`)
-    assertClientFrames(encoded)
+  const workspaceFallback = prepareBuiltWorkspaceFallback(harnessRoot)
+  try {
+    const fixtures = JSON.stringify(wireFixtures())
+    const targets = [
+      {
+        label: 'source',
+        codecCwd: harnessRoot,
+        codecSpecifier: './packages/a2a/registry-sync/src/index.ts',
+        webCwd: harnessRoot,
+        webSpecifier: './packages/bundle/web-app/src/index.ts',
+        sessionSpecifier: './packages/api/session-controller/src/index.ts',
+        appBootSpecifier: './packages/boot/app-boot/src/index.ts',
+        preload: ['--import', 'tsx/esm'],
+      },
+      {
+        label: 'built runtime',
+        codecCwd: join(harnessRoot, 'packages/a2a/registry-sync'),
+        codecSpecifier: '@deepseek-ai/dsh-a2a-registry-sync',
+        webCwd: join(harnessRoot, 'packages/bundle/web-app'),
+        webSpecifier: '@deepseek-ai/dsh-web-app',
+        sessionSpecifier: '@deepseek-ai/dsh-api-session-controller',
+        appBootSpecifier: '@deepseek-ai/dsh-app-boot',
+        preload: workspaceFallback.preload,
+      },
+    ]
+    for (const target of targets) {
+      const encoded = runTargetNode(nodePath,
+        [...target.preload, '--input-type=module', '--eval', codecProbe(target.codecSpecifier)], {
+          cwd: target.codecCwd,
+          env: systemEnvironment(),
+          input: fixtures,
+        }, `Harness ${target.label} bidirectional Registry codec`)
+      assertClientFrames(encoded)
 
-    const schema = runTargetNode(nodePath,
-      [...target.preload, '--input-type=module', '--eval',
-        connectionOverlaySchemaProbe(target.webSpecifier, target.appBootSpecifier), overlayPath], {
-        cwd: target.webCwd,
-        env: systemEnvironment(),
-      }, `Harness ${target.label} connection-only overlay schema`)
-    if (schema.trim() !== 'overlay-schema-compatible') {
-      fail(`Harness ${target.label} returned an invalid overlay schema result`)
-    }
+      const schema = runTargetNode(nodePath,
+        [...target.preload, '--input-type=module', '--eval',
+          connectionOverlaySchemaProbe(target.webSpecifier, target.appBootSpecifier), overlayPath], {
+          cwd: target.webCwd,
+          env: systemEnvironment(),
+        }, `Harness ${target.label} connection-only overlay schema`)
+      if (schema.trim() !== 'overlay-schema-compatible') {
+        fail(`Harness ${target.label} returned an invalid overlay schema result`)
+      }
 
-    const publicationSchema = runTargetNode(nodePath,
-      [...target.preload, '--input-type=module', '--eval',
-        publicationOverlaySchemaProbe(target.webSpecifier, target.sessionSpecifier,
-          target.appBootSpecifier), publicationOverlayPath], {
-        cwd: target.webCwd,
-        env: systemEnvironment(),
-      }, `Harness ${target.label} publication overlay schema`)
-    if (publicationSchema.trim() !== 'publication-overlay-schema-compatible') {
-      fail(`Harness ${target.label} returned an invalid publication overlay schema result`)
+      const publicationSchema = runTargetNode(nodePath,
+        [...target.preload, '--input-type=module', '--eval',
+          publicationOverlaySchemaProbe(target.webSpecifier, target.sessionSpecifier,
+            target.appBootSpecifier), publicationOverlayPath], {
+          cwd: target.webCwd,
+          env: systemEnvironment(),
+        }, `Harness ${target.label} publication overlay schema`)
+      if (publicationSchema.trim() !== 'publication-overlay-schema-compatible') {
+        fail(`Harness ${target.label} returned an invalid publication overlay schema result`)
+      }
     }
+    verifyCliComposition(nodePath, harnessRoot, overlayPath, 'connection-only', workspaceFallback.preload)
+    verifyCliComposition(nodePath, harnessRoot, publicationOverlayPath, 'publication', workspaceFallback.preload)
+
+    process.stdout.write([
+      'registry-harness-compatibility: passed',
+      '- the explicit target Node.js runtime is version 24 or newer',
+      '- Harness source and built codecs accept Registry connection, publication, import, refresh and question lifecycle frames',
+      '- Registry accepts Harness source and built connection, publication, import, refresh and question lifecycle frames',
+      '- Harness source and built web/session schemas accept the actual connection-only and publication/import overlays',
+      '- the built Harness CLI composes both overlays inside separate isolated temporary DSH_HOME directories',
+      '- declared publication workspace dependencies are resolved from their checked built entries when local pnpm links are stale',
+      '- this static gate does not prove a packed install, real device authentication, KMS delivery or model execution',
+      '',
+    ].join('\n'))
+  } finally {
+    rmSync(workspaceFallback.directory, { recursive: true, force: true, maxRetries: 3 })
   }
-  verifyCliComposition(nodePath, harnessRoot, overlayPath, 'connection-only')
-  verifyCliComposition(nodePath, harnessRoot, publicationOverlayPath, 'publication')
-
-  process.stdout.write([
-    'registry-harness-compatibility: passed',
-    '- the explicit target Node.js runtime is version 24 or newer',
-    '- Harness source and built codecs accept Registry connection, publication, import, refresh and question lifecycle frames',
-    '- Registry accepts Harness source and built connection, publication, import, refresh and question lifecycle frames',
-    '- Harness source and built web/session schemas accept the actual connection-only and publication overlays',
-    '- the built Harness CLI composes both overlays inside separate isolated temporary DSH_HOME directories',
-    '- this static gate does not prove real device authentication, KMS delivery or model execution',
-    '',
-  ].join('\n'))
 }
 
 const invoked = process.argv[1]

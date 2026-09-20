@@ -81,10 +81,6 @@ function harnessEnvironment() {
     DSH_REGISTRY_SYNC_URL: 'wss://registry.acme.dev/a2a/v1/sync',
     DSH_REGISTRY_DISCLOSURE_BRIDGE_URL: 'https://registry.acme.dev/a2a/v1/disclosure-publication',
     DSH_DISCLOSURE_STATE_PATH: join(root, 'disclosures'),
-    DSH_A2A_MODEL_PROVIDER: 'deepseek-official',
-    DSH_A2A_MODEL: 'deepseek-v4-flash',
-    DSH_A2A_MODEL_CREDENTIAL_ENV: 'DEEPSEEK_API_KEY',
-    DEEPSEEK_API_KEY: 'synthetic-model-key',
     DSH_REGISTRY_DEVICE_TOKEN:
       `dsh1.${encodedOrganization}.${bindingId}.${Buffer.alloc(32, 9).toString('base64url')}`,
     DSH_REGISTRY_DISCLOSURE_TOKEN:
@@ -206,41 +202,6 @@ test('production Harness preflight pins the disclosure bridge to the exact publi
       /DSH_REGISTRY_DISCLOSURE_BRIDGE_URL must be the exact public HTTPS disclosure bridge URL/u)
   }
 
-  const missingModel = { ...valid }
-  delete missingModel.DSH_A2A_MODEL
-  const rejectedMissingModel = preflight(missingModel, 'harness')
-  assert.equal(rejectedMissingModel.status, 1)
-  assert.match(rejectedMissingModel.stderr, /DSH_A2A_MODEL is required/u)
-
-  const missingReferencedCredential = { ...valid }
-  delete missingReferencedCredential.DEEPSEEK_API_KEY
-  const rejectedMissingCredential = preflight(missingReferencedCredential, 'harness')
-  assert.equal(rejectedMissingCredential.status, 1)
-  assert.match(rejectedMissingCredential.stderr, /DEEPSEEK_API_KEY is required/u)
-
-  const reusedDeviceCredential = {
-    ...valid,
-    DSH_A2A_MODEL_CREDENTIAL_ENV: 'DSH_REGISTRY_DEVICE_TOKEN',
-  }
-  const rejectedReusedCredential = preflight(reusedDeviceCredential, 'harness')
-  assert.equal(rejectedReusedCredential.status, 1)
-  assert.match(rejectedReusedCredential.stderr, /does not match the selected provider credential mapping/u)
-
-  const invalidCredentialReference = {
-    ...valid,
-    DSH_A2A_MODEL_CREDENTIAL_ENV: 'bad-name',
-  }
-  const rejectedInvalidReference = preflight(invalidCredentialReference, 'harness')
-  assert.equal(rejectedInvalidReference.status, 1)
-  assert.match(rejectedInvalidReference.stderr, /must name one inherited environment variable/u)
-
-  const unsupportedProvider = {
-    ...valid,
-    DSH_A2A_MODEL_PROVIDER: 'unreviewed-provider',
-  }
-  const rejectedProvider = preflight(unsupportedProvider, 'harness')
-  assert.equal(rejectedProvider.status, 1)
-  assert.match(rejectedProvider.stderr, /is not supported by the production credential gate/u)
 })
 
 test('public production status requires the live SaaS tenant-router marker', () => {
@@ -332,6 +293,24 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
   assert.match(preparer, /未由输入 tarball 提供的 DeepSeek 包/u)
   assert.match(preparer, /\[IO\.Directory\]::Move\(\$stagingRoot, \$DestinationRoot\)/u)
   assert.match(preparer, /productionRegistryConnection:/u)
+  for (const forbidden of [
+    'testOnlyDisclosurePublication:',
+    'productionDisclosureHttpsBridge:',
+    'productionDisclosurePublication:',
+    'registryDisclosureImport:',
+    'productionRegistryDisclosureImport:',
+    'registryA2aConsumer:',
+    'productionDisclosureAuthority',
+    'registryDisclosureKeyPublisher',
+    'a2aDisclosureDecryption:',
+    'loopbackDisclosureImport:',
+    'loopbackA2aConsumer:',
+    'loopbackDisclosureRefresh:',
+    'registryUrl:',
+    'sharedSecretEnv:',
+  ]) {
+    assert.ok(preparer.includes(`'${forbidden}'`), `preparer must reject ${forbidden}`)
+  }
   assert.match(preparer, /Remove-StagingDirectory \$stagingRoot \$destinationParent \$stagingName/u)
 
   const launcher = readFileSync(new URL(

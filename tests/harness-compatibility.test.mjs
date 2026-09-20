@@ -1,10 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { decodeRegistryClientFrame, decodeRegistryServerFrame } from '@deepseek-ai/dsh-a2a-registry-sync'
 import {
   assertConnectionOnlyComposition,
+  assertPublicationCompositionValidator,
   assertPublicationComposition,
   parseCompatibilityArguments,
+  prepareBuiltWorkspaceFallback,
+  publicationOverlaySchemaProbe,
   wireFixtures,
 } from '../deploy/registry/verify-harness-compatibility.mjs'
 
@@ -26,6 +33,51 @@ test('Harness compatibility checker requires explicit runtime, checkout and over
     '--harness-root', 'harness', '--node-path', 'node', '--overlay', 'one',
     '--publication-overlay', 'publication', '--overlay', 'two',
   ]), /usage:/u)
+})
+
+test('built Harness fallback resolves only declared workspace package build entries', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-harness-fallback-test-'))
+  const consumerRoot = join(root, 'packages/bundle/web-app')
+  const packages = [
+    ['@deepseek-ai/dsh-a2a-disclosure-outbox', 'packages/a2a/disclosure-outbox'],
+    ['@deepseek-ai/dsh-a2a-disclosure-policy', 'packages/a2a/disclosure-policy'],
+    ['@deepseek-ai/dsh-a2a-disclosure-producer', 'packages/a2a/disclosure-producer'],
+    ['@deepseek-ai/dsh-storage-json', 'packages/storage/storage-json'],
+  ]
+  const dependencies = Object.fromEntries(packages.map(([name]) => [name, 'workspace:^']))
+  let fallback
+  try {
+    mkdirSync(consumerRoot, { recursive: true })
+    writeFileSync(join(consumerRoot, 'package.json'), JSON.stringify({ dependencies }))
+    for (const [name, relativeRoot] of packages) {
+      const packageRoot = join(root, relativeRoot)
+      mkdirSync(join(packageRoot, 'lib'), { recursive: true })
+      writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({
+        name,
+        type: 'module',
+        main: 'lib/index.js',
+        exports: { '.': { default: './lib/index.js' } },
+      }))
+      writeFileSync(join(packageRoot, 'lib/index.js'), `export const marker = ${JSON.stringify(name)}\n`)
+    }
+
+    fallback = prepareBuiltWorkspaceFallback(root)
+    const result = spawnSync(process.execPath, [
+      ...fallback.preload,
+      '--input-type=module',
+      '--eval',
+      "const value = await import('@deepseek-ai/dsh-a2a-disclosure-policy'); process.stdout.write(value.marker)",
+    ], { cwd: consumerRoot, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, '@deepseek-ai/dsh-a2a-disclosure-policy')
+
+    delete dependencies['@deepseek-ai/dsh-a2a-disclosure-policy']
+    writeFileSync(join(consumerRoot, 'package.json'), JSON.stringify({ dependencies }))
+    assert.throws(() => prepareBuiltWorkspaceFallback(root), /does not declare required workspace dependency/u)
+  } finally {
+    if (fallback !== undefined) rmSync(fallback.directory, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('Harness compatibility fixtures cover publication, import release and question terminal alternatives', () => {
@@ -157,12 +209,60 @@ test('Harness compatibility checker accepts only the connection-only composed We
     'tokenEnv: DSH_REGISTRY_DEVICE_TOKEN',
     'tokenEnv: WRONG_TOKEN',
   )), /omitted connection-only field tokenEnv/u)
-  assert.throws(() => assertConnectionOnlyComposition(`${connectionOnly}
-- id: session-controller
-  config:
-    registryDisclosureImport: {}
-    registryA2aConsumer: {}
-`), /unexpectedly enabled registryDisclosureImport/u)
+  for (const forbidden of [
+    'testOnlyDisclosurePublication:',
+    'productionDisclosureHttpsBridge:',
+    'productionDisclosurePublication:',
+    'registryDisclosureImport:',
+    'productionRegistryDisclosureImport:',
+    'registryA2aConsumer:',
+    'productionDisclosureAuthority',
+    'registryDisclosureKeyPublisher',
+    'a2aDisclosureDecryption:',
+    'loopbackDisclosureImport:',
+    'loopbackA2aConsumer:',
+    'loopbackDisclosureRefresh:',
+    'registryUrl:',
+    'sharedSecretEnv:',
+  ]) {
+    assert.throws(() => assertConnectionOnlyComposition(`${connectionOnly}\n${forbidden}`),
+      /connection-only overlay unexpectedly enabled/u)
+  }
+})
+
+test('publication schema probe enforces the target Harness cross-field composition contract', () => {
+  const resolvedWeb = {
+    productionRegistryConnection: {
+      transport: { url: 'wss://registry.invalid/a2a/v1/sync', maxConnections: 110 },
+    },
+    productionDisclosureHttpsBridge: {
+      url: 'https://registry.invalid/a2a/v1/disclosure-publication',
+    },
+    productionDisclosurePublication: { producer: { maxPublications: 100 } },
+    productionRegistryDisclosureImport: {},
+  }
+  const capacityOnly = (connection, _bridge, publication, disclosureImport) => {
+    const reserved = disclosureImport === undefined ? 2 : 3
+    if (connection.transport.maxConnections - publication.producer.maxPublications < reserved) {
+      throw new Error('insufficient capacity')
+    }
+  }
+  const strict = (connection, bridge, publication, disclosureImport) => {
+    capacityOnly(connection, bridge, publication, disclosureImport)
+    const registry = new URL(connection.transport.url)
+    registry.protocol = 'https:'
+    if (new URL(bridge.url).origin !== registry.origin) throw new Error('foreign authority')
+  }
+  assert.doesNotThrow(() => { assertPublicationCompositionValidator(strict, resolvedWeb) })
+  assert.throws(() => assertPublicationCompositionValidator(() => {}, resolvedWeb),
+    /accepted insufficient transport capacity/u)
+  assert.throws(() => assertPublicationCompositionValidator(capacityOnly, resolvedWeb),
+    /accepted a foreign bridge authority/u)
+
+  const probe = publicationOverlaySchemaProbe('web-app', 'session-controller', 'app-boot')
+  assert.match(probe, /validateProductionRegistryComposition/u)
+  assert.match(probe,
+    /assertPublicationCompositionValidator\(validateProductionRegistryComposition, resolvedWeb\)/u)
 })
 
 test('Harness compatibility checker requires the full production publication composition', () => {
@@ -171,27 +271,12 @@ test('Harness compatibility checker requires the full production publication com
   name: '@deepseek-ai/dsh-api-session-controller'
   config:
     disclosurePreview: {}
-    registryDisclosureImport:
-      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
-      targetInstanceId: !!js process.env.DSH_INSTANCE_ID
-      maxRetainedBytes: 16777216
-    registryA2aConsumer:
-      handling: automatic
-      localModel:
-        provider: !!js process.env.DSH_A2A_MODEL_PROVIDER
-        model: !!js process.env.DSH_A2A_MODEL
-      modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV
-      organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
-      sourceInstanceId: !!js process.env.DSH_INSTANCE_ID
 - id: web-runtime
   name: '@deepseek-ai/dsh-web-app'
   inject:
     - webStartup
     - credentials
-    - productionDisclosureAuthority
-    - registryDisclosureKeyPublisher
   config:
-    a2aDisclosureDecryption: {}
     productionRegistryConnection:
       tokenEnv: DSH_REGISTRY_DEVICE_TOKEN
       privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY
@@ -207,22 +292,31 @@ test('Harness compatibility checker requires the full production publication com
       maxDisplayNameCharacters: 256
     productionDisclosurePublication:
       storageRoot: !!js process.env.DSH_DISCLOSURE_STATE_PATH
+    productionRegistryDisclosureImport:
+      pollIntervalMs: 1000
+      limits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+      cryptoLimits:
+        maxPlaintextBytes: 65536
+        maxCiphertextBytes: 262144
+        maxTrustedKeys: 4
+      maxRetainedBytes: 16777216
 `
   assert.doesNotThrow(() => { assertPublicationComposition(publication) })
   assert.throws(() => assertPublicationComposition(publication.replace(
-    'registryA2aConsumer:', 'loopbackA2aConsumer:',
-  )), /omitted publication session-controller field registryA2aConsumer/u)
+    'productionRegistryDisclosureImport:', 'registryDisclosureImport:',
+  )), /omitted publication web-runtime field productionRegistryDisclosureImport/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
-    'handling: automatic', 'handling: manual',
-  )), /omitted publication question consumer field handling: automatic/u)
+    '    productionRegistryConnection:',
+    '    a2aDisclosureDecryption: {}\n    productionRegistryConnection:',
+  )), /unexpectedly enabled a2aDisclosureDecryption/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
-    'provider: !!js process.env.DSH_A2A_MODEL_PROVIDER',
-    'provider: deepseek-official',
-  )), /omitted publication local model field provider/u)
-  assert.throws(() => assertPublicationComposition(publication.replace(
-    'modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV',
-    'modelCredentialEnv: DSH_REGISTRY_DEVICE_TOKEN',
-  )), /omitted publication question consumer field modelCredentialEnv/u)
+    '    - credentials',
+    '    - credentials\n    - productionDisclosureAuthority',
+  )), /unexpectedly enabled productionDisclosureAuthority/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
     'productionDisclosureHttpsBridge:', 'missingDisclosureHttpsBridge:',
   )), /omitted publication web-runtime field productionDisclosureHttpsBridge/u)
