@@ -562,7 +562,12 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
     || !expression(selectedImport?.targetInstanceId, 'process.env.DSH_INSTANCE_ID')
     || !expression(selectedQuestion?.organizationId, 'process.env.DSH_REGISTRY_ORGANIZATION_ID')
     || !expression(selectedQuestion?.sourceInstanceId, 'process.env.DSH_INSTANCE_ID')
-    || selectedQuestion?.handling !== 'manual') process.exit(3)
+    || selectedQuestion?.handling !== 'automatic'
+    || !exactKeys(selectedQuestion.localModel, ['provider', 'model'])
+    || !expression(selectedQuestion.localModel.provider, 'process.env.DSH_A2A_MODEL_PROVIDER')
+    || !expression(selectedQuestion.localModel.model, 'process.env.DSH_A2A_MODEL')
+    || !expression(selectedQuestion.modelCredentialEnv,
+      'process.env.DSH_A2A_MODEL_CREDENTIAL_ENV')) process.exit(3)
   const resolvedSession = SessionController.Config({
     ...sessionConfig,
     registryDisclosureImport: {
@@ -574,13 +579,18 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
       ...selectedQuestion,
       organizationId: 'compatibility-organization',
       sourceInstanceId: 'compatibility-target',
+      localModel: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+      modelCredentialEnv: 'DEEPSEEK_API_KEY',
     },
   })
   if (resolvedSession.registryDisclosureImport?.organizationId !== 'compatibility-organization'
     || resolvedSession.registryDisclosureImport?.targetInstanceId !== 'compatibility-target'
     || resolvedSession.registryA2aConsumer?.organizationId !== 'compatibility-organization'
     || resolvedSession.registryA2aConsumer?.sourceInstanceId !== 'compatibility-target'
-    || resolvedSession.registryA2aConsumer?.handling !== 'manual') process.exit(3)
+    || resolvedSession.registryA2aConsumer?.handling !== 'automatic'
+    || resolvedSession.registryA2aConsumer.localModel.provider !== 'deepseek-official'
+    || resolvedSession.registryA2aConsumer.localModel.model !== 'deepseek-v4-flash'
+    || resolvedSession.registryA2aConsumer.modelCredentialEnv !== 'DEEPSEEK_API_KEY') process.exit(3)
   process.stdout.write('publication-overlay-schema-compatible\n')
 `
 
@@ -698,9 +708,20 @@ export function assertPublicationComposition(output) {
     'targetInstanceId: !!js process.env.DSH_INSTANCE_ID',
     'maxRetainedBytes: 16777216',
     'registryA2aConsumer:',
-    'handling: manual',
     'sourceInstanceId: !!js process.env.DSH_INSTANCE_ID',
   ], 'publication session-controller')
+  const question = compositionMapping(session, 'registryA2aConsumer')
+  requireCompositionMappingFields(question, [
+    'handling: automatic',
+    'modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV',
+    'organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID',
+    'sourceInstanceId: !!js process.env.DSH_INSTANCE_ID',
+  ], 'publication question consumer')
+  const localModel = compositionMapping(question, 'localModel', 6)
+  requireCompositionMappingFields(localModel, [
+    'provider: !!js process.env.DSH_A2A_MODEL_PROVIDER',
+    'model: !!js process.env.DSH_A2A_MODEL',
+  ], 'publication local model', 8)
   for (const forbidden of [
     'testOnlyDisclosurePublication:',
     'loopbackDisclosureImport:',

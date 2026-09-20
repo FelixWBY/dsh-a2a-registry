@@ -60,9 +60,11 @@
         maxCiphertextBytes: 262144
         maxTrustedKeys: 4
 
-# The same pre-enrolled device consumes Registry-authorized imports and manual
-# questions. This also supplies the one real receiver report source carried by
-# the independent Presence connection above. No loopback transport is enabled.
+# The same pre-enrolled device consumes Registry-authorized imports and answers
+# questions with one explicitly configured local model. The imported A2A turn
+# uses the Harness no-tool execution policy; no remote tool execution is enabled.
+# This also supplies the one real receiver report source carried by the
+# independent Presence connection above. No loopback transport is enabled.
 - id: session-controller
   config:
     disclosurePreview:
@@ -86,7 +88,11 @@
         maxTextBytes: 1048576
         maxDisplayCharacters: 2000
     registryA2aConsumer:
-      handling: manual
+      handling: automatic
+      localModel:
+        provider: !!js process.env.DSH_A2A_MODEL_PROVIDER
+        model: !!js process.env.DSH_A2A_MODEL
+      modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
       sourceInstanceId: !!js process.env.DSH_INSTANCE_ID
       pollIntervalMs: 1000

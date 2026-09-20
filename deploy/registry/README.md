@@ -54,9 +54,9 @@ node deploy/registry/enroll-registry-device.mjs export-env `
   --output C:\dsh-private\harness-registry.env
 ```
 
-确认成功会在再次复核路径和 ACL 后原子替换状态文件，删除配对码和两个独立 raw secret 字段；WSS 设备 secret 与 disclosure bridge secret 分别封装进 `dsh1`、`dshb1` token。导出的六个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供 `harness-production-publication.example.patch.yml` 调用内建 HTTPS bridge 完成权限、容量和数据密钥提供。Registry PostgreSQL 层已经装配正文投影 provider；自动刷新既有 Session 仍需 Harness 的生产 provider。两个文件都含长期敏感凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
+确认成功会在再次复核路径和 ACL 后原子替换状态文件，删除配对码和两个独立 raw secret 字段；WSS 设备 secret 与 disclosure bridge secret 分别封装进 `dsh1`、`dshb1` token。导出的六个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供 `harness-production-publication.example.patch.yml` 调用内建 HTTPS bridge 完成权限、容量和数据密钥提供。Registry PostgreSQL 层已经装配正文投影 provider，完整模板也已接入 WSS Session 刷新和自动无工具问题消费；模型 provider、model、凭据引用和实际凭据仍须由 Harness 服务端环境单独提供。两个文件都含长期敏感凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
 
-升级前遗留的 V1 待确认状态仍可完成 `confirm`，V1 已确认状态仍可 `export-env`；两者都只保留原有 `dsh1`，导出严格五项变量，仅支持 connection-only WSS。工具不会把旧 secret 复用为 `dshb1`，也不会把 V1 状态静默升级为可发布状态。要启用 HTTPS disclosure publication，必须撤销旧设备并重新绑定。`check-production-environment.mjs harness`／`all` 对应公网完整 publication，仍固定要求新六项凭据，并要求 `DSH_REGISTRY_DISCLOSURE_BRIDGE_URL` 精确指向同一 `REGISTRY_DOMAIN` 的 `/a2a/v1/disclosure-publication` HTTPS 地址，不接受显式端口、凭据、查询或片段。
+升级前遗留的 V1 待确认状态仍可完成 `confirm`，V1 已确认状态仍可 `export-env`；两者都只保留原有 `dsh1`，导出严格五项变量，仅支持 connection-only WSS。工具不会把旧 secret 复用为 `dshb1`，也不会把 V1 状态静默升级为可发布状态。要启用 HTTPS disclosure publication，必须撤销旧设备并重新绑定。`check-production-environment.mjs harness`／`all` 对应公网完整 publication，固定要求新六项设备配置、三项模型路由／凭据引用配置和被引用的实际模型凭据；当前只接受 `deepseek-official -> DEEPSEEK_API_KEY`，因此无关环境变量不能冒充模型凭据。它还要求 `DSH_REGISTRY_DISCLOSURE_BRIDGE_URL` 精确指向同一 `REGISTRY_DOMAIN` 的 `/a2a/v1/disclosure-publication` HTTPS 地址，不接受显式端口、凭据、查询或片段。
 
 在连接某个 Harness 源码版本前，先运行无秘密的线协议兼容检查：
 
@@ -70,7 +70,7 @@ npm run verify:harness-compatibility -- `
 
 检查使用显式指定的目标 Node.js 24 或更高版本。Registry 会生成内部一致且真实签名的披露事件与检查点，再把连接、披露注册回执、事件／检查点回执、导入派发／释放和纯文本问题派发、运行、完成、失败及授权释放的代表性 v1 服务端帧交给目标 Harness 的源码与已构建 codec 解码；目标 codec 会反向编码连接、披露注册／事件／检查点、导入完成／重试释放和问题运行／完成／失败等客户端帧，由 Registry 解码。
 
-目标源码和已构建 web-app／session-controller 还会用各自的 app-boot 与 schema 分别解析实际 connection-only overlay 和完整 publication overlay。最后已构建 CLI 会为两层 overlay 分别创建临时工作目录与临时 `DSH_HOME` 执行 `--dump-config`：前者必须只合成生产连接，后者必须同时合成生产连接、披露发布、确定会话导入和手动纯文本问题消费，且不得混入测试或 loopback provider；完成后删除临时目录，不写目标 Harness 的真实 profile。
+目标源码和已构建 web-app／session-controller 还会用各自的 app-boot 与 schema 分别解析实际 connection-only overlay 和完整 publication overlay。最后已构建 CLI 会为两层 overlay 分别创建临时工作目录与临时 `DSH_HOME` 执行 `--dump-config`：前者必须只合成生产连接，后者必须同时合成生产连接、披露发布、确定会话导入，以及由显式 provider、model 和凭据引用驱动的自动无工具纯文本问题消费，且不得混入测试或 loopback provider；完成后删除临时目录，不写目标 Harness 的真实 profile。
 
 检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名和静态状态分支只验证 v1 codec 与配置兼容，不证明 WSS 挑战已由真实设备私钥签署，也不把完成与失败样本解释成同一次真实请求的状态轨迹；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
 

@@ -176,7 +176,11 @@ test('Harness compatibility checker requires the full production publication com
       targetInstanceId: !!js process.env.DSH_INSTANCE_ID
       maxRetainedBytes: 16777216
     registryA2aConsumer:
-      handling: manual
+      handling: automatic
+      localModel:
+        provider: !!js process.env.DSH_A2A_MODEL_PROVIDER
+        model: !!js process.env.DSH_A2A_MODEL
+      modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
       sourceInstanceId: !!js process.env.DSH_INSTANCE_ID
 - id: web-runtime
@@ -209,8 +213,16 @@ test('Harness compatibility checker requires the full production publication com
     'registryA2aConsumer:', 'loopbackA2aConsumer:',
   )), /omitted publication session-controller field registryA2aConsumer/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
-    'handling: manual', 'handling: automatic\n      sharedSecretEnv: forbidden',
-  )), /omitted publication session-controller field handling: manual/u)
+    'handling: automatic', 'handling: manual',
+  )), /omitted publication question consumer field handling: automatic/u)
+  assert.throws(() => assertPublicationComposition(publication.replace(
+    'provider: !!js process.env.DSH_A2A_MODEL_PROVIDER',
+    'provider: deepseek-official',
+  )), /omitted publication local model field provider/u)
+  assert.throws(() => assertPublicationComposition(publication.replace(
+    'modelCredentialEnv: !!js process.env.DSH_A2A_MODEL_CREDENTIAL_ENV',
+    'modelCredentialEnv: DSH_REGISTRY_DEVICE_TOKEN',
+  )), /omitted publication question consumer field modelCredentialEnv/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
     'productionDisclosureHttpsBridge:', 'missingDisclosureHttpsBridge:',
   )), /omitted publication web-runtime field productionDisclosureHttpsBridge/u)
