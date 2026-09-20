@@ -449,7 +449,8 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
     || !exactKeys(session, ['id', 'config'])) process.exit(3)
   const webConfig = web.config
   if (!exactKeys(webConfig, ['openBrowser', 'printUrl', 'surfaceContext', 'trustedHosts',
-    'a2aDisclosureDecryption', 'productionRegistryConnection', 'productionDisclosurePublication'])
+    'a2aDisclosureDecryption', 'productionRegistryConnection', 'productionDisclosureHttpsBridge',
+    'productionDisclosurePublication'])
     || !expression(webConfig.openBrowser, 'ctx.webStartup.openBrowser')
     || webConfig.printUrl !== true || webConfig.surfaceContext !== true
     || !expression(webConfig.trustedHosts, 'ctx.webStartup.trustedHosts')) process.exit(3)
@@ -461,6 +462,16 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
     || connection.tokenEnv !== 'DSH_REGISTRY_DEVICE_TOKEN'
     || connection.privateKeyEnv !== 'DSH_REGISTRY_DEVICE_PRIVATE_KEY'
     || !expression(connection.transport?.url, 'process.env.DSH_REGISTRY_SYNC_URL')) process.exit(3)
+  const bridge = webConfig.productionDisclosureHttpsBridge
+  if (!exactKeys(bridge, ['mode', 'url', 'tokenEnv', 'requestTimeoutMs', 'maxResponseBytes',
+    'maxAudienceEntries', 'maxDisplayNameCharacters'])
+    || bridge.mode !== 'https-bridge'
+    || !expression(bridge.url, 'process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL')
+    || bridge.tokenEnv !== 'DSH_REGISTRY_DISCLOSURE_TOKEN'
+    || bridge.requestTimeoutMs !== 10000
+    || bridge.maxResponseBytes !== 1048576
+    || bridge.maxAudienceEntries !== 10000
+    || bridge.maxDisplayNameCharacters !== 256) process.exit(3)
   const publication = webConfig.productionDisclosurePublication
   if (!exactKeys(publication, ['mode', 'storageRoot', 'producer', 'crypto'])
     || publication.mode !== 'production'
@@ -475,12 +486,20 @@ const publicationOverlaySchemaProbe = (webAppSpecifier, sessionControllerSpecifi
       instanceId: 'compatibility-target',
       transport: { ...connection.transport, url: 'wss://registry.invalid/a2a/v1/sync' },
     },
+    productionDisclosureHttpsBridge: {
+      ...bridge,
+      url: 'https://registry.invalid/a2a/v1/disclosure-publication',
+    },
     productionDisclosurePublication: {
       ...publication,
       storageRoot: resolve('compatibility-disclosure-state'),
     },
   })
   if (resolvedWeb.productionRegistryConnection?.mode !== 'production'
+    || resolvedWeb.productionDisclosureHttpsBridge?.mode !== 'https-bridge'
+    || resolvedWeb.productionDisclosureHttpsBridge.url
+      !== 'https://registry.invalid/a2a/v1/disclosure-publication'
+    || resolvedWeb.productionDisclosureHttpsBridge.tokenEnv !== 'DSH_REGISTRY_DISCLOSURE_TOKEN'
     || resolvedWeb.productionDisclosurePublication?.mode !== 'production'
     || resolvedWeb.productionDisclosurePublication.storageRoot !== resolve('compatibility-disclosure-state')) {
     process.exit(3)
@@ -537,6 +556,34 @@ function requireCompositionFields(section, fields, label) {
   }
 }
 
+/** Extract one direct nested mapping from a composed top-level row. */
+function compositionMapping(section, name, indentation = 4) {
+  const lines = section.split(/\r?\n/u)
+  const prefix = `${' '.repeat(indentation)}${name}:`
+  const starts = lines.flatMap((line, index) => line === prefix ? [index] : [])
+  if (starts.length !== 1) fail(`built Harness CLI did not compose exactly one ${name} mapping`)
+  const start = starts[0]
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() !== '' && line.length - line.trimStart().length <= indentation) {
+      end = index
+      break
+    }
+  }
+  return lines.slice(start, end).join('\n')
+}
+
+/** Require exact direct scalar rows inside an extracted mapping. */
+function requireCompositionMappingFields(mapping, fields, label, indentation = 6) {
+  const lines = new Set(mapping.split(/\r?\n/u))
+  for (const field of fields) {
+    if (!lines.has(`${' '.repeat(indentation)}${field}`)) {
+      fail(`built Harness CLI omitted ${label} field ${field}`)
+    }
+  }
+}
+
 /** Assert the built CLI composed one enabled Web runtime carrying only the connection bridge. */
 export function assertConnectionOnlyComposition(output) {
   const section = compositionSection(output, 'web-runtime')
@@ -553,6 +600,7 @@ export function assertConnectionOnlyComposition(output) {
   ], 'connection-only')
   for (const forbidden of [
     'testOnlyDisclosurePublication:',
+    'productionDisclosureHttpsBridge:',
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
     'registryA2aConsumer:',
@@ -575,12 +623,25 @@ export function assertPublicationComposition(output) {
     '- registryDisclosureKeyPublisher',
     'a2aDisclosureDecryption:',
     'productionRegistryConnection:',
+    'productionDisclosureHttpsBridge:',
+    'url: !!js process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL',
+    'tokenEnv: DSH_REGISTRY_DISCLOSURE_TOKEN',
     'productionDisclosurePublication:',
     'storageRoot: !!js process.env.DSH_DISCLOSURE_STATE_PATH',
     'tokenEnv: DSH_REGISTRY_DEVICE_TOKEN',
     'privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY',
     'url: !!js process.env.DSH_REGISTRY_SYNC_URL',
   ], 'publication web-runtime')
+  const bridge = compositionMapping(web, 'productionDisclosureHttpsBridge')
+  requireCompositionMappingFields(bridge, [
+    'mode: https-bridge',
+    'url: !!js process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL',
+    'tokenEnv: DSH_REGISTRY_DISCLOSURE_TOKEN',
+    'requestTimeoutMs: 10000',
+    'maxResponseBytes: 1048576',
+    'maxAudienceEntries: 10000',
+    'maxDisplayNameCharacters: 256',
+  ], 'publication disclosure bridge')
   requireCompositionFields(session, [
     "name: '@deepseek-ai/dsh-api-session-controller'",
     'disclosurePreview:',
