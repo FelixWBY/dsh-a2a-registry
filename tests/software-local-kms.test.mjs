@@ -166,6 +166,116 @@ test('dual-slot roots read retained owners by durable id while new organizations
   }
 })
 
+test('owner root rewrap authenticates all DEKs, changes one owner record, and exact retries are idempotent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-rewrap-'))
+  const organizationId = 'organization-rewrap'
+  const firstScope = scope(organizationId, '-first')
+  const secondScope = scope(organizationId, '-second')
+  const previous = rootKey(0x1a, 'root-key:previous')
+  const active = rootKey(0x1b, 'root-key:active')
+  let ctx
+  try {
+    ctx = await runtime(home)
+    const original = await openStore(ctx, organizationId, previous, new AbortController())
+    await original.publishDataKey(firstScope, dataKey(firstScope, 'data-key:first', 0x1c), operationSignal())
+    await original.publishDataKey(secondScope, dataKey(secondScope, 'data-key:second', 0x1d), operationSignal())
+    await original.close()
+    const beforeDocument = JSON.parse(await readFile(
+      domainPath(home, 'software_local_kms', organizationId), 'utf8'))
+
+    const rotating = await openStore(ctx, organizationId, active, new AbortController(),
+      'software_local_kms', previous)
+    const rotated = await rotating.rewrapOwnerRootKey(operationSignal())
+    assert.equal(rotated.outcome, 'rewrapped')
+    assert.equal(rotated.before.rootKeyId, previous.keyId)
+    assert.equal(rotated.after.rootKeyId, active.keyId)
+    assert.equal(rotated.before.organizationKeyId, rotated.after.organizationKeyId)
+    assert.equal(rotated.before.dataKeyCount, 2)
+    assert.equal(rotated.after.dataKeyCount, 2)
+    assert.equal(rotated.organizationId, organizationId)
+    assert.equal(rotated.assurance, 'software-local')
+    assert.deepEqual(Object.keys(rotated).sort(),
+      ['after', 'assurance', 'before', 'organizationId', 'outcome', 'version'])
+    assert.deepEqual(Object.keys(rotated.before).sort(), [
+      'assurance', 'dataKeyCount', 'metadataSha256', 'organizationId',
+      'organizationKeyId', 'rootKeyId', 'version',
+    ])
+    assert.deepEqual(Object.keys(rotated.after).sort(), Object.keys(rotated.before).sort())
+
+    const retry = await rotating.rewrapOwnerRootKey(operationSignal())
+    assert.equal(retry.outcome, 'already-active')
+    assert.deepEqual(retry.before, rotated.after)
+    assert.deepEqual(retry.after, rotated.after)
+    await rotating.close()
+
+    const afterDocument = JSON.parse(await readFile(
+      domainPath(home, 'software_local_kms', organizationId), 'utf8'))
+    assert.equal(afterDocument.tables.owner.owner.rootKeyId, active.keyId)
+    assert.equal(afterDocument.tables.owner.owner.organizationKeyId,
+      beforeDocument.tables.owner.owner.organizationKeyId)
+    assert.deepEqual(afterDocument.tables.data_keys, beforeDocument.tables.data_keys)
+
+    const activeOnly = await openStore(ctx, organizationId, active, new AbortController())
+    assert.equal((await activeOnly.rewrapOwnerRootKey(operationSignal())).outcome, 'already-active')
+    assert.deepEqual(exported((await activeOnly.readDataKeys(firstScope, 1, operationSignal()))[0].key),
+      Buffer.alloc(32, 0x1c))
+    await activeOnly.close()
+    await rejectsCode(() => openStore(ctx, organizationId, previous, new AbortController()),
+      'root-key-unavailable')
+  } finally {
+    if (ctx !== undefined) await ctx.fiber.dispose()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('owner root rewrap refuses a tampered DEK before writing owner metadata', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-rewrap-auth-'))
+  const organizationId = 'organization-rewrap-auth'
+  const grantScope = scope(organizationId)
+  const previous = rootKey(0x1e, 'root-key:previous')
+  const active = rootKey(0x1f, 'root-key:active')
+  const ctx = await runtime(home)
+  let dataKeys
+  const facility = {
+    async open(specification) {
+      const domain = await ctx.storageDomain.open(specification)
+      dataKeys = domain.table('data_keys')
+      return domain
+    },
+  }
+  try {
+    const original = await openStore(ctx, organizationId, previous, new AbortController(), 'kms_rewrap_auth')
+    await original.publishDataKey(grantScope, dataKey(grantScope, 'data-key:retained', 0x20), operationSignal())
+    await original.close()
+
+    const rotating = await openSoftwareLocalDisclosureKeyStore(facility, {
+      organizationId,
+      rootKey: active,
+      previousRootKey: previous,
+      storage: { domainNamePrefix: 'kms_rewrap_auth', tenantId: organizationId },
+      limits,
+      signal: new AbortController().signal,
+    })
+    const [recordKey, record] = [...dataKeys.entries()][0]
+    const firstTag = record.wrappedDataKey.tag.at(0)
+    await dataKeys.put(recordKey, Object.freeze({
+      ...record,
+      wrappedDataKey: Object.freeze({
+        ...record.wrappedDataKey,
+        tag: `${firstTag === 'A' ? 'B' : 'A'}${record.wrappedDataKey.tag.slice(1)}`,
+      }),
+    }))
+    await rejectsCode(() => rotating.rewrapOwnerRootKey(operationSignal()), 'authentication-failed')
+    await rotating.close()
+
+    const document = JSON.parse(await readFile(domainPath(home, 'kms_rewrap_auth', organizationId), 'utf8'))
+    assert.equal(document.tables.owner.owner.rootKeyId, previous.keyId)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('one domain prefix derives distinct physical stores for concurrently active organizations', async () => {
   const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-domains-'))
   const firstOrganization = 'organization-a'
@@ -341,6 +451,87 @@ test('an ambiguous committed write quarantines the handle and an idempotent rest
       assert.deepEqual(await recovered.publishDataKey(grantScope, published, operationSignal()), {
         scope: grantScope, keyId: published.keyId, assurance: 'software-local',
       })
+      await recovered.close()
+    } finally { await restarted.fiber.dispose() }
+  } finally { await rm(home, { recursive: true, force: true }) }
+})
+
+test('an ambiguous owner rewrap quarantines the handle and restart observes an idempotent success', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-rewrap-ambiguous-'))
+  const organizationId = 'organization-rewrap-ambiguous'
+  const grantScope = scope(organizationId)
+  const previous = rootKey(0x3b, 'root-key:previous')
+  const active = rootKey(0x3c, 'root-key:active')
+
+  const seeded = await runtime(home)
+  try {
+    const original = await openStore(seeded, organizationId, previous, new AbortController(), 'kms_rewrap_ambiguous')
+    await original.publishDataKey(grantScope,
+      dataKey(grantScope, 'data-key:retained', 0x3d), operationSignal())
+    await original.close()
+  } finally { await seeded.fiber.dispose() }
+
+  const ctx = new Context()
+  const backend = new jsonStorage.JsonStorageBackend(home)
+  let failOwnerWrite = true
+  const ambiguousBackend = {
+    kv: {
+      async open(descriptor) {
+        const unit = await backend.kv.open(descriptor)
+        return {
+          loadAll: unit.loadAll.bind(unit),
+          async putRecord(table, key, value) {
+            await unit.putRecord(table, key, value)
+            if (table === 'owner' && failOwnerWrite) {
+              failOwnerWrite = false
+              throw new Error('simulated post-commit owner transport failure')
+            }
+          },
+          putRecords: unit.putRecords?.bind(unit),
+          deleteRecord: unit.deleteRecord.bind(unit),
+          setGlobal: unit.setGlobal.bind(unit),
+          close: unit.close.bind(unit),
+        }
+      },
+    },
+    close: backend.close.bind(backend),
+  }
+  const facility = new storageDomain.DomainFacility(ctx, { backend: 'ambiguous-rewrap' })
+  let unregister
+  let rotating
+  try {
+    await ctx.plugin(Storage)
+    unregister = ctx.storage.backend.register('ambiguous-rewrap', ambiguousBackend)
+    rotating = await openSoftwareLocalDisclosureKeyStore(facility, {
+      organizationId,
+      rootKey: active,
+      previousRootKey: previous,
+      storage: { domainNamePrefix: 'kms_rewrap_ambiguous', tenantId: organizationId },
+      limits,
+      signal: new AbortController().signal,
+    })
+    await rejectsCode(() => rotating.rewrapOwnerRootKey(operationSignal()), 'storage-failed')
+    await rejectsCode(() => rotating.checkReadiness(operationSignal()), 'unavailable')
+    await rotating.close()
+    rotating = undefined
+  } finally {
+    if (rotating !== undefined) await rotating.close()
+    await facility.closeAll()
+    unregister?.()
+    await ambiguousBackend.close()
+    await ctx.fiber.dispose()
+  }
+
+  try {
+    const restarted = await runtime(home)
+    try {
+      const recovered = await openStore(restarted, organizationId, active,
+        new AbortController(), 'kms_rewrap_ambiguous')
+      const retry = await recovered.rewrapOwnerRootKey(operationSignal())
+      assert.equal(retry.outcome, 'already-active')
+      assert.equal(retry.before.rootKeyId, active.keyId)
+      assert.deepEqual(exported((await recovered.readDataKeys(grantScope, 1, operationSignal()))[0].key),
+        Buffer.alloc(32, 0x3d))
       await recovered.close()
     } finally { await restarted.fiber.dispose() }
   } finally { await rm(home, { recursive: true, force: true }) }

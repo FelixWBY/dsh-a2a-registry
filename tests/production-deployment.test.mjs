@@ -298,11 +298,25 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
   assert.ok(nodeTrust >= 0 && nodeExecution > nodeTrust,
     'the source Node.js namespace must be trusted before execution')
   assert.match(preparer, /Assert-NoReparsePointsRecursively \$stagingRoot/u)
+  assert.match(preparer,
+    /foreach \(\$protectedRoot in @\(\$harnessRoot\.FullName, \$nodeRoot\.FullName, \$launcherRoot\.FullName\)\)/u)
+  assert.match(preparer, /Protect-Directory \$protectedRoot \$false/u)
   assert.match(preparer, /runtime-files\.sha256/u)
   assert.match(preparer, /Assert-PublishOrder/u)
   assert.match(preparer, /runtime-package-lock\.json/u)
   assert.match(preparer, /未由输入 tarball 提供的 DeepSeek 包/u)
   assert.match(preparer, /\[IO\.Directory\]::Move\(\$stagingRoot, \$DestinationRoot\)/u)
+  assert.match(preparer, /\$process\.Dispose\(\)/u)
+  assert.match(preparer, /\$moveAttempt -ge 20/u)
+  assert.match(preparer, /Assert-PrivateAcl \$stagingRoot '运行包根目录' \$true \$true/u)
+  assert.match(preparer,
+    /\[ValidateSet\('ConnectionOnly', 'Production'\)\][\s\S]*\$RuntimeMode = 'ConnectionOnly'/u)
+  assert.match(preparer, /function Assert-ProductionComposition/u)
+  assert.match(preparer, /productionRegistryDisclosureImport:/u)
+  assert.match(preparer, /productionRegistryQuestionConsumer:/u)
+  assert.match(preparer, /modelCredentialEnv: DEEPSEEK_API_KEY/u)
+  assert.match(preparer, /credentialInputs = 'external-at-launch'/u)
+  assert.match(preparer, /validatedModes = \$validatedModes/u)
   assert.match(preparer, /productionRegistryConnection:/u)
   for (const forbidden of [
     'testOnlyDisclosurePublication:',
@@ -327,6 +341,8 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
 
   const launcher = readFileSync(new URL(
     '../deploy/registry/start-bound-harness.ps1', import.meta.url), 'utf8')
+  assert.match(launcher,
+    /\[ValidateSet\('ConnectionOnly', 'Production'\)\][\s\S]*\$RuntimeMode = 'ConnectionOnly'/u)
   assert.match(launcher, /\[ValidateRange\(1, 65535\)\][\s\S]*\[int\]\$Port = 3080/u)
   assert.match(launcher, /Test-PortInUse \$Port/u)
   assert.match(launcher, /Test-ProcessOwnsLoopbackListener \$process\.Id \$Port/u)
@@ -341,5 +357,17 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
   assert.match(launcher, /\$values\.ContainsKey\('DSH_REGISTRY_DISCLOSURE_TOKEN'\)/u)
   assert.match(launcher, /const hasDisclosureToken = disclosureToken\.length > 0/u)
   assert.match(launcher, /if \(hasDisclosureToken\)[\s\S]*disclosureParts\[2\] !== parts\[2\][\s\S]*\.equals\(deviceSecretBytes\)/u)
+  assert.match(launcher, /\$productionEnvironmentNames = @\(\$deviceEnvironmentNames\)[\s\S]*DEEPSEEK_API_KEY/u)
+  assert.match(launcher,
+    /Production 环境文件必须严格包含六项设备变量、bridge／state 配置和 DEEPSEEK_API_KEY/u)
+  assert.match(launcher, /\$syncUri\.Authority\.Equals\(\$syncUri\.Host/u)
+  assert.match(launcher, /\$bridgeUri\.Authority\.Equals\(\$bridgeUri\.Host/u)
+  assert.match(launcher, /无显式端口的固定公网 WSS／HTTPS 路径/u)
+  assert.match(launcher, /function Assert-ProtectedRuntime/u)
+  assert.match(launcher, /function Invoke-IsolatedRuntimeHashVerification/u)
+  assert.match(launcher, /runtime-files\.sha256/u)
+  assert.match(launcher, /运行包逐文件 SHA-256 验证失败/u)
+  assert.match(launcher, /credentialInputs -cne 'external-at-launch'/u)
+  assert.match(launcher, /harness-production-publication\.example\.patch\.yml/u)
   assert.match(launcher, /foreach \(\$name in @\(\$deviceEnvironment\.Keys\)\)/u)
 })

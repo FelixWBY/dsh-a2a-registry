@@ -76,6 +76,8 @@ const TENANT_SCOPED_TABLES = [
   'billing_orders',
   'billing_provider_events',
 ] as const
+/** Tables whose exact RLS policy catalog is covered by the persisted tenancy fingerprint. */
+export const TENANCY_POLICY_TABLE_NAMES = Object.freeze([...TENANT_SCOPED_TABLES])
 const TENANCY_POLICIES = [
   { table: 'organizations', name: 'organizations_select', command: 'r', using: true, check: false },
   { table: 'organizations', name: 'organizations_insert', command: 'a', using: false, check: true },
@@ -457,6 +459,18 @@ export function fingerprintTenancyPolicies(rows: readonly TenancyPolicyRow[]): s
     row.check_definition,
   ])).join('\n')
   return createHash('sha256').update('registry-tenancy-policy-v3\0', 'utf8').update(definitions, 'utf8').digest('hex')
+}
+
+/** Match the exact policy names, commands, modes, roles, and clause presence expected by tenancy v3. */
+export function matchesExpectedTenancyPolicies(policies: readonly TenancyPolicyRow[]): boolean {
+  if (policies.length !== TENANCY_POLICIES.length) return false
+  const policyByKey = new Map(policies.map(row => [`${row.table_name}\0${row.policy_name}`, row]))
+  for (const expected of TENANCY_POLICIES) {
+    const policy = policyByKey.get(`${expected.table}\0${expected.name}`)
+    if (policy === undefined || policy.command !== expected.command || !policy.permissive || !policy.public_only
+      || policy.has_using !== expected.using || policy.has_check !== expected.check) return false
+  }
+  return true
 }
 
 export const TENANCY_POLICY_DEPARSE_SEARCH_PATH = 'pg_catalog'
@@ -2059,15 +2073,7 @@ export class PostgresRegistryTenancy implements RegistryTenancyStore {
   }
 
   private requireExpectedPolicies(policies: readonly TenancyPolicyRow[]): void {
-    if (policies.length !== TENANCY_POLICIES.length) throw new RegistryTenancyError('unavailable')
-    const policyByKey = new Map(policies.map(row => [`${row.table_name}\0${row.policy_name}`, row]))
-    for (const expected of TENANCY_POLICIES) {
-      const policy = policyByKey.get(`${expected.table}\0${expected.name}`)
-      if (policy === undefined || policy.command !== expected.command || !policy.permissive || !policy.public_only
-        || policy.has_using !== expected.using || policy.has_check !== expected.check) {
-        throw new RegistryTenancyError('unavailable')
-      }
-    }
+    if (!matchesExpectedTenancyPolicies(policies)) throw new RegistryTenancyError('unavailable')
   }
 
   private async installPolicies(client: PoolClient): Promise<void> {

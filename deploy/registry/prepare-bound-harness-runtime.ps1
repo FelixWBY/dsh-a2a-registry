@@ -8,6 +8,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$DestinationRoot,
 
+  [ValidateSet('ConnectionOnly', 'Production')]
+  [string]$RuntimeMode = 'ConnectionOnly',
+
   [string]$NpmRegistry = 'https://registry.npmjs.org/'
 )
 
@@ -40,12 +43,13 @@ $launcherSourceRoot = Resolve-ExistingDirectory $PSScriptRoot '准备器目录'
 Assert-NoUntrustedNamespaceReplacement $launcherSourceRoot '准备器目录'
 Assert-NoUnauthorizedWriteAcl $launcherSourceRoot '准备器目录' $false
 
-function Protect-Directory([string]$Path) {
+function Protect-Directory([string]$Path, [bool]$ResetChildren = $true) {
   $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   & $icaclsPath $Path '/inheritance:r' '/grant:r' `
     "*$($currentSid):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "无法限制运行包 ACL：$Path" }
-  if ($null -ne (Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1)) {
+  if ($ResetChildren -and
+    $null -ne (Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1)) {
     & $icaclsPath (Join-Path $Path '*') '/reset' '/T' '/C' '/Q' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "无法重置运行包子项 ACL：$Path" }
   }
@@ -154,7 +158,9 @@ function Invoke-IsolatedNode(
   }
   $stdout = if ($CaptureOutput) { $stdoutTask.GetAwaiter().GetResult() } else { '' }
   $stderr = if ($CaptureOutput) { $stderrTask.GetAwaiter().GetResult() } else { '' }
-  return @{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+  $exitCode = $process.ExitCode
+  $process.Dispose()
+  return @{ ExitCode = $exitCode; Stdout = $stdout; Stderr = $stderr }
 }
 
 function Get-BoundedProcessDiagnostic([hashtable]$Result) {
@@ -235,6 +241,61 @@ function Assert-ConnectionOnlyComposition([string]$Output) {
     )) {
     if ($Output.Contains($forbidden, [StringComparison]::Ordinal)) {
       throw "connection-only 配置合成意外启用：$forbidden"
+    }
+  }
+}
+
+function Assert-ProductionComposition([string]$Output) {
+  $webSection = Get-CompositionSection $Output 'web-runtime'
+  $sessionSection = Get-CompositionSection $Output 'session-controller'
+  foreach ($required in @(
+      "name: '@deepseek-ai/dsh-web-app'",
+      '- credentials',
+      'productionRegistryConnection:',
+      'organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID',
+      'instanceId: !!js process.env.DSH_INSTANCE_ID',
+      'tokenEnv: DSH_REGISTRY_DEVICE_TOKEN',
+      'privateKeyEnv: DSH_REGISTRY_DEVICE_PRIVATE_KEY',
+      'url: !!js process.env.DSH_REGISTRY_SYNC_URL',
+      'productionDisclosureHttpsBridge:',
+      'url: !!js process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL',
+      'tokenEnv: DSH_REGISTRY_DISCLOSURE_TOKEN',
+      'productionDisclosurePublication:',
+      'storageRoot: !!js process.env.DSH_DISCLOSURE_STATE_PATH',
+      'productionRegistryDisclosureImport:',
+      'maxRetainedBytes: 16777216',
+      'productionRegistryQuestionConsumer:',
+      'handling: automatic',
+      'provider: deepseek-official',
+      'model: deepseek-flash',
+      'modelCredentialEnv: DEEPSEEK_API_KEY',
+      'maxClaims: 10000',
+      'maxRequests: 10000',
+      'maxRetainedRequests: 100000',
+      'maxPendingOperations: 256'
+    )) {
+    if (-not $webSection.Contains($required, [StringComparison]::Ordinal)) {
+      throw "production 配置合成缺少字段：$required"
+    }
+  }
+  foreach ($required in @(
+      "name: '@deepseek-ai/dsh-api-session-controller'",
+      'disclosurePreview:'
+    )) {
+    if (-not $sessionSection.Contains($required, [StringComparison]::Ordinal)) {
+      throw "production Session 配置合成缺少字段：$required"
+    }
+  }
+  foreach ($forbidden in @(
+      'testOnlyDisclosurePublication:', 'registryDisclosureImport:',
+      'registryA2aConsumer:', 'productionDisclosureAuthority',
+      'registryDisclosureKeyPublisher', 'a2aDisclosureDecryption:',
+      'loopbackDisclosureImport:', 'loopbackA2aConsumer:',
+      'loopbackDisclosureRefresh:', 'registryUrl:', 'sharedSecretEnv:'
+    )) {
+    if ($webSection.Contains($forbidden, [StringComparison]::Ordinal) -or
+      $sessionSection.Contains($forbidden, [StringComparison]::Ordinal)) {
+      throw "production 配置合成意外启用：$forbidden"
     }
   }
 }
@@ -641,14 +702,40 @@ try {
   } $true
   if ($composition.ExitCode -ne 0) { throw '可移植 Harness 未通过 connection-only 配置合成烟测。' }
   Assert-ConnectionOnlyComposition $composition.Stdout
+  $validatedModes = @('ConnectionOnly')
+  if ($RuntimeMode -eq 'Production') {
+    $productionComposition = Invoke-IsolatedNode (Join-Path $nodeRoot.FullName 'node.exe') `
+      $probeHome.FullName @(
+        $portableCli, '--profile', 'web', '--patch',
+        (Join-Path $launcherRoot.FullName 'harness-production-publication.example.patch.yml'),
+        '--dump-config'
+      ) @{
+        DSH_HOME = $probeHome.FullName
+        DSH_TELEMETRY_DISABLED = '1'
+        DSH_REGISTRY_ORGANIZATION_ID = 'runtime-preparation-organization'
+        DSH_INSTANCE_ID = 'runtime-preparation-instance'
+        DSH_REGISTRY_SYNC_URL = 'wss://registry.invalid/a2a/v1/sync'
+        DSH_REGISTRY_DISCLOSURE_BRIDGE_URL = 'https://registry.invalid/a2a/v1/disclosure-publication'
+        DSH_DISCLOSURE_STATE_PATH = (Join-Path $probeHome.FullName 'disclosures')
+      } $true
+    if ($productionComposition.ExitCode -ne 0) {
+      throw '可移植 Harness 未通过 production publication/import/question 配置合成烟测。'
+    }
+    Assert-ProductionComposition $productionComposition.Stdout
+    $validatedModes += 'Production'
+  }
   Remove-StagingDirectory $probeHome.FullName $stagingRoot 'probe-home'
 
   $evidencePath = Join-Path $stagingRoot 'runtime-build.json'
   $evidence = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     harnessVersion = $harnessVersion
     nodeVersion = $nodeVersion[0]
+    runtimeMode = $RuntimeMode
+    validatedModes = $validatedModes
     lifecycleScripts = $false
+    optionalDependenciesInstalled = $false
+    credentialInputs = 'external-at-launch'
     createdAt = [DateTime]::UtcNow.ToString('o')
     packages = $packageEvidence
   }
@@ -661,13 +748,30 @@ try {
 
   Assert-NoReparsePointsRecursively $stagingRoot
   Protect-Directory $stagingRoot
+  foreach ($protectedRoot in @($harnessRoot.FullName, $nodeRoot.FullName, $launcherRoot.FullName)) {
+    Protect-Directory $protectedRoot $false
+  }
+  Assert-PrivateAcl $stagingRoot '运行包根目录' $true $true
   Assert-NoUnauthorizedWriteAcl $stagingRoot '运行包根目录' $true
+  Assert-NoUnauthorizedWriteAcl $harnessRoot.FullName 'HarnessRoot' $true
+  Assert-NoUnauthorizedWriteAcl $nodeRoot.FullName 'Node.js 目录' $true
+  Assert-NoUnauthorizedWriteAcl $launcherRoot.FullName '启动器目录' $true
   Assert-NoUnauthorizedWriteAcl (Join-Path $harnessRoot.FullName 'apps\cli\lib\bin.js') 'Harness CLI' $false
   Assert-NoUnauthorizedWriteAcl (Join-Path $nodeRoot.FullName 'node.exe') 'Node.js' $false
   $hashManifest = Join-Path $stagingRoot 'runtime-files.sha256'
   Write-HashManifest $stagingRoot $hashManifest
 
-  [IO.Directory]::Move($stagingRoot, $DestinationRoot)
+  $moveAttempt = 0
+  while ($true) {
+    try {
+      [IO.Directory]::Move($stagingRoot, $DestinationRoot)
+      break
+    } catch [UnauthorizedAccessException], [IO.IOException] {
+      $moveAttempt += 1
+      if ($moveAttempt -ge 20 -or (Test-Path -LiteralPath $DestinationRoot)) { throw }
+      Start-Sleep -Milliseconds 500
+    }
+  }
   if (-not (Test-Path -LiteralPath $DestinationRoot -PathType Container) -or
     (Test-Path -LiteralPath $stagingRoot)) {
     throw '运行包原子发布后的目录状态无效。'
@@ -689,4 +793,5 @@ Write-Output "NodePath: $(Join-Path $DestinationRoot 'node\node.exe')"
 Write-Output "launcher: $(Join-Path $DestinationRoot 'launcher\start-bound-harness.ps1')"
 Write-Output "Harness version: $harnessVersion"
 Write-Output "Node version: $($nodeVersion[0])"
+Write-Output "Runtime mode: $RuntimeMode"
 Write-Output "hash manifest: $(Join-Path $DestinationRoot 'runtime-files.sha256')"

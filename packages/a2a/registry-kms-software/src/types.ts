@@ -72,6 +72,19 @@ export interface SoftwareLocalDisclosureKeyVerification {
   readonly metadataSha256: `sha256:${string}`
 }
 
+/**
+ * Secret-free acknowledgement for one organization-owner root-key rewrap.
+ * Both snapshots contain authenticated metadata only; wrapped values and key material are never returned.
+ */
+export interface SoftwareLocalRootKeyRewrapReceipt {
+  readonly version: 1
+  readonly assurance: 'software-local'
+  readonly organizationId: DisclosureDataKeyGrantScope['organizationId']
+  readonly outcome: 'rewrapped' | 'already-active'
+  readonly before: SoftwareLocalDisclosureKeyVerification
+  readonly after: SoftwareLocalDisclosureKeyVerification
+}
+
 /** Content-free failures safe to return across an authenticated adapter boundary. */
 export type SoftwareLocalKmsErrorCode =
   | 'invalid-input'

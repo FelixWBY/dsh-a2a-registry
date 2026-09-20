@@ -19,7 +19,8 @@ import { requireAes256Key, unwrapKey, wrapKey } from './crypto.ts'
 import {
   SOFTWARE_LOCAL_KEY_PROTECTION, SoftwareLocalKmsError,
   type SoftwareLocalDisclosureKeyReceipt, type SoftwareLocalDisclosureKeyStoreOptions,
-  type SoftwareLocalDisclosureKeyVerification, type SoftwareLocalRootKey, type SoftwareLocalWrappedKey,
+  type SoftwareLocalDisclosureKeyVerification, type SoftwareLocalRootKey,
+  type SoftwareLocalRootKeyRewrapReceipt, type SoftwareLocalWrappedKey,
 } from './types.ts'
 
 export * from './types.ts'
@@ -185,6 +186,21 @@ function receipt(scope: DisclosureDataKeyGrantScope, keyId: DisclosureDataKeyId)
   return Object.freeze({ scope: Object.freeze({ ...scope }), keyId, assurance: 'software-local' })
 }
 
+function rootKeyRewrapReceipt(
+  outcome: SoftwareLocalRootKeyRewrapReceipt['outcome'],
+  before: SoftwareLocalDisclosureKeyVerification,
+  after: SoftwareLocalDisclosureKeyVerification,
+): SoftwareLocalRootKeyRewrapReceipt {
+  return Object.freeze({
+    version: FORMAT_VERSION,
+    assurance: 'software-local',
+    organizationId: before.organizationId,
+    outcome,
+    before,
+    after,
+  })
+}
+
 async function bootstrapOwner(domain: StoreDomain, options: SoftwareLocalDisclosureKeyStoreOptions): Promise<{
   owner: OwnerRecord
   organizationKey: KeyObject
@@ -302,22 +318,28 @@ export class SoftwareLocalDisclosureKeyStore {
   private unavailable = false
   private disposal: Promise<void> | undefined
   private organizationKey: KeyObject | undefined
+  private owner: OwnerRecord
   private readonly abort: () => void
   private readonly organizationId: DisclosureDataKeyGrantScope['organizationId']
   private readonly limits: SoftwareLocalDisclosureKeyStoreOptions['limits']
   private readonly lifecycleSignal: AbortSignal
+  private readonly activeRootKey: SoftwareLocalRootKey
+  private readonly previousRootKey: SoftwareLocalRootKey | undefined
 
   /** Constructed only after the complete durable key hierarchy authenticates. */
   constructor(
     private readonly domain: StoreDomain,
-    private readonly owner: OwnerRecord,
+    owner: OwnerRecord,
     organizationKey: KeyObject,
     options: SoftwareLocalDisclosureKeyStoreOptions,
   ) {
+    this.owner = owner
     this.organizationKey = organizationKey
     this.organizationId = options.organizationId
     this.limits = Object.freeze({ ...options.limits })
     this.lifecycleSignal = options.signal
+    this.activeRootKey = options.rootKey
+    this.previousRootKey = options.previousRootKey
     this.abort = () => { this.controller.abort() }
     this.lifecycleSignal.addEventListener('abort', this.abort, { once: true })
     if (this.lifecycleSignal.aborted) this.abort()
@@ -419,6 +441,74 @@ export class SoftwareLocalDisclosureKeyStore {
     return this.run(signal, () => this.verifyRetainedHierarchy())
   }
 
+  /**
+   * Rewrap only this organization's owner key from the configured previous root to the active root.
+   * Every retained DEK is authenticated before the single owner-record replacement. Exact retries are safe.
+   */
+  rewrapOwnerRootKey(signal: AbortSignal): Promise<SoftwareLocalRootKeyRewrapReceipt> {
+    return this.run(signal, async () => {
+      const owners = this.domain.table('owner')
+      const retained = owners.get(OWNER_RECORD_KEY)
+      requireKms(retained !== undefined && owners.size === 1
+        && retained.organizationId === this.organizationId
+        && retained.organizationKeyId === this.owner.organizationKeyId, 'invalid-storage')
+
+      const selectedRoot = retained.rootKeyId === this.activeRootKey.keyId
+        ? this.activeRootKey
+        : retained.rootKeyId === this.previousRootKey?.keyId ? this.previousRootKey : undefined
+      requireKms(selectedRoot !== undefined, 'root-key-unavailable')
+
+      let material: Buffer | undefined
+      try {
+        material = unwrapKey(selectedRoot.key, retained.wrappedOrganizationKey, organizationKeyAad(retained))
+        const organizationKey = this.requireOrganizationKey()
+        const cachedMaterial = exportKey(organizationKey, 'invalid-input')
+        try { requireKms(timingSafeEqual(material, cachedMaterial), 'authentication-failed') }
+        finally { cachedMaterial.fill(0) }
+        const before = this.verifyRetainedHierarchy(retained, organizationKey)
+
+        if (retained.rootKeyId === this.activeRootKey.keyId) {
+          this.owner = retained
+          return rootKeyRewrapReceipt('already-active', before, before)
+        }
+
+        requireKms(this.previousRootKey !== undefined
+          && retained.rootKeyId === this.previousRootKey.keyId, 'root-key-unavailable')
+        const nextMetadata = {
+          organizationId: retained.organizationId,
+          rootKeyId: this.activeRootKey.keyId,
+          organizationKeyId: retained.organizationKeyId,
+        }
+        const next = Object.freeze({
+          version: FORMAT_VERSION,
+          ...nextMetadata,
+          wrappedOrganizationKey: wrapKey(
+            this.activeRootKey.key, material, organizationKeyAad(nextMetadata),
+          ),
+        }) satisfies OwnerRecord
+
+        // Authenticate the candidate with its new metadata/AAD before the only durable mutation.
+        const confirmed = unwrapKey(
+          this.activeRootKey.key, next.wrappedOrganizationKey, organizationKeyAad(next),
+        )
+        try { requireKms(timingSafeEqual(material, confirmed), 'authentication-failed') }
+        finally { confirmed.fill(0) }
+
+        try { await owners.put(OWNER_RECORD_KEY, next) } catch {
+          // The backend may have committed before reporting failure. Quarantine until a clean reopen observes it.
+          this.isolate()
+          throw new SoftwareLocalKmsError('storage-failed')
+        }
+        this.owner = next
+        this.assertLive(signal)
+        const after = this.verifyRetainedHierarchy(next, organizationKey)
+        return rootKeyRewrapReceipt('rewrapped', before, after)
+      } finally {
+        material?.fill(0)
+      }
+    })
+  }
+
   /** Abort admission, drain already-started operations, and release the tenant domain. */
   close(): Promise<void> {
     if (this.disposal === undefined) {
@@ -438,20 +528,23 @@ export class SoftwareLocalDisclosureKeyStore {
     return this.organizationKey
   }
 
-  private verifyRetainedHierarchy(): SoftwareLocalDisclosureKeyVerification {
+  private verifyRetainedHierarchy(
+    owner: OwnerRecord = this.owner,
+    organizationKey: KeyObject = this.requireOrganizationKey(),
+  ): SoftwareLocalDisclosureKeyVerification {
     const records = [...this.domain.table('data_keys').entries()]
       .sort((left, right) => left[0].localeCompare(right[0]))
     requireKms(records.length <= this.limits.maxDataKeys, 'invalid-storage')
     const digest = createHash('sha256')
     digest.update(JSON.stringify([
       'dsh-registry-software-kms-verification', FORMAT_VERSION, this.organizationId,
-      this.owner.rootKeyId, this.owner.organizationKeyId,
+      owner.rootKeyId, owner.organizationKeyId,
     ]), 'utf8')
     for (const [key, record] of records) {
-      requireKms(record.organizationKeyId === this.owner.organizationKeyId
+      requireKms(record.organizationKeyId === owner.organizationKeyId
         && record.scope.organizationId === this.organizationId
         && key === dataKeyRecordKey(record.scope, record.keyId), 'invalid-storage')
-      const material = unwrapKey(this.requireOrganizationKey(), record.wrappedDataKey, dataKeyAad(record))
+      const material = unwrapKey(organizationKey, record.wrappedDataKey, dataKeyAad(record))
       material.fill(0)
       digest.update('\n', 'utf8')
       digest.update(JSON.stringify([
@@ -463,8 +556,8 @@ export class SoftwareLocalDisclosureKeyStore {
       version: FORMAT_VERSION,
       assurance: 'software-local',
       organizationId: this.organizationId,
-      rootKeyId: this.owner.rootKeyId,
-      organizationKeyId: this.owner.organizationKeyId,
+      rootKeyId: owner.rootKeyId,
+      organizationKeyId: owner.organizationKeyId,
       dataKeyCount: records.length,
       metadataSha256: `sha256:${digest.digest('hex')}`,
     })

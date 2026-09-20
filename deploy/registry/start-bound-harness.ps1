@@ -17,6 +17,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$LogDirectory,
 
+  [ValidateSet('ConnectionOnly', 'Production')]
+  [string]$RuntimeMode = 'ConnectionOnly',
+
   [ValidateRange(1, 65535)]
   [int]$Port = 3080
 )
@@ -31,8 +34,9 @@ if ($PSVersionTable.PSVersion.Major -lt 7 -or
   -not (Get-Command Start-Process).Parameters.ContainsKey('Environment')) {
   throw '需要支持 Start-Process -Environment 的 PowerShell 7。'
 }
-if ($null -ne (Get-Item -LiteralPath 'Env:NODE_OPTIONS' -ErrorAction SilentlyContinue)) {
-  throw '启动 Harness 前必须移除 NODE_OPTIONS。'
+if ($null -ne (Get-Item -LiteralPath 'Env:NODE_OPTIONS' -ErrorAction SilentlyContinue) -or
+  $null -ne (Get-Item -LiteralPath 'Env:NODE_PATH' -ErrorAction SilentlyContinue)) {
+  throw '启动 Harness 前必须移除 NODE_OPTIONS 和 NODE_PATH。'
 }
 
 $requiredDeviceEnvironmentNames = @(
@@ -43,6 +47,11 @@ $requiredDeviceEnvironmentNames = @(
   'DSH_REGISTRY_DEVICE_PRIVATE_KEY'
 )
 $deviceEnvironmentNames = @($requiredDeviceEnvironmentNames) + @('DSH_REGISTRY_DISCLOSURE_TOKEN')
+$productionEnvironmentNames = @($deviceEnvironmentNames) + @(
+  'DSH_REGISTRY_DISCLOSURE_BRIDGE_URL',
+  'DSH_DISCLOSURE_STATE_PATH',
+  'DEEPSEEK_API_KEY'
+)
 
 . (Join-Path $PSScriptRoot 'windows-private-path-gate.ps1')
 
@@ -66,7 +75,7 @@ function Test-ProcessOwnsLoopbackListener([int]$OwnerProcessId, [int]$Port) {
     }).Count -gt 0
 }
 
-function Read-EnrollmentEnvironment([string]$Path) {
+function Read-HarnessEnvironment([string]$Path, [string]$SelectedMode) {
   if ((Get-Item -LiteralPath $Path -Force).Length -gt 16KB) {
     throw 'enrollment 环境文件超过大小限制。'
   }
@@ -83,8 +92,13 @@ function Read-EnrollmentEnvironment([string]$Path) {
     if ($separator -le 0) { throw 'enrollment 环境文件格式无效。' }
     $name = $line.Substring(0, $separator)
     $value = $line.Substring($separator + 1)
-    if ($deviceEnvironmentNames -cnotcontains $name) {
-      throw 'enrollment 环境文件只能包含绑定工具导出的五项连接变量及可选的 disclosure token。'
+    $allowedNames = if ($SelectedMode -eq 'Production') {
+      $productionEnvironmentNames
+    } else {
+      $deviceEnvironmentNames
+    }
+    if ($allowedNames -cnotcontains $name) {
+      throw 'enrollment 环境文件包含当前运行模式不允许的变量。'
     }
     if ($values.ContainsKey($name)) {
       throw 'enrollment 环境文件中的变量不能重复。'
@@ -95,10 +109,15 @@ function Read-EnrollmentEnvironment([string]$Path) {
     }
     $values[$name] = $value
   }
-  if (($values.Count -ne $requiredDeviceEnvironmentNames.Count -and
+  if ($SelectedMode -eq 'Production') {
+    if ($values.Count -ne $productionEnvironmentNames.Count -or
+      @($productionEnvironmentNames | Where-Object { -not $values.ContainsKey($_) }).Count -ne 0) {
+      throw 'Production 环境文件必须严格包含六项设备变量、bridge／state 配置和 DEEPSEEK_API_KEY。'
+    }
+  } elseif (($values.Count -ne $requiredDeviceEnvironmentNames.Count -and
       $values.Count -ne $deviceEnvironmentNames.Count) -or
     @($requiredDeviceEnvironmentNames | Where-Object { -not $values.ContainsKey($_) }).Count -ne 0) {
-    throw 'enrollment 环境文件必须严格包含旧版五项连接变量，或包含新增独立 disclosure token 的六项变量。'
+    throw 'ConnectionOnly 环境文件必须严格包含旧版五项连接变量，或包含新增独立 disclosure token 的六项变量。'
   }
   if ($values['DSH_REGISTRY_ORGANIZATION_ID'] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$' -or
     $values['DSH_INSTANCE_ID'] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$') {
@@ -122,7 +141,32 @@ function Read-EnrollmentEnvironment([string]$Path) {
   if ($values.ContainsKey('DSH_REGISTRY_DISCLOSURE_TOKEN') -and
     ($values['DSH_REGISTRY_DISCLOSURE_TOKEN'].Length -gt 512 -or
       $values['DSH_REGISTRY_DISCLOSURE_TOKEN'] -notmatch '^dshb1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$')) {
-    throw 'enrollment 环境文件中的设备凭据格式无效。'
+      throw 'enrollment 环境文件中的设备凭据格式无效。'
+  }
+  if ($SelectedMode -eq 'Production') {
+    try {
+      $bridgeUri = [Uri]$values['DSH_REGISTRY_DISCLOSURE_BRIDGE_URL']
+    } catch {
+      throw 'Production disclosure bridge 地址无效。'
+    }
+    if (-not $syncUri.IsDefaultPort -or
+      -not $syncUri.Authority.Equals($syncUri.Host, [StringComparison]::OrdinalIgnoreCase) -or
+      $syncUri.AbsolutePath -cne '/a2a/v1/sync' -or
+      -not $bridgeUri.IsAbsoluteUri -or $bridgeUri.Scheme -ne 'https' -or
+      -not [string]::IsNullOrEmpty($bridgeUri.UserInfo) -or
+      -not [string]::IsNullOrEmpty($bridgeUri.Query) -or
+      -not [string]::IsNullOrEmpty($bridgeUri.Fragment) -or
+      -not $bridgeUri.IsDefaultPort -or
+      -not $bridgeUri.Authority.Equals($bridgeUri.Host, [StringComparison]::OrdinalIgnoreCase) -or
+      $bridgeUri.AbsolutePath -cne '/a2a/v1/disclosure-publication' -or
+      -not $bridgeUri.Host.Equals($syncUri.Host, [StringComparison]::OrdinalIgnoreCase)) {
+      throw 'Production 同步与 disclosure bridge 必须是同主机、无显式端口的固定公网 WSS／HTTPS 路径。'
+    }
+    Assert-AbsoluteWindowsPath $values['DSH_DISCLOSURE_STATE_PATH'] 'DSH_DISCLOSURE_STATE_PATH'
+    $modelCredentialBytes = [Text.Encoding]::UTF8.GetByteCount($values['DEEPSEEK_API_KEY'])
+    if ($modelCredentialBytes -lt 16 -or $modelCredentialBytes -gt 4096) {
+      throw 'DEEPSEEK_API_KEY 必须是 16 到 4096 字节的非空凭据。'
+    }
   }
   return $values
 }
@@ -248,12 +292,231 @@ if (!valid) process.exit(1)
   }
 }
 
+function Invoke-IsolatedRuntimeHashVerification(
+  [string]$Runtime,
+  [string]$RuntimeRoot,
+  [string]$ManifestPath
+) {
+  $verifier = @'
+const { createHash } = require('node:crypto')
+const { readFileSync, readdirSync } = require('node:fs')
+const { relative, resolve } = require('node:path')
+const { TextDecoder } = require('node:util')
+
+const root = resolve(process.argv[2])
+const manifestPath = resolve(process.argv[3])
+const normalize = value => value.replaceAll('\\', '/')
+const fail = () => { throw new Error('runtime hash verification failed') }
+
+try {
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(manifestPath))
+  if (!text.endsWith('\n') || text.includes('\r')) fail()
+  const lines = text.slice(0, -1).split('\n')
+  if (lines.length === 0) fail()
+  const expected = new Map()
+  for (const line of lines) {
+    const match = /^([0-9a-f]{64})  (.+)$/u.exec(line)
+    if (match === null) fail()
+    const selected = match[2]
+    const segments = selected.split('/')
+    if (selected.includes('\\') || selected.includes(':') || selected.startsWith('/')
+      || segments.some(segment => segment === '' || segment === '.' || segment === '..')) fail()
+    const key = selected.toLowerCase()
+    if (expected.has(key)) fail()
+    expected.set(key, { hash: match[1], path: selected })
+  }
+
+  const manifestRelative = normalize(relative(root, manifestPath)).toLowerCase()
+  const actual = new Map()
+  const pending = [root]
+  while (pending.length > 0) {
+    const directory = pending.pop()
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) fail()
+      const fullPath = resolve(directory, entry.name)
+      if (entry.isDirectory()) {
+        pending.push(fullPath)
+      } else if (entry.isFile()) {
+        const selected = normalize(relative(root, fullPath))
+        const key = selected.toLowerCase()
+        if (key === manifestRelative) continue
+        if (actual.has(key)) fail()
+        actual.set(key, { path: selected, fullPath })
+      } else {
+        fail()
+      }
+    }
+  }
+  if (actual.size !== expected.size) fail()
+  for (const [key, selected] of expected) {
+    const file = actual.get(key)
+    if (file === undefined || file.path !== selected.path) fail()
+    const hash = createHash('sha256').update(readFileSync(file.fullPath)).digest('hex')
+    if (hash !== selected.hash) fail()
+  }
+} catch {
+  process.exitCode = 1
+}
+'@
+  $encodedVerifier = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($verifier))
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $Runtime
+  $startInfo.WorkingDirectory = $RuntimeRoot
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  foreach ($argument in @(
+      '--eval', "eval(Buffer.from(process.argv[1],'base64').toString('utf8'))",
+      $encodedVerifier, $RuntimeRoot, $ManifestPath
+    )) {
+    [void]$startInfo.ArgumentList.Add($argument)
+  }
+  $startInfo.Environment.Clear()
+  foreach ($name in @(
+      'ALLUSERSPROFILE', 'APPDATA', 'CommonProgramFiles', 'CommonProgramFiles(x86)',
+      'CommonProgramW6432', 'DriverData', 'HOMEDRIVE', 'HOMEPATH',
+      'LOCALAPPDATA', 'NUMBER_OF_PROCESSORS', 'OS', 'PATHEXT',
+      'PROCESSOR_ARCHITECTURE', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)',
+      'ProgramW6432', 'SystemDrive', 'SystemRoot', 'TEMP', 'TMP', 'USERNAME',
+      'USERPROFILE', 'WINDIR'
+    )) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if (-not [string]::IsNullOrEmpty($value)) { $startInfo.Environment[$name] = $value }
+  }
+  $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+  $startInfo.Environment['ComSpec'] = Join-Path $systemDirectory 'cmd.exe'
+  $startInfo.Environment['Path'] = "$(Split-Path -Parent $Runtime);$systemDirectory"
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) { throw '无法启动隔离的运行包摘要验证器。' }
+  $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+  $stderrTask = $process.StandardError.ReadToEndAsync()
+  if (-not $process.WaitForExit(120000)) {
+    try { $process.Kill($true) } catch {}
+    [void]$process.WaitForExit(5000)
+    throw '隔离的运行包摘要验证器超时。'
+  }
+  [void]$stdoutTask.GetAwaiter().GetResult()
+  [void]$stderrTask.GetAwaiter().GetResult()
+  $exitCode = $process.ExitCode
+  $process.Dispose()
+  if ($exitCode -ne 0) { throw '运行包逐文件 SHA-256 验证失败。' }
+}
+
+function Assert-ProtectedRuntime(
+  [string]$SelectedHarnessRoot,
+  [string]$SelectedNodePath,
+  [string]$SelectedMode
+) {
+  $launcherRoot = Resolve-ExistingDirectory $PSScriptRoot '启动器目录'
+  $runtimeRoot = Resolve-ExistingDirectory (Split-Path -Parent $launcherRoot) '运行包根目录'
+  $expectedHarnessRoot = Resolve-ExistingDirectory (Join-Path $runtimeRoot 'harness') '运行包 HarnessRoot'
+  $expectedNodeRoot = Resolve-ExistingDirectory (Join-Path $runtimeRoot 'node') '运行包 Node.js 目录'
+  $expectedNodePath = Resolve-ExistingFile (Join-Path $expectedNodeRoot 'node.exe') '运行包 Node.js'
+  if (-not $SelectedHarnessRoot.Equals($expectedHarnessRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $SelectedNodePath.Equals($expectedNodePath, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'HarnessRoot 和 NodePath 必须指向当前受保护运行包内的固定位置。'
+  }
+
+  Assert-NoUntrustedNamespaceReplacement $runtimeRoot '运行包根目录'
+  Assert-NoUnauthorizedWriteAcl $runtimeRoot '运行包根目录' $true
+  Assert-NoUnauthorizedWriteAcl $expectedHarnessRoot 'HarnessRoot' $true
+  Assert-NoUnauthorizedWriteAcl $expectedNodeRoot 'Node.js 目录' $true
+  Assert-NoUnauthorizedWriteAcl $launcherRoot '启动器目录' $true
+  $runtimeItems = @(Get-ChildItem -LiteralPath $runtimeRoot -Force -Recurse)
+  $reparse = $runtimeItems | Where-Object {
+    ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+  } | Select-Object -First 1
+  if ($null -ne $reparse) { throw '受保护运行包不能包含 junction 或符号链接。' }
+
+  $manifestPath = Resolve-ExistingFile (Join-Path $runtimeRoot 'runtime-files.sha256') '运行包摘要清单'
+  if ((Get-Item -LiteralPath $manifestPath -Force).Length -gt 32MB) {
+    throw '运行包摘要清单超过大小限制。'
+  }
+  try {
+    $manifestLines = [IO.File]::ReadAllLines($manifestPath, [Text.UTF8Encoding]::new($false, $true))
+  } catch {
+    throw '运行包摘要清单不是严格 UTF-8 文本。'
+  }
+  $manifestEntries = [Collections.Generic.Dictionary[string, string]]::new(
+    [StringComparer]::OrdinalIgnoreCase)
+  foreach ($line in $manifestLines) {
+    if ($line.Length -lt 67 -or $line.Substring(0, 64) -notmatch '^[0-9a-f]{64}$' -or
+      $line.Substring(64, 2) -cne '  ') {
+      throw '运行包摘要清单格式无效。'
+    }
+    $relative = $line.Substring(66)
+    $segments = @($relative.Split('/'))
+    if ($relative.Length -eq 0 -or $relative.Contains('\') -or $relative.Contains(':') -or
+      $relative.StartsWith('/', [StringComparison]::Ordinal) -or
+      @($segments | Where-Object { $_.Length -eq 0 -or $_ -eq '.' -or $_ -eq '..' }).Count -ne 0 -or
+      $manifestEntries.ContainsKey($relative)) {
+      throw '运行包摘要清单包含重复或越界路径。'
+    }
+    $manifestEntries.Add($relative, $line.Substring(0, 64))
+  }
+  if ($manifestEntries.Count -eq 0) { throw '运行包摘要清单不能为空。' }
+
+  foreach ($requiredRelative in @(
+      'harness/apps/cli/lib/bin.js',
+      'node/node.exe',
+      'launcher/start-bound-harness.ps1',
+      'launcher/windows-private-path-gate.ps1',
+      'launcher/harness-registry-connection.example.patch.yml',
+      'launcher/harness-production-publication.example.patch.yml',
+      'runtime-package-lock.json',
+      'runtime-build.json'
+    )) {
+    if (-not $manifestEntries.ContainsKey($requiredRelative)) {
+      throw "运行包摘要清单缺少必要文件：$requiredRelative"
+    }
+    Assert-NoUnauthorizedWriteAcl (Join-Path $runtimeRoot $requiredRelative.Replace('/', '\')) `
+      "运行包关键文件 $requiredRelative" $false
+  }
+  $nodeRelative = 'node/node.exe'
+  $nodeHash = (Get-FileHash -LiteralPath $expectedNodePath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($nodeHash -cne $manifestEntries[$nodeRelative]) {
+    throw '运行包 Node.js 摘要不匹配。'
+  }
+  Invoke-IsolatedRuntimeHashVerification $expectedNodePath $runtimeRoot $manifestPath
+
+  $evidencePath = Resolve-ExistingFile (Join-Path $runtimeRoot 'runtime-build.json') '运行包构建证据'
+  try {
+    $evidence = [IO.File]::ReadAllText($evidencePath, [Text.UTF8Encoding]::new($false, $true)) |
+      ConvertFrom-Json -AsHashtable -ErrorAction Stop
+  } catch {
+    throw '运行包构建证据不是有效的严格 UTF-8 JSON。'
+  }
+  $nodeEvidenceMatch = [regex]::Match([string]$evidence.nodeVersion, '^([0-9]+)\.')
+  if ($evidence.schemaVersion -ne 2 -or $evidence.lifecycleScripts -ne $false -or
+    $evidence.optionalDependenciesInstalled -ne $false -or
+    [string]$evidence.credentialInputs -cne 'external-at-launch' -or
+    [string]::IsNullOrWhiteSpace([string]$evidence.harnessVersion) -or
+    -not $nodeEvidenceMatch.Success -or [int]$nodeEvidenceMatch.Groups[1].Value -lt 24 -or
+    @($evidence.packages).Count -eq 0) {
+    throw '运行包构建证据不满足无脚本、Node.js 24+ 和包来源要求。'
+  }
+  $validatedModes = @($evidence.validatedModes)
+  if (([string]$evidence.runtimeMode -cne 'ConnectionOnly' -and
+      [string]$evidence.runtimeMode -cne 'Production') -or
+    $validatedModes -cnotcontains 'ConnectionOnly' -or
+    ([string]$evidence.runtimeMode -ceq 'ConnectionOnly' -and $validatedModes.Count -ne 1) -or
+    ([string]$evidence.runtimeMode -ceq 'Production' -and
+      ($validatedModes.Count -ne 2 -or $validatedModes -cnotcontains 'Production')) -or
+    ($SelectedMode -eq 'Production' -and $validatedModes -cnotcontains 'Production')) {
+    throw '运行包未记录当前启动模式所需的配置合成验收。'
+  }
+  return $evidence
+}
+
 $HarnessRoot = Resolve-ExistingDirectory $HarnessRoot 'HarnessRoot'
 $NodePath = Resolve-ExistingFile $NodePath 'NodePath'
 $EnvFile = Resolve-ExistingFile $EnvFile 'EnvFile'
 $CaCertificate = Resolve-ExistingFile $CaCertificate 'CaCertificate'
 $DshHome = Resolve-ExistingDirectory $DshHome 'DshHome'
 $LogDirectory = Resolve-ExistingDirectory $LogDirectory 'LogDirectory'
+$runtimeEvidence = Assert-ProtectedRuntime $HarnessRoot $NodePath $RuntimeMode
 
 if (-not [IO.Path]::GetFileName($NodePath).Equals('node.exe', [StringComparison]::OrdinalIgnoreCase)) {
   throw 'NodePath 必须指向 node.exe。'
@@ -266,10 +529,19 @@ if ($LASTEXITCODE -ne 0 -or $nodeVersion.Count -ne 1 -or $nodeVersion[0] -notmat
 }
 $nodeMajor = [int]$nodeVersion[0].Split('.')[0]
 if ($nodeMajor -lt 24) { throw '需要 Node.js 24 或更高版本。' }
+if ($nodeVersion[0] -cne [string]$runtimeEvidence.nodeVersion) {
+  throw 'Node.js 版本与受保护运行包构建证据不一致。'
+}
 
 $cliPath = Resolve-ExistingFile (Join-Path $HarnessRoot 'apps\cli\lib\bin.js') 'Harness CLI'
 $launcherRoot = Resolve-ExistingDirectory $PSScriptRoot '启动器目录'
-$overlayPath = Resolve-ExistingFile (Join-Path $launcherRoot 'harness-registry-connection.example.patch.yml') '连接专用 overlay'
+$runtimeRoot = Resolve-ExistingDirectory (Split-Path -Parent $launcherRoot) '运行包根目录'
+$overlayName = if ($RuntimeMode -eq 'Production') {
+  'harness-production-publication.example.patch.yml'
+} else {
+  'harness-registry-connection.example.patch.yml'
+}
+$overlayPath = Resolve-ExistingFile (Join-Path $launcherRoot $overlayName) 'Harness overlay'
 $envParent = Resolve-ExistingDirectory (Split-Path -Parent $EnvFile) 'EnvFile 父目录'
 $caParent = Resolve-ExistingDirectory (Split-Path -Parent $CaCertificate) 'CaCertificate 父目录'
 Assert-NoUntrustedNamespaceReplacement $envParent 'EnvFile 父目录'
@@ -278,9 +550,10 @@ Assert-NoUntrustedNamespaceReplacement $LogDirectory 'LogDirectory'
 Assert-NoUntrustedNamespaceReplacement $HarnessRoot 'HarnessRoot'
 Assert-NoUntrustedNamespaceReplacement $launcherRoot '启动器目录'
 Assert-NoUntrustedNamespaceReplacement $caParent 'CaCertificate 父目录'
-Assert-OutsideDirectory $EnvFile $HarnessRoot 'EnvFile'
-Assert-OutsideDirectory $DshHome $HarnessRoot 'DshHome'
-Assert-OutsideDirectory $LogDirectory $HarnessRoot 'LogDirectory'
+Assert-OutsideDirectory $EnvFile $runtimeRoot 'EnvFile'
+Assert-OutsideDirectory $CaCertificate $runtimeRoot 'CaCertificate'
+Assert-OutsideDirectory $DshHome $runtimeRoot 'DshHome'
+Assert-OutsideDirectory $LogDirectory $runtimeRoot 'LogDirectory'
 
 if (Test-PortInUse $Port) {
   throw "TCP 端口 $Port 已被占用；启动器不会停止或替换现有进程。"
@@ -293,7 +566,7 @@ Assert-PrivateAcl $LogDirectory 'LogDirectory' $true
 Assert-NoUnauthorizedWriteAcl $HarnessRoot 'HarnessRoot' $true
 Assert-NoUnauthorizedWriteAcl $cliPath 'Harness CLI' $false
 Assert-NoUnauthorizedWriteAcl $launcherRoot '启动器目录' $true
-Assert-NoUnauthorizedWriteAcl $overlayPath '连接专用 overlay' $false
+Assert-NoUnauthorizedWriteAcl $overlayPath 'Harness overlay' $false
 Assert-NoUnauthorizedWriteAcl $caParent 'CaCertificate 父目录' $true
 Assert-NoUnauthorizedWriteAcl $CaCertificate 'CaCertificate' $false
 
@@ -302,7 +575,21 @@ if ($certificateText -notmatch '-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTI
   throw 'CaCertificate 不是 PEM 证书文件。'
 }
 $certificateText = $null
-$deviceEnvironment = Read-EnrollmentEnvironment $EnvFile
+$deviceEnvironment = Read-HarnessEnvironment $EnvFile $RuntimeMode
+$disclosureStatePath = $null
+$portableCliVersion = @(& $NodePath $cliPath '--version' 2>$null)
+if ($LASTEXITCODE -ne 0 -or $portableCliVersion.Count -ne 1 -or
+  $portableCliVersion[0] -cne [string]$runtimeEvidence.harnessVersion) {
+  throw 'Harness CLI 版本与受保护运行包构建证据不一致。'
+}
+if ($RuntimeMode -eq 'Production') {
+  $disclosureStatePath = Resolve-ExistingDirectory `
+    $deviceEnvironment['DSH_DISCLOSURE_STATE_PATH'] 'DSH_DISCLOSURE_STATE_PATH'
+  Assert-OutsideDirectory $disclosureStatePath $runtimeRoot 'DSH_DISCLOSURE_STATE_PATH'
+  Assert-NoUntrustedNamespaceReplacement $disclosureStatePath 'DSH_DISCLOSURE_STATE_PATH'
+  Assert-PrivateAcl $disclosureStatePath 'DSH_DISCLOSURE_STATE_PATH' $true $true
+  $deviceEnvironment['DSH_DISCLOSURE_STATE_PATH'] = $disclosureStatePath
+}
 $childEnvironment = $null
 try {
   Assert-DeviceCredentialMaterial $NodePath $deviceEnvironment
@@ -391,6 +678,7 @@ Write-Output 'Registry Presence: 未在本启动器中验证，请在注册站�
 Write-Output "PID: $($process.Id)"
 Write-Output "URL: http://127.0.0.1:$Port/"
 Write-Output "DSH_HOME: $DshHome"
+Write-Output "Runtime mode: $RuntimeMode"
 Write-Output "overlay: $overlayPath"
 Write-Output "stdout: $stdoutPath"
 Write-Output "stderr: $stderrPath"
