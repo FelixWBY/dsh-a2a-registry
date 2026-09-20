@@ -12,7 +12,7 @@ import {
   verifyRuntimeConfigurationValue,
 } from '../deploy/registry/verify-public-registry.mjs'
 
-const registryVariables = /^(?:DSH_|REGISTRY_DOMAIN$|REGISTRY_BACKUP_PASSWORD$)/u
+const registryVariables = /^(?:DSH_|DEEPSEEK_API_KEY$|REGISTRY_DOMAIN$|REGISTRY_BACKUP_PASSWORD$)/u
 
 function deploymentEntries(...patches) {
   return composeEntries([
@@ -87,6 +87,7 @@ function harnessEnvironment() {
       `dshb1.${encodedOrganization}.${bindingId}.${Buffer.alloc(32, 10).toString('base64url')}`,
     DSH_REGISTRY_DEVICE_PRIVATE_KEY: generateKeyPairSync('ed25519').privateKey
       .export({ format: 'der', type: 'pkcs8' }).toString('base64url'),
+    DEEPSEEK_API_KEY: 'deepseek-production-key',
   }
 }
 
@@ -202,6 +203,16 @@ test('production Harness preflight pins the disclosure bridge to the exact publi
       /DSH_REGISTRY_DISCLOSURE_BRIDGE_URL must be the exact public HTTPS disclosure bridge URL/u)
   }
 
+  const missingModelCredential = { ...valid }
+  delete missingModelCredential.DEEPSEEK_API_KEY
+  const rejectedMissingCredential = preflight(missingModelCredential, 'harness')
+  assert.equal(rejectedMissingCredential.status, 1)
+  assert.match(rejectedMissingCredential.stderr, /DEEPSEEK_API_KEY is required/u)
+
+  const rejectedShortCredential = preflight({ ...valid, DEEPSEEK_API_KEY: 'too-short' }, 'harness')
+  assert.equal(rejectedShortCredential.status, 1)
+  assert.match(rejectedShortCredential.stderr, /DEEPSEEK_API_KEY must contain at least 16 bytes/u)
+
 })
 
 test('public production status requires the live SaaS tenant-router marker', () => {
@@ -299,6 +310,7 @@ test('Windows Harness runtime preparer declares the static release and ACL gates
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
     'productionRegistryDisclosureImport:',
+    'productionRegistryQuestionConsumer:',
     'registryA2aConsumer:',
     'productionDisclosureAuthority',
     'registryDisclosureKeyPublisher',

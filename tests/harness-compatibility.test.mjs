@@ -215,6 +215,7 @@ test('Harness compatibility checker accepts only the connection-only composed We
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
     'productionRegistryDisclosureImport:',
+    'productionRegistryQuestionConsumer:',
     'registryA2aConsumer:',
     'productionDisclosureAuthority',
     'registryDisclosureKeyPublisher',
@@ -240,15 +241,17 @@ test('publication schema probe enforces the target Harness cross-field compositi
     },
     productionDisclosurePublication: { producer: { maxPublications: 100 } },
     productionRegistryDisclosureImport: {},
+    productionRegistryQuestionConsumer: {},
   }
-  const capacityOnly = (connection, _bridge, publication, disclosureImport) => {
-    const reserved = disclosureImport === undefined ? 2 : 3
+  const capacityOnly = (connection, _bridge, publication, disclosureImport, questionConsumer) => {
+    const reserved = 2 + (disclosureImport === undefined ? 0 : 1)
+      + (questionConsumer === undefined ? 0 : 1)
     if (connection.transport.maxConnections - publication.producer.maxPublications < reserved) {
       throw new Error('insufficient capacity')
     }
   }
-  const strict = (connection, bridge, publication, disclosureImport) => {
-    capacityOnly(connection, bridge, publication, disclosureImport)
+  const strict = (connection, bridge, publication, disclosureImport, questionConsumer) => {
+    capacityOnly(connection, bridge, publication, disclosureImport, questionConsumer)
     const registry = new URL(connection.transport.url)
     registry.protocol = 'https:'
     if (new URL(bridge.url).origin !== registry.origin) throw new Error('foreign authority')
@@ -304,11 +307,43 @@ test('Harness compatibility checker requires the full production publication com
         maxCiphertextBytes: 262144
         maxTrustedKeys: 4
       maxRetainedBytes: 16777216
+    productionRegistryQuestionConsumer:
+      handling: automatic
+      localModel:
+        provider: deepseek-official
+        model: deepseek-flash
+      modelCredentialEnv: DEEPSEEK_API_KEY
+      pollIntervalMs: 1000
+      maxClaims: 10000
+      mailboxLimits:
+        maxTextBytes: 16384
+        maxTextCharacters: 8192
+        maxCiphertextBytes: 32768
+        maxAggregateBytes: 16777216
+        maxRequests: 10000
+        maxRetainedRequests: 100000
+        maxPendingOperations: 256
+        maxLifetimeMs: 604800000
+      contextLimits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+      cryptoLimits:
+        maxPlaintextBytes: 65536
+        maxCiphertextBytes: 262144
+        maxTrustedKeys: 4
+      maxQuestionBytes: 16384
+      maxQuestionCharacters: 8192
+      maxMessageBytes: 8388608
 `
   assert.doesNotThrow(() => { assertPublicationComposition(publication) })
   assert.throws(() => assertPublicationComposition(publication.replace(
     'productionRegistryDisclosureImport:', 'registryDisclosureImport:',
   )), /omitted publication web-runtime field productionRegistryDisclosureImport/u)
+  assert.throws(() => assertPublicationComposition(publication.replace(
+    'productionRegistryQuestionConsumer:', 'registryA2aConsumer:',
+  )), /omitted publication web-runtime field productionRegistryQuestionConsumer/u)
   assert.throws(() => assertPublicationComposition(publication.replace(
     '    productionRegistryConnection:',
     '    a2aDisclosureDecryption: {}\n    productionRegistryConnection:',

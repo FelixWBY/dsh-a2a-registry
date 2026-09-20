@@ -1,7 +1,8 @@
 # Production Harness-to-Registry A2A foundation. The Web app owns the HTTPS
 # authority/key bridge, durable publication runtime, and authenticated WSS
-# import/refresh attachment. The independently enrolled dshb1 credential is
-# used only by the HTTPS bridge; the dsh1 credential remains WSS-only.
+# import/refresh plus automatic text-question attachments. The independently
+# enrolled dshb1 credential is used only by the HTTPS bridge; the dsh1
+# credential remains WSS-only.
 
 - id: web-runtime
   inject:
@@ -64,11 +65,39 @@
         maxCiphertextBytes: 262144
         maxTrustedKeys: 4
       maxRetainedBytes: 16777216
+    productionRegistryQuestionConsumer:
+      handling: automatic
+      localModel:
+        provider: deepseek-official
+        model: deepseek-flash
+      modelCredentialEnv: DEEPSEEK_API_KEY
+      pollIntervalMs: 1000
+      maxClaims: 10000
+      mailboxLimits:
+        maxTextBytes: 16384
+        maxTextCharacters: 8192
+        maxCiphertextBytes: 32768
+        maxAggregateBytes: 16777216
+        maxRequests: 10000
+        maxRetainedRequests: 100000
+        maxPendingOperations: 256
+        maxLifetimeMs: 604800000
+      contextLimits:
+        maxEvents: 100
+        maxEncryptedBytes: 8388608
+        maxTextBytes: 1048576
+        maxDisplayCharacters: 2000
+      cryptoLimits:
+        maxPlaintextBytes: 65536
+        maxCiphertextBytes: 262144
+        maxTrustedKeys: 4
+      maxQuestionBytes: 16384
+      maxQuestionCharacters: 8192
+      maxMessageBytes: 8388608
 
 # Session Controller exposes the local disclosure preview and receives the
-# production publication/refresh services installed by the Web app. Automatic
-# Registry question consumption is intentionally omitted until its production
-# adapter is present in this Harness build.
+# production publication/refresh services and isolated automatic question turns
+# installed by the Web app. The fixed route is text-only and has no tools.
 - id: session-controller
   config:
     disclosurePreview:

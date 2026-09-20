@@ -549,7 +549,8 @@ const connectionOverlaySchemaProbe = (webAppSpecifier, appBootSpecifier) => Stri
 `
 
 /** Exercise the target Web app's cross-field Registry composition contract.
- * @param {(connection: object, bridge: object, publication: object, disclosureImport: object) => void} validate
+ * @param {(connection: object, bridge: object, publication: object, disclosureImport: object,
+ * questionConsumer: object) => void} validate
  * Target Harness composition validator.
  * @param {object} resolvedWeb Fully schema-resolved publication Web config. */
 export function assertPublicationCompositionValidator(validate, resolvedWeb) {
@@ -558,6 +559,7 @@ export function assertPublicationCompositionValidator(validate, resolvedWeb) {
     resolvedWeb.productionDisclosureHttpsBridge,
     resolvedWeb.productionDisclosurePublication,
     resolvedWeb.productionRegistryDisclosureImport,
+    resolvedWeb.productionRegistryQuestionConsumer,
   )
   const rejected = (candidate) => {
     try {
@@ -566,6 +568,7 @@ export function assertPublicationCompositionValidator(validate, resolvedWeb) {
         candidate.productionDisclosureHttpsBridge,
         candidate.productionDisclosurePublication,
         candidate.productionRegistryDisclosureImport,
+        candidate.productionRegistryQuestionConsumer,
       )
       return false
     } catch {
@@ -578,7 +581,7 @@ export function assertPublicationCompositionValidator(validate, resolvedWeb) {
       ...resolvedWeb.productionRegistryConnection,
       transport: {
         ...resolvedWeb.productionRegistryConnection.transport,
-        maxConnections: resolvedWeb.productionDisclosurePublication.producer.maxPublications + 2,
+        maxConnections: resolvedWeb.productionDisclosurePublication.producer.maxPublications + 3,
       },
     },
   }
@@ -619,7 +622,8 @@ export const publicationOverlaySchemaProbe = (webAppSpecifier, sessionController
   const webConfig = web.config
   if (!exactKeys(webConfig, ['openBrowser', 'printUrl', 'surfaceContext', 'trustedHosts',
     'productionRegistryConnection', 'productionDisclosureHttpsBridge',
-    'productionDisclosurePublication', 'productionRegistryDisclosureImport'])
+    'productionDisclosurePublication', 'productionRegistryDisclosureImport',
+    'productionRegistryQuestionConsumer'])
     || !expression(webConfig.openBrowser, 'ctx.webStartup.openBrowser')
     || webConfig.printUrl !== true || webConfig.surfaceContext !== true
     || !expression(webConfig.trustedHosts, 'ctx.webStartup.trustedHosts')) process.exit(3)
@@ -653,6 +657,42 @@ export const publicationOverlaySchemaProbe = (webAppSpecifier, sessionController
       ['maxEvents', 'maxEncryptedBytes', 'maxTextBytes', 'maxDisplayCharacters'])
     || !exactKeys(disclosureImport.cryptoLimits,
       ['maxPlaintextBytes', 'maxCiphertextBytes', 'maxTrustedKeys'])) process.exit(3)
+  const questionConsumer = webConfig.productionRegistryQuestionConsumer
+  if (!exactKeys(questionConsumer, ['handling', 'localModel', 'modelCredentialEnv', 'pollIntervalMs',
+    'maxClaims', 'mailboxLimits', 'contextLimits', 'cryptoLimits', 'maxQuestionBytes',
+    'maxQuestionCharacters', 'maxMessageBytes'])
+    || questionConsumer.handling !== 'automatic'
+    || !exactKeys(questionConsumer.localModel, ['provider', 'model'])
+    || questionConsumer.localModel.provider !== 'deepseek-official'
+    || questionConsumer.localModel.model !== 'deepseek-flash'
+    || questionConsumer.modelCredentialEnv !== 'DEEPSEEK_API_KEY'
+    || questionConsumer.pollIntervalMs !== 1000
+    || questionConsumer.maxClaims !== 10000
+    || !exactKeys(questionConsumer.mailboxLimits, ['maxTextBytes', 'maxTextCharacters',
+      'maxCiphertextBytes', 'maxAggregateBytes', 'maxRequests', 'maxRetainedRequests',
+      'maxPendingOperations', 'maxLifetimeMs'])
+    || questionConsumer.mailboxLimits.maxTextBytes !== 16384
+    || questionConsumer.mailboxLimits.maxTextCharacters !== 8192
+    || questionConsumer.mailboxLimits.maxCiphertextBytes !== 32768
+    || questionConsumer.mailboxLimits.maxAggregateBytes !== 16777216
+    || questionConsumer.mailboxLimits.maxRequests !== 10000
+    || questionConsumer.mailboxLimits.maxRetainedRequests !== 100000
+    || questionConsumer.mailboxLimits.maxPendingOperations !== 256
+    || questionConsumer.mailboxLimits.maxLifetimeMs !== 604800000
+    || !exactKeys(questionConsumer.contextLimits,
+      ['maxEvents', 'maxEncryptedBytes', 'maxTextBytes', 'maxDisplayCharacters'])
+    || questionConsumer.contextLimits.maxEvents !== 100
+    || questionConsumer.contextLimits.maxEncryptedBytes !== 8388608
+    || questionConsumer.contextLimits.maxTextBytes !== 1048576
+    || questionConsumer.contextLimits.maxDisplayCharacters !== 2000
+    || !exactKeys(questionConsumer.cryptoLimits,
+      ['maxPlaintextBytes', 'maxCiphertextBytes', 'maxTrustedKeys'])
+    || questionConsumer.cryptoLimits.maxPlaintextBytes !== 65536
+    || questionConsumer.cryptoLimits.maxCiphertextBytes !== 262144
+    || questionConsumer.cryptoLimits.maxTrustedKeys !== 4
+    || questionConsumer.maxQuestionBytes !== 16384
+    || questionConsumer.maxQuestionCharacters !== 8192
+    || questionConsumer.maxMessageBytes !== 8388608) process.exit(3)
   const resolvedWeb = WebConfigSchema({
     ...webConfig,
     openBrowser: false,
@@ -680,7 +720,11 @@ export const publicationOverlaySchemaProbe = (webAppSpecifier, sessionController
     || resolvedWeb.productionDisclosurePublication?.mode !== 'production'
     || resolvedWeb.productionDisclosurePublication.storageRoot !== resolve('compatibility-disclosure-state')
     || resolvedWeb.productionRegistryDisclosureImport?.pollIntervalMs !== 1000
-    || resolvedWeb.productionRegistryDisclosureImport.maxRetainedBytes !== 16777216) {
+    || resolvedWeb.productionRegistryDisclosureImport.maxRetainedBytes !== 16777216
+    || resolvedWeb.productionRegistryQuestionConsumer?.handling !== 'automatic'
+    || resolvedWeb.productionRegistryQuestionConsumer.localModel.provider !== 'deepseek-official'
+    || resolvedWeb.productionRegistryQuestionConsumer.localModel.model !== 'deepseek-flash'
+    || resolvedWeb.productionRegistryQuestionConsumer.modelCredentialEnv !== 'DEEPSEEK_API_KEY') {
     process.exit(3)
   }
   assertPublicationCompositionValidator(validateProductionRegistryComposition, resolvedWeb)
@@ -759,6 +803,7 @@ export function assertConnectionOnlyComposition(output) {
     'productionDisclosurePublication:',
     'registryDisclosureImport:',
     'productionRegistryDisclosureImport:',
+    'productionRegistryQuestionConsumer:',
     'registryA2aConsumer:',
     'productionDisclosureAuthority',
     'registryDisclosureKeyPublisher',
@@ -773,7 +818,7 @@ export function assertConnectionOnlyComposition(output) {
   }
 }
 
-/** Assert the production template composes connection, publication and import without unsupported consumers. */
+/** Assert the production template composes publication, import and the fixed automatic question consumer. */
 export function assertPublicationComposition(output) {
   const web = compositionSection(output, 'web-runtime')
   const session = compositionSection(output, 'session-controller')
@@ -791,6 +836,7 @@ export function assertPublicationComposition(output) {
     'url: !!js process.env.DSH_REGISTRY_SYNC_URL',
     'productionRegistryDisclosureImport:',
     'maxRetainedBytes: 16777216',
+    'productionRegistryQuestionConsumer:',
   ], 'publication web-runtime')
   const bridge = compositionMapping(web, 'productionDisclosureHttpsBridge')
   requireCompositionMappingFields(bridge, [
@@ -807,6 +853,27 @@ export function assertPublicationComposition(output) {
     'pollIntervalMs: 1000',
     'maxRetainedBytes: 16777216',
   ], 'publication Registry disclosure import')
+  const questionConsumer = compositionMapping(web, 'productionRegistryQuestionConsumer')
+  requireCompositionMappingFields(questionConsumer, [
+    'handling: automatic',
+    'modelCredentialEnv: DEEPSEEK_API_KEY',
+    'pollIntervalMs: 1000',
+    'maxClaims: 10000',
+    'maxQuestionBytes: 16384',
+    'maxQuestionCharacters: 8192',
+    'maxMessageBytes: 8388608',
+  ], 'publication Registry question consumer')
+  const localModel = compositionMapping(questionConsumer, 'localModel', 6)
+  requireCompositionMappingFields(localModel, [
+    'provider: deepseek-official',
+    'model: deepseek-flash',
+  ], 'publication Registry question model', 8)
+  const mailboxLimits = compositionMapping(questionConsumer, 'mailboxLimits', 6)
+  requireCompositionMappingFields(mailboxLimits, [
+    'maxRequests: 10000',
+    'maxRetainedRequests: 100000',
+    'maxPendingOperations: 256',
+  ], 'publication Registry question mailbox', 8)
   requireCompositionFields(session, [
     "name: '@deepseek-ai/dsh-api-session-controller'",
     'disclosurePreview:',
@@ -948,7 +1015,7 @@ async function main(args) {
       '- the explicit target Node.js runtime is version 24 or newer',
       '- Harness source and built codecs accept Registry connection, publication, import, refresh and question lifecycle frames',
       '- Registry accepts Harness source and built connection, publication, import, refresh and question lifecycle frames',
-      '- Harness source and built web/session schemas accept the actual connection-only and publication/import overlays',
+      '- Harness source and built web/session schemas accept the actual connection-only and publication/import/question overlays',
       '- the built Harness CLI composes both overlays inside separate isolated temporary DSH_HOME directories',
       '- declared publication workspace dependencies are resolved from their checked built entries when local pnpm links are stale',
       '- this static gate does not prove a packed install, real device authentication, KMS delivery or model execution',

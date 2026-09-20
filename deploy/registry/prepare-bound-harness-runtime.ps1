@@ -226,7 +226,8 @@ function Assert-ConnectionOnlyComposition([string]$Output) {
   foreach ($forbidden in @(
       'testOnlyDisclosurePublication:', 'productionDisclosureHttpsBridge:',
       'productionDisclosurePublication:', 'registryDisclosureImport:',
-      'productionRegistryDisclosureImport:', 'registryA2aConsumer:',
+      'productionRegistryDisclosureImport:', 'productionRegistryQuestionConsumer:',
+      'registryA2aConsumer:',
       'productionDisclosureAuthority', 'registryDisclosureKeyPublisher',
       'a2aDisclosureDecryption:', 'loopbackDisclosureImport:',
       'loopbackA2aConsumer:', 'loopbackDisclosureRefresh:',

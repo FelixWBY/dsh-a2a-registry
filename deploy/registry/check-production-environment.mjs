@@ -334,6 +334,7 @@ const secrets = [
     ['DSH_REGISTRY_DEVICE_TOKEN', 16],
     ['DSH_REGISTRY_DISCLOSURE_TOKEN', 16],
     ['DSH_REGISTRY_DEVICE_PRIVATE_KEY', 32],
+    ['DEEPSEEK_API_KEY', 16],
   ] : []),
 ]
 for (const [name, minimumBytes] of secrets) required(name, { secret: true, minimumBytes })
