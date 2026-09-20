@@ -273,6 +273,18 @@ export function wireFixtures() {
     frame(13, { type: 'question-transition', receipt: operations.failedReceipt }),
     frame(14, { type: 'question-authorized', delivery: operations.questionDelivery }),
     frame(15, { type: 'question-authorize-released', authorizationRequestId: 14 }),
+    frame(17, { type: 'disclosure-refresh-current', sourceInstanceId: operations.sourceInstanceId,
+      disclosureId: operations.disclosureId, currentCheckpointHash: operations.checkpoint.checkpointHash,
+      currentAuthorizationVersion: operations.readyReceipt.authorizationVersion }),
+    frame(18, { type: 'disclosure-refresh-available', sourceInstanceId: operations.sourceInstanceId,
+      disclosureId: operations.disclosureId, checkpointHash: operations.checkpoint.checkpointHash,
+      authorizationVersion: operations.readyReceipt.authorizationVersion,
+      policyVersion: operations.checkpoint.policyVersion, sourceCursor: operations.checkpoint.sourceCursor,
+      eventCount: operations.checkpoint.eventCount }),
+    frame(19, { type: 'disclosure-refresh-authorized', authorizationRequestId: 19,
+      prefix: operations.importDelivery.prefix, keyGrant: operations.importDelivery.keyGrant,
+      source: operations.importDelivery.source }),
+    frame(20, { type: 'disclosure-refresh-released', authorizationRequestId: 19 }),
   ]
   const serverFrames = serverFrameValues.map(value => {
     try {
@@ -303,6 +315,15 @@ export function wireFixtures() {
       transition: { state: 'failed' } }),
     frame(15, { type: 'question-authorize', binding: operations.binding, expectedVersion: 2 }),
     frame(16, { type: 'question-authorize-release', authorizationRequestId: 15 }),
+    frame(17, { type: 'disclosure-refresh-readiness', sourceInstanceId: operations.sourceInstanceId,
+      disclosureId: operations.disclosureId, currentCheckpointHash: operations.checkpoint.checkpointHash,
+      currentAuthorizationVersion: operations.readyReceipt.authorizationVersion }),
+    frame(18, { type: 'disclosure-refresh-readiness', sourceInstanceId: operations.sourceInstanceId,
+      disclosureId: operations.disclosureId, currentCheckpointHash: `sha256:${'0'.repeat(64)}`,
+      currentAuthorizationVersion: 0 }),
+    frame(19, { type: 'disclosure-refresh-authorize', sourceInstanceId: operations.sourceInstanceId,
+      disclosureId: operations.disclosureId, checkpointHash: operations.checkpoint.checkpointHash }),
+    frame(20, { type: 'disclosure-refresh-release', authorizationRequestId: 19 }),
   ]
   return { serverFrames, clientFrames }
 }
@@ -313,7 +334,7 @@ const codecProbe = specifier => String.raw`
   for await (const chunk of process.stdin) chunks.push(chunk)
   const input = JSON.parse(Buffer.concat(chunks).toString('utf8'))
   const decoded = input.serverFrames.map(frame => decodeRegistryServerFrame(frame, ${MAX_FRAME_BYTES}))
-  if (decoded.length !== 15
+  if (decoded.length !== 19
     || decoded[0].type !== 'challenge'
     || decoded[0].challenge.organizationId !== 'compatibility-organization'
     || decoded[0].challenge.instanceId !== 'compatibility-target'
@@ -353,7 +374,18 @@ const codecProbe = specifier => String.raw`
     || decoded[13].type !== 'question-authorized'
     || decoded[13].delivery.binding.requestId !== 'compatibility-question'
     || decoded[14].type !== 'question-authorize-released'
-    || decoded[14].authorizationRequestId !== 14) process.exit(3)
+    || decoded[14].authorizationRequestId !== 14
+    || decoded[15].type !== 'disclosure-refresh-current'
+    || decoded[15].currentCheckpointHash !== decoded[5].receipt.checkpointHash
+    || decoded[16].type !== 'disclosure-refresh-available'
+    || decoded[16].policyVersion !== 1
+    || decoded[16].sourceCursor !== 1
+    || decoded[16].eventCount !== 1
+    || decoded[17].type !== 'disclosure-refresh-authorized'
+    || decoded[17].authorizationRequestId !== 19
+    || decoded[17].keyGrant.keys.length !== 1
+    || decoded[18].type !== 'disclosure-refresh-released'
+    || decoded[18].authorizationRequestId !== 19) process.exit(3)
   process.stdout.write(JSON.stringify(input.clientFrames.map(frame =>
     encodeRegistryClientFrame(frame, ${MAX_FRAME_BYTES}))))
 `
@@ -368,7 +400,7 @@ function assertClientFrames(encoded) {
     if (error instanceof CompatibilityFailure) throw error
     fail('target codec returned client frames rejected by Registry')
   }
-  if (frames.length !== 16
+  if (frames.length !== 20
     || frames[0]?.type !== 'hello' || frames[0].token !== 'compatibility-noncredential-token'
     || frames[1]?.type !== 'prove'
     || frames[2]?.type !== 'heartbeat' || frames[2].report?.state !== 'online'
@@ -391,7 +423,14 @@ function assertClientFrames(encoded) {
     || frames[13]?.type !== 'question-transition' || frames[13].transition.state !== 'failed'
     || frames[14]?.type !== 'question-authorize'
     || frames[15]?.type !== 'question-authorize-release'
-    || frames[15].authorizationRequestId !== 15) {
+    || frames[15].authorizationRequestId !== 15
+    || frames[16]?.type !== 'disclosure-refresh-readiness'
+    || frames[16].currentCheckpointHash !== frames[18]?.checkpointHash
+    || frames[17]?.type !== 'disclosure-refresh-readiness'
+    || frames[17].currentAuthorizationVersion !== 0
+    || frames[18]?.type !== 'disclosure-refresh-authorize'
+    || frames[19]?.type !== 'disclosure-refresh-release'
+    || frames[19].authorizationRequestId !== 19) {
     fail('target codec changed the complete Registry client frame semantics')
   }
 }
@@ -657,6 +696,7 @@ export function assertPublicationComposition(output) {
     'registryDisclosureImport:',
     'organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID',
     'targetInstanceId: !!js process.env.DSH_INSTANCE_ID',
+    'maxRetainedBytes: 16777216',
     'registryA2aConsumer:',
     'handling: manual',
     'sourceInstanceId: !!js process.env.DSH_INSTANCE_ID',
@@ -788,8 +828,8 @@ async function main(args) {
   process.stdout.write([
     'registry-harness-compatibility: passed',
     '- the explicit target Node.js runtime is version 24 or newer',
-    '- Harness source and built codecs accept Registry connection, publication, import and question lifecycle frames',
-    '- Registry accepts Harness source and built connection, publication, import release and question transition frames',
+    '- Harness source and built codecs accept Registry connection, publication, import, refresh and question lifecycle frames',
+    '- Registry accepts Harness source and built connection, publication, import, refresh and question lifecycle frames',
     '- Harness source and built web/session schemas accept the actual connection-only and publication overlays',
     '- the built Harness CLI composes both overlays inside separate isolated temporary DSH_HOME directories',
     '- this static gate does not prove real device authentication, KMS delivery or model execution',

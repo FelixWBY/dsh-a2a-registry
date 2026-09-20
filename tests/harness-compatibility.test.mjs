@@ -40,6 +40,8 @@ test('Harness compatibility fixtures cover publication, import release and quest
     'question-dispatch', 'question-start',
     'question-transition', 'question-transition', 'question-transition',
     'question-authorized', 'question-authorize-released',
+    'disclosure-refresh-current', 'disclosure-refresh-available',
+    'disclosure-refresh-authorized', 'disclosure-refresh-released',
   ])
   assert.deepEqual([
     server[3].status.receipt.ingest,
@@ -60,6 +62,8 @@ test('Harness compatibility fixtures cover publication, import release and quest
     'question-dispatch', 'question-start',
     'question-transition', 'question-transition', 'question-transition',
     'question-authorize', 'question-authorize-release',
+    'disclosure-refresh-readiness', 'disclosure-refresh-readiness',
+    'disclosure-refresh-authorize', 'disclosure-refresh-release',
   ])
   assert.deepEqual(client.filter(frame => frame.type === 'question-transition')
     .map(frame => frame.transition.state), ['running', 'completed', 'failed'])
@@ -90,6 +94,35 @@ test('Registry Sync import key grants are canonical, unique and fixed-prefix sco
     assert.throws(() => decodeRegistryServerFrame(JSON.stringify(candidate), MAX_FRAME_BYTES),
       /invalid Registry synchronization frame/u)
   }
+})
+
+test('Registry Sync refresh frames are exact and retain real checkpoint cursor metadata', () => {
+  const fixtures = wireFixtures()
+  const available = fixtures.serverFrames.map(frame => decodeRegistryServerFrame(frame, MAX_FRAME_BYTES))
+    .find(frame => frame.type === 'disclosure-refresh-available')
+  assert.ok(available)
+  assert.equal(available.policyVersion, 1)
+  assert.equal(available.sourceCursor, 1)
+  assert.equal(available.eventCount, 1)
+
+  const availableWire = JSON.parse(fixtures.serverFrames.find(frame =>
+    JSON.parse(frame).type === 'disclosure-refresh-available'))
+  for (const mutate of [
+    value => { delete value.policyVersion },
+    value => { value.sourceCursor = '0' },
+    value => { value.eventCount = -1 },
+    value => { value.extra = true },
+  ]) {
+    const candidate = structuredClone(availableWire)
+    mutate(candidate)
+    assert.throws(() => decodeRegistryServerFrame(JSON.stringify(candidate), MAX_FRAME_BYTES),
+      /invalid Registry synchronization frame/u)
+  }
+
+  const readiness = fixtures.clientFrames.find(frame => frame.type === 'disclosure-refresh-readiness')
+  assert.ok(readiness)
+  assert.throws(() => decodeRegistryClientFrame(JSON.stringify({ ...readiness, memberId: 'untrusted' }),
+    MAX_FRAME_BYTES), /invalid Registry synchronization frame/u)
 })
 
 test('Harness compatibility checker accepts only the connection-only composed Web row', () => {
@@ -141,6 +174,7 @@ test('Harness compatibility checker requires the full production publication com
     registryDisclosureImport:
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
       targetInstanceId: !!js process.env.DSH_INSTANCE_ID
+      maxRetainedBytes: 16777216
     registryA2aConsumer:
       handling: manual
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID

@@ -8,7 +8,9 @@ import type { InstanceKeyHistory, InstanceKeyId } from '@deepseek-ai/dsh-a2a-dev
 import type { RegistryConnectionAuthority } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import { RegistryIngestError, type FreshRegistryMetadataAuthority,
   type RegistryConfirmedPrefix } from '@deepseek-ai/dsh-a2a-registry-ingest'
-import type { RegistryImportDelivery, RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
+import type { RegistryDisclosureRefreshAuthorization, RegistryDisclosureRefreshDelivery,
+  RegistryDisclosureRefreshReadiness, RegistryDisclosureRefreshStatus,
+  RegistryImportDelivery, RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
 import { defineDomain, domainTable, type Domain, type DomainFacility, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
@@ -434,6 +436,20 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
         })
       return delivered
     })
+  }
+
+  /** Production session refresh is intentionally available only through the SaaS Registry Sync broker. */
+  refreshReadiness(_target: RegistryConnectionAuthority, _readiness: RegistryDisclosureRefreshReadiness,
+    _signal: AbortSignal): Promise<RegistryDisclosureRefreshStatus> {
+    return Promise.reject(new RegistryIngestError('not-found'))
+  }
+
+  /** The loopback compatibility bridge never receives production WSS refresh authorization. */
+  withRefreshAuthorization(_target: RegistryConnectionAuthority,
+    _authorization: RegistryDisclosureRefreshAuthorization, _authorizationRequestId: number,
+    _receive: (delivery: RegistryDisclosureRefreshDelivery, signal: AbortSignal) => Promise<void>,
+    _signal: AbortSignal): Promise<void> {
+    return Promise.reject(new RegistryIngestError('not-found'))
   }
 
   /** Reauthorize and redeliver one durable queued record with its stable operation identity. */

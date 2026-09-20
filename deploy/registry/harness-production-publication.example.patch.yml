@@ -1,8 +1,8 @@
 # Production Harness-to-Registry A2A foundation. The bundled HTTPS bridge
 # supplies productionDisclosureAuthority and registryDisclosureKeyPublisher
 # through the Registry-owned endpoint and the independently enrolled dshb1
-# credential. A production sessionDisclosureRefresh provider is still required
-# before policy changes can refresh an already-open Session automatically.
+# credential. The Registry import consumer also provides the production
+# sessionDisclosureRefresh implementation over that authenticated WSS channel.
 
 - id: web-runtime
   inject:
@@ -79,6 +79,7 @@
       organizationId: !!js process.env.DSH_REGISTRY_ORGANIZATION_ID
       targetInstanceId: !!js process.env.DSH_INSTANCE_ID
       pollIntervalMs: 1000
+      maxRetainedBytes: 16777216
       limits:
         maxEvents: 100
         maxEncryptedBytes: 8388608

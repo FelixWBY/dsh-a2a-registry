@@ -14,6 +14,7 @@ import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type Disclos
   type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { decodeRegistryClientFrame, encodeRegistryServerFrame, RegistrySyncProtocolError,
   type RegistryClientFrame, type RegistryInstanceReport, type RegistryProducerAccessUpdate,
+  type RegistryDisclosureRefreshDelivery, type RegistryDisclosureRefreshStatus,
   type RegistryImportDelivery, type RegistryProducerRegistration, type RegistryQuestionDelivery,
   type RegistryServerFrame,
   type RegistrySyncErrorCode } from '@deepseek-ai/dsh-a2a-registry-sync'
@@ -36,6 +37,11 @@ class ImportRejected extends Error {
     super(code)
   }
 }
+class RefreshRejected extends Error {
+  constructor(readonly code: RegistrySyncErrorCode, readonly requestId: number, readonly fatal = false) {
+    super(code)
+  }
+}
 type ResourceResponse = Extract<RegistryServerFrame, { type: 'status' | 'event-ack' | 'checkpoint-ack' }>
 type RegistryInboundFrame = Exclude<RegistryClientFrame, { type: 'event' | 'checkpoint' }>
   | Omit<Extract<RegistryClientFrame, { type: 'event' }>, 'envelope'> & { readonly envelope: unknown }
@@ -47,7 +53,10 @@ type QuestionFrame = Extract<RegistryInboundFrame, { type:
 type QuestionReleaseFrame = Extract<RegistryInboundFrame, { type: 'question-authorize-release' }>
 type ImportFrame = Extract<RegistryInboundFrame, { type: 'import-dispatch' }>
 type ImportReleaseFrame = Extract<RegistryInboundFrame, { type: 'import-release' }>
-type ReleaseFrame = QuestionReleaseFrame | ImportReleaseFrame
+type RefreshFrame = Extract<RegistryInboundFrame,
+  { type: 'disclosure-refresh-readiness' | 'disclosure-refresh-authorize' }>
+type RefreshReleaseFrame = Extract<RegistryInboundFrame, { type: 'disclosure-refresh-release' }>
+type ReleaseFrame = QuestionReleaseFrame | ImportReleaseFrame | RefreshReleaseFrame
 type ProducerCommandFrame = Extract<RegistryInboundFrame, { type:
   | 'producer-register' | 'producer-update-access' | 'producer-transition-control' | 'producer-delete' }>
 
@@ -108,6 +117,31 @@ function requireImportDelivery(delivery: RegistryImportDelivery, target: Registr
     || grantScope.conversationId !== delivery.prefix.conversationId
     || grantScope.disclosureId !== checkpoint.disclosureId) {
     throw new RegistryIngestError('invalid-storage')
+  }
+}
+
+/** Reject any broker output that does not match the authenticated target and exact client-selected source prefix. */
+function requireRefreshDelivery(delivery: RegistryDisclosureRefreshDelivery,
+  target: RegistryConnectionAuthority, frame: Extract<RefreshFrame, { type: 'disclosure-refresh-authorize' }>): void {
+  const checkpoint = delivery.prefix.checkpoint
+  const grantScope = delivery.keyGrant.scope
+  if (delivery.authorizationRequestId !== frame.requestId
+    || checkpoint.organizationId !== target.connection.organizationId
+    || checkpoint.organizationId !== target.history.organizationId
+    || checkpoint.instanceId !== frame.sourceInstanceId || checkpoint.disclosureId !== frame.disclosureId
+    || checkpoint.checkpointHash !== frame.checkpointHash
+    || grantScope.organizationId !== checkpoint.organizationId
+    || grantScope.instanceId !== checkpoint.instanceId
+    || grantScope.conversationId !== delivery.prefix.conversationId
+    || grantScope.disclosureId !== checkpoint.disclosureId) throw new RegistrySyncProtocolError()
+}
+
+function requireRefreshStatus(status: RegistryDisclosureRefreshStatus,
+  frame: Extract<RefreshFrame, { type: 'disclosure-refresh-readiness' }>): void {
+  if (status.sourceInstanceId !== frame.sourceInstanceId || status.disclosureId !== frame.disclosureId
+    || status.kind === 'current' && (status.currentCheckpointHash !== frame.currentCheckpointHash
+      || status.currentAuthorizationVersion < frame.currentAuthorizationVersion)) {
+    throw new RegistrySyncProtocolError()
   }
 }
 
@@ -360,6 +394,13 @@ export class RegistrySyncConnection {
         else this.resetIdle()
         return
       }
+      if (error instanceof RefreshRejected) {
+        try { await this.send({ protocolVersion: 1, requestId: error.requestId, type: 'error', code: error.code }) }
+        catch { this.stop(); return }
+        if (error.fatal) this.stop()
+        else this.resetIdle()
+        return
+      }
       const code: RegistrySyncErrorCode = error instanceof RegistryIngestError ? error.code
         : error instanceof RegistrySyncProtocolError ? 'protocol' : error instanceof Unauthorized ? 'unauthorized'
           : error instanceof Busy ? 'busy' : 'storage-unavailable'
@@ -409,7 +450,9 @@ export class RegistrySyncConnection {
       ? frame.disclosureId
       : frame.type === 'question-start' || frame.type === 'question-renew' || frame.type === 'question-status'
         || frame.type === 'question-transition' || frame.type === 'question-authorize'
-        ? frame.binding.disclosureId : undefined
+        ? frame.binding.disclosureId
+        : frame.type === 'disclosure-refresh-readiness' || frame.type === 'disclosure-refresh-authorize'
+          ? frame.disclosureId : undefined
     if (!this.admission.admitRequest(authority.identity, disclosureId, bytes)) {
       throw new Busy()
     }
@@ -426,7 +469,8 @@ export class RegistrySyncConnection {
         this.recordHeartbeat?.(observedAt, frame.report)
         return
       }
-      if (frame.type === 'question-authorize-release' || frame.type === 'import-release') {
+      if (frame.type === 'question-authorize-release' || frame.type === 'import-release'
+        || frame.type === 'disclosure-refresh-release') {
         throw new RegistrySyncProtocolError()
       }
       if (frame.type === 'question-dispatch' || frame.type === 'question-start' || frame.type === 'question-renew'
@@ -437,6 +481,10 @@ export class RegistrySyncConnection {
       }
       if (frame.type === 'import-dispatch') {
         await this.handleImport(frame, checked)
+        return
+      }
+      if (frame.type === 'disclosure-refresh-readiness' || frame.type === 'disclosure-refresh-authorize') {
+        await this.handleRefresh(frame, checked)
         return
       }
       if (producerCommand) {
@@ -650,6 +698,63 @@ export class RegistrySyncConnection {
     }
   }
 
+  private async handleRefresh(frame: RefreshFrame,
+    checked: () => Promise<RegistryConnectionAuthority>): Promise<void> {
+    const broker: RegistryImportBroker | undefined = this.ctx.get('registryImportBroker', false)
+    if (broker === undefined) throw new RefreshRejected('not-found', frame.requestId)
+    const base = { protocolVersion: 1 as const, requestId: frame.requestId }
+    let release: RefreshReleaseFrame | undefined
+    let authorizedSent = false
+    try {
+      await this.verifyReceiver(checked)
+      const target = await checked()
+      this.disclosures.add(frame.disclosureId)
+      if (frame.type === 'disclosure-refresh-readiness') {
+        const status = await broker.refreshReadiness(target, frame, this.abort.signal)
+        requireRefreshStatus(status, frame)
+        await checked()
+        await this.send(status.kind === 'current'
+          ? { ...base, type: 'disclosure-refresh-current', sourceInstanceId: status.sourceInstanceId,
+            disclosureId: status.disclosureId, currentCheckpointHash: status.currentCheckpointHash,
+            currentAuthorizationVersion: status.currentAuthorizationVersion }
+          : { ...base, type: 'disclosure-refresh-available', sourceInstanceId: status.sourceInstanceId,
+            disclosureId: status.disclosureId, checkpointHash: status.checkpointHash,
+            authorizationVersion: status.authorizationVersion, policyVersion: status.policyVersion,
+            sourceCursor: status.sourceCursor, eventCount: status.eventCount })
+        this.resetIdle()
+        return
+      }
+      await broker.withRefreshAuthorization(target, frame, frame.requestId, async (delivery, authorizationSignal) => {
+        requireRefreshDelivery(delivery, target, frame)
+        const waiting = this.waitForRefreshRelease(frame.requestId, authorizationSignal)
+        try {
+          await this.send({ ...base, type: 'disclosure-refresh-authorized', ...delivery })
+          authorizedSent = true
+        }
+        catch (error) {
+          this.stop()
+          await waiting.catch(() => undefined)
+          throw error
+        }
+        release = await waiting
+      }, this.abort.signal)
+      if (release === undefined) throw new RegistrySyncProtocolError()
+      await checked()
+      await this.send({ protocolVersion: 1, requestId: release.requestId,
+        type: 'disclosure-refresh-released', authorizationRequestId: frame.requestId })
+      this.resetIdle()
+    } catch (error) {
+      const code = error instanceof RegistryIngestError ? error.code
+        : error instanceof Unauthorized ? 'unauthorized' : error instanceof RegistrySyncProtocolError
+          ? 'protocol' : 'storage-unavailable'
+      const businessRejection = !authorizedSent && release === undefined && error instanceof RegistryIngestError
+        && (error.code === 'not-found' || error.code === 'invalid-input' || error.code === 'conflict'
+          || error.code === 'gap' || error.code === 'frozen' || error.code === 'limit'
+          || error.code === 'version-conflict' || error.code === 'invalid-transition')
+      throw new RefreshRejected(code, release?.requestId ?? frame.requestId, !businessRejection)
+    }
+  }
+
   private waitForQuestionRelease(authorizationRequestId: number,
     signal: AbortSignal = this.abort.signal): Promise<QuestionReleaseFrame> {
     if (this.release !== undefined || signal.aborted) return Promise.reject(new RegistrySyncProtocolError())
@@ -686,6 +791,26 @@ export class RegistrySyncConnection {
       this.release = { type: 'import-release', authorizationRequestId, settle }
       this.abort.signal.addEventListener('abort', abort, { once: true })
       if (this.abort.signal.aborted) abort()
+    })
+  }
+
+  private waitForRefreshRelease(authorizationRequestId: number,
+    signal: AbortSignal): Promise<RefreshReleaseFrame> {
+    if (this.release !== undefined || signal.aborted) return Promise.reject(new RegistrySyncProtocolError())
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const settle = (frame: ReleaseFrame | undefined): void => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', abort)
+        if (this.release?.settle === settle) this.release = undefined
+        if (frame === undefined || frame.type !== 'disclosure-refresh-release') reject(new Unauthorized())
+        else resolve(frame)
+      }
+      const abort = (): void => { settle(undefined) }
+      this.release = { type: 'disclosure-refresh-release', authorizationRequestId, settle }
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
     })
   }
 

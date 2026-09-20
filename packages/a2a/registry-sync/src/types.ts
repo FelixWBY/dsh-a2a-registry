@@ -85,6 +85,46 @@ export interface RegistryImportDelivery {
   }
 }
 
+/** Client-observed imported prefix used only to compare against the current authorized source prefix. */
+export interface RegistryDisclosureRefreshReadiness {
+  readonly sourceInstanceId: DshInstanceId
+  readonly disclosureId: DisclosureId
+  readonly currentCheckpointHash: DisclosureHash
+  readonly currentAuthorizationVersion: number
+}
+
+/** Latest source prefix identity returned without encrypted event bodies or key material. */
+export type RegistryDisclosureRefreshStatus =
+  | (RegistryDisclosureRefreshReadiness & { readonly kind: 'current' })
+  | {
+    readonly kind: 'available'
+    readonly sourceInstanceId: DshInstanceId
+    readonly disclosureId: DisclosureId
+    readonly checkpointHash: DisclosureHash
+    readonly authorizationVersion: number
+    readonly policyVersion: number
+    readonly sourceCursor: number
+    readonly eventCount: number
+  }
+
+/** One exact checkpoint selected by the client after a refresh-availability response. */
+export interface RegistryDisclosureRefreshAuthorization {
+  readonly sourceInstanceId: DshInstanceId
+  readonly disclosureId: DisclosureId
+  readonly checkpointHash: DisclosureHash
+}
+
+/** Detached refresh payload; Registry reauthorizes it again before acknowledging release. */
+export interface RegistryDisclosureRefreshDelivery {
+  readonly authorizationRequestId: number
+  readonly prefix: RegistryConfirmedPrefix
+  readonly keyGrant: RegistryImportKeyGrant
+  readonly source: {
+    readonly instanceName: string
+    readonly conversationTitle: string
+  }
+}
+
 /** Target result returned while Registry authorization for one import is still held. */
 export type RegistryImportOutcome =
   | { readonly status: 'completed'; readonly sessionId: string }
@@ -151,6 +191,9 @@ export type RegistryClientFrame = Frame & (
   | { readonly type: 'question-authorize-release'; readonly authorizationRequestId: number }
   | { readonly type: 'import-dispatch' }
   | { readonly type: 'import-release'; readonly authorizationRequestId: number; readonly outcome: RegistryImportOutcome }
+  | ({ readonly type: 'disclosure-refresh-readiness' } & RegistryDisclosureRefreshReadiness)
+  | ({ readonly type: 'disclosure-refresh-authorize' } & RegistryDisclosureRefreshAuthorization)
+  | { readonly type: 'disclosure-refresh-release'; readonly authorizationRequestId: number }
 )
 
 /** Fixed content-free failure categories; provider diagnostics never cross the connection. */
@@ -182,5 +225,11 @@ export type RegistryServerFrame = Frame & (
   | { readonly type: 'question-authorize-released'; readonly authorizationRequestId: number }
   | { readonly type: 'import-dispatch'; readonly delivery: RegistryImportDelivery | null }
   | { readonly type: 'import-released'; readonly authorizationRequestId: number }
+  | (Omit<Extract<RegistryDisclosureRefreshStatus, { kind: 'current' }>, 'kind'>
+    & { readonly type: 'disclosure-refresh-current' })
+  | (Omit<Extract<RegistryDisclosureRefreshStatus, { kind: 'available' }>, 'kind'>
+    & { readonly type: 'disclosure-refresh-available' })
+  | ({ readonly type: 'disclosure-refresh-authorized' } & RegistryDisclosureRefreshDelivery)
+  | { readonly type: 'disclosure-refresh-released'; readonly authorizationRequestId: number }
   | { readonly type: 'error'; readonly code: RegistrySyncErrorCode }
 )

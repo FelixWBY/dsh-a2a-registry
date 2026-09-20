@@ -1,6 +1,8 @@
 /** Authenticated target-side delivery of Registry-owned durable context imports. */
 import type { RegistryConnectionAuthority } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import type { RegistryImportDelivery, RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
+import type { RegistryDisclosureRefreshAuthorization, RegistryDisclosureRefreshDelivery,
+  RegistryDisclosureRefreshReadiness, RegistryDisclosureRefreshStatus,
+  RegistryImportDelivery, RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
 
 /** Private target-side Broker surface. The caller holds device authority through the delivery callback. */
 export interface RegistryImportBroker {
@@ -12,6 +14,14 @@ export interface RegistryImportBroker {
   dispatch(target: RegistryConnectionAuthority,
     receive: (delivery: RegistryImportDelivery) => Promise<RegistryImportOutcome>,
     signal: AbortSignal): Promise<boolean>
+  /** Compare a target's imported prefix with the latest prefix still authorized through its completed import. */
+  refreshReadiness(target: RegistryConnectionAuthority, readiness: RegistryDisclosureRefreshReadiness,
+    signal: AbortSignal): Promise<RegistryDisclosureRefreshStatus>
+  /** Build one bounded refresh, wait for WSS release, then reauthorize the exact prefix before returning. */
+  withRefreshAuthorization(target: RegistryConnectionAuthority,
+    authorization: RegistryDisclosureRefreshAuthorization, authorizationRequestId: number,
+    receive: (delivery: RegistryDisclosureRefreshDelivery, signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal): Promise<void>
 }
 
 declare module '@deepseek-ai/cordis' {

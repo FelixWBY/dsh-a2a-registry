@@ -135,6 +135,21 @@ async function closeSocket(socket) {
   })
 }
 
+function waitForSocketClose(socket, timeoutMs = 2_000) {
+  if (socket.readyState === WebSocket.CLOSED) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off('close', closed)
+      reject(new Error('WebSocket did not close within the refresh timeout'))
+    }, timeoutMs)
+    const closed = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    socket.once('close', closed)
+  })
+}
+
 function runtimeConfig(organizationId, memberId) {
   return {
     organizationId,
@@ -168,7 +183,7 @@ function runtimeConfig(organizationId, memberId) {
       maxDeliveryBytes: 8 * 1024,
       maxGrantBytes: 4 * 1024,
       maxTrustedKeys: 2,
-      deliveryTimeoutMs: TIMEOUT_MS,
+      deliveryTimeoutMs: 500,
     },
     questions: {
       mailboxKeyEnv: 'TEST_REGISTRY_MAILBOX_KEY',
@@ -272,9 +287,31 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
     const keyMaterial = Buffer.alloc(32, 0x6b)
     const keyReads = []
     let keyMode = 'valid'
+    let runtimeA
+    let requireUnlockedGrant = false
+    let unlockedGrantProbes = 0
+    let grantHook
     const keyProvider = {
       async issueAuthorizedGrant(scope, maxKeys, maxBytes, signal) {
         signal.throwIfAborted()
+        if (requireUnlockedGrant) {
+          let timer
+          try {
+            await Promise.race([
+              runtimeA.store.run(async () => {}),
+              new Promise((_resolve, reject) => {
+                timer = setTimeout(() => { reject(new Error('KMS ran while the ingest owner was locked')) }, 100)
+              }),
+            ])
+            unlockedGrantProbes += 1
+          } finally { clearTimeout(timer) }
+        }
+        if (grantHook !== undefined) {
+          const hook = grantHook
+          grantHook = undefined
+          await hook()
+          signal.throwIfAborted()
+        }
         keyReads.push({ scope: structuredClone(scope), maxKeys, maxBytes })
         if (keyMode === 'empty') return { version: 1, scope, keys: [] }
         const count = keyMode === 'over-limit' ? maxKeys + 1 : 1
@@ -289,7 +326,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
         }
       },
     }
-    let runtimeA = await openRegistryTenantRuntime(ctx, runtimeConfig(organizationA, memberA), {
+    runtimeA = await openRegistryTenantRuntime(ctx, runtimeConfig(organizationA, memberA), {
       storage: { domainName: 'saas_device_auth_a', tenantId: organizationA },
       keyProvider,
     })
@@ -677,6 +714,11 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       connection: { organizationId, instanceId, keyId: keyPair.keyId, now: Date.now() },
       history: { organizationId, instanceId, status: 'active', keys: [] },
     })
+    const freshProducerAuthority = () => ({
+      connection: { organizationId: organizationA, instanceId: ticket.challenge.instanceId,
+        keyId: keyPair.keyId, now: Date.now() },
+      history,
+    })
     assert.equal(await importRouter.dispatch(receiverAuthority(organizationB, ticket.challenge.instanceId),
       rejectMisroute, importSignal), false)
     assert.equal(await importRouter.dispatch(receiverAuthority(organizationA, 'different-target-instance'),
@@ -854,6 +896,7 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       })
 
       const importInput = { targetInstanceId: ticket.challenge.instanceId, idempotencyKey: 'tenant-a-import-1' }
+      requireUnlockedGrant = true
       queuedImport = await runtimeA.imports.importDisclosure(restoredSelection(), importInput, importSignal)
       sessionId = `a2a-import-${createHash('sha256')
         .update(`${ticket.challenge.instanceId}\0${queuedImport.operationId}`, 'utf8').digest('hex')}`
@@ -882,12 +925,199 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       })
       assert.equal(released.type, 'import-released')
       assert.equal(released.authorizationRequestId, 10)
+
+      const refreshCurrent = await exchange(receiverSocket, 12, {
+        type: 'disclosure-refresh-readiness', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      })
+      assert.deepEqual(refreshCurrent, {
+        protocolVersion: 1, requestId: 12, type: 'disclosure-refresh-current',
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      })
+      const refreshAvailable = await exchange(receiverSocket, 13, {
+        type: 'disclosure-refresh-readiness', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, currentCheckpointHash: `sha256:${'0'.repeat(64)}`,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      })
+      assert.deepEqual(refreshAvailable, {
+        protocolVersion: 1, requestId: 13, type: 'disclosure-refresh-available',
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        checkpointHash: checkpoint.checkpointHash, authorizationVersion: prefix.authorizationVersion,
+        policyVersion: checkpoint.policyVersion, sourceCursor: checkpoint.sourceCursor,
+        eventCount: checkpoint.eventCount,
+      })
+      const refreshAuthorized = await exchange(receiverSocket, 14, {
+        type: 'disclosure-refresh-authorize', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, checkpointHash: checkpoint.checkpointHash,
+      })
+      assert.equal(refreshAuthorized.type, 'disclosure-refresh-authorized')
+      assert.equal(refreshAuthorized.authorizationRequestId, 14)
+      assert.deepEqual(refreshAuthorized.prefix, prefix)
+      assert.deepEqual(refreshAuthorized.keyGrant, dispatched.delivery.keyGrant)
+      assert.deepEqual(refreshAuthorized.source, dispatched.delivery.source)
+      const refreshReleased = await exchange(receiverSocket, 15, {
+        type: 'disclosure-refresh-release', authorizationRequestId: 14,
+      })
+      assert.deepEqual(refreshReleased, {
+        protocolVersion: 1, requestId: 15, type: 'disclosure-refresh-released', authorizationRequestId: 14,
+      })
+      const timedRefresh = await exchange(receiverSocket, 16, {
+        type: 'disclosure-refresh-authorize', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, checkpointHash: checkpoint.checkpointHash,
+      })
+      assert.equal(timedRefresh.type, 'disclosure-refresh-authorized')
+      await waitForSocketClose(receiverSocket)
     } finally {
       await closeSocket(receiverSocket)
     }
     const completedImport = await runtimeA.imports.readImport(restoredSelection(), queuedImport.operationId,
       importSignal)
     assert.deepEqual(completedImport, { operationId: queuedImport.operationId, status: 'completed', sessionId })
+
+    const rejectedRefreshSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    try {
+      const rejectedRefresh = await exchange(rejectedRefreshSocket, 4, {
+        type: 'disclosure-refresh-authorize', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, checkpointHash: `sha256:${'0'.repeat(64)}`,
+      })
+      assert.deepEqual(rejectedRefresh, {
+        protocolVersion: 1, requestId: 4, type: 'error', code: 'not-found',
+      })
+      assert.equal((await exchange(rejectedRefreshSocket, 5, { type: 'heartbeat' })).type, 'heartbeat-ack')
+    } finally {
+      await closeSocket(rejectedRefreshSocket)
+    }
+
+    const disconnectSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    const disconnectRefresh = await exchange(disconnectSocket, 4, {
+      type: 'disclosure-refresh-authorize', sourceInstanceId: ticket.challenge.instanceId,
+      disclosureId, checkpointHash: checkpoint.checkpointHash,
+    })
+    assert.equal(disconnectRefresh.type, 'disclosure-refresh-authorized')
+    await closeSocket(disconnectSocket)
+    requireUnlockedGrant = false
+    assert.ok(unlockedGrantProbes >= 4)
+    assert.deepEqual(await runtimeA.imports.refreshReadiness(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      }, importSignal), {
+      kind: 'current', sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+      currentCheckpointHash: checkpoint.checkpointHash,
+      currentAuthorizationVersion: prefix.authorizationVersion,
+    })
+
+    const accessSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    try {
+      const updated = await exchange(accessSocket, 4, {
+        type: 'producer-update-access', disclosureId, expectedAuthorizationVersion: prefix.authorizationVersion,
+        update: {
+          targets: [{ kind: 'member', memberId: memberA }, { kind: 'member', memberId: memberB }],
+          expiresAt: expiresAt + 1,
+        },
+      })
+      assert.equal(updated.type, 'producer-update-access-ack')
+      assert.equal(updated.status.kind, 'live')
+      assert.equal(updated.status.receipt.authorizationVersion, prefix.authorizationVersion + 1)
+    } finally {
+      await closeSocket(accessSocket)
+    }
+    assert.deepEqual(await runtimeA.imports.refreshReadiness(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      }, importSignal), {
+      kind: 'current', sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+      currentCheckpointHash: checkpoint.checkpointHash,
+      currentAuthorizationVersion: prefix.authorizationVersion + 1,
+    })
+    await assert.rejects(runtimeA.imports.refreshReadiness(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion + 2,
+      }, importSignal), error => error?.code === 'conflict')
+    assert.deepEqual(await runtimeA.imports.refreshReadiness(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: `sha256:${'0'.repeat(64)}`,
+        currentAuthorizationVersion: prefix.authorizationVersion,
+      }, importSignal), {
+      kind: 'available', sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+      checkpointHash: checkpoint.checkpointHash, authorizationVersion: prefix.authorizationVersion + 1,
+      policyVersion: checkpoint.policyVersion, sourceCursor: checkpoint.sourceCursor,
+      eventCount: checkpoint.eventCount,
+    })
+
+    const disclosureAccess = (members, selectedExpiresAt) => ({
+      expiresAt: selectedExpiresAt,
+      capabilities: ['conversation.read', 'branch.create'],
+      grants: members.map(memberId => ({ target: { kind: 'member', memberId }, state: 'active',
+        capabilities: ['conversation.read', 'branch.create'], expiresAt: selectedExpiresAt })),
+    })
+    grantHook = () => runtimeA.control.updateAccess(
+      freshProducerAuthority, disclosureId,
+      disclosureAccess([memberB], expiresAt + 2), prefix.authorizationVersion + 1)
+    let deliveredAfterRevocation = false
+    await assert.rejects(runtimeA.imports.withRefreshAuthorization(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        checkpointHash: checkpoint.checkpointHash,
+      }, 90, async () => { deliveredAfterRevocation = true }, importSignal),
+    error => error?.code === 'not-found')
+    assert.equal(deliveredAfterRevocation, false)
+    const restoredBeforeDelivery = await runtimeA.control.updateAccess(
+      freshProducerAuthority, disclosureId,
+      disclosureAccess([memberA, memberB], expiresAt + 3), prefix.authorizationVersion + 2)
+    assert.equal(restoredBeforeDelivery.authorizationVersion, prefix.authorizationVersion + 3)
+
+    const revokedRefreshSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    const producerAccessSocket = await openAuthenticatedSocket(url, token, keyPair, expectedIdentity)
+    try {
+      const pendingRefresh = await exchange(revokedRefreshSocket, 4, {
+        type: 'disclosure-refresh-authorize', sourceInstanceId: ticket.challenge.instanceId,
+        disclosureId, checkpointHash: checkpoint.checkpointHash,
+      })
+      assert.equal(pendingRefresh.type, 'disclosure-refresh-authorized')
+      const revokedAccess = await exchange(producerAccessSocket, 4, {
+        type: 'producer-update-access', disclosureId,
+        expectedAuthorizationVersion: prefix.authorizationVersion + 3,
+        update: { targets: [{ kind: 'member', memberId: memberB }], expiresAt: expiresAt + 4 },
+      })
+      assert.equal(revokedAccess.type, 'producer-update-access-ack')
+      assert.equal(revokedAccess.status.kind, 'live')
+      assert.equal(revokedAccess.status.receipt.authorizationVersion, prefix.authorizationVersion + 4)
+      await waitForSocketClose(revokedRefreshSocket)
+      const restoredAccess = await exchange(producerAccessSocket, 5, {
+        type: 'producer-update-access', disclosureId,
+        expectedAuthorizationVersion: prefix.authorizationVersion + 4,
+        update: {
+          targets: [{ kind: 'member', memberId: memberA }, { kind: 'member', memberId: memberB }],
+          expiresAt: expiresAt + 5,
+        },
+      })
+      assert.equal(restoredAccess.type, 'producer-update-access-ack')
+      assert.equal(restoredAccess.status.kind, 'live')
+      assert.equal(restoredAccess.status.receipt.authorizationVersion, prefix.authorizationVersion + 5)
+    } finally {
+      await closeSocket(revokedRefreshSocket)
+      await closeSocket(producerAccessSocket)
+    }
+    assert.deepEqual(await runtimeA.imports.refreshReadiness(
+      receiverAuthority(organizationA, ticket.challenge.instanceId), {
+        sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+        currentCheckpointHash: checkpoint.checkpointHash,
+        currentAuthorizationVersion: prefix.authorizationVersion + 1,
+      }, importSignal), {
+      kind: 'current', sourceInstanceId: ticket.challenge.instanceId, disclosureId,
+      currentCheckpointHash: checkpoint.checkpointHash,
+      currentAuthorizationVersion: prefix.authorizationVersion + 5,
+    })
     assert.deepEqual(await runtimeA.imports.importDisclosure(restoredSelection(), {
       targetInstanceId: ticket.challenge.instanceId, idempotencyKey: 'tenant-a-import-1',
     }, importSignal),

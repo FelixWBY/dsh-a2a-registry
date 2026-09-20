@@ -9,6 +9,7 @@ import type { RegistryCheckpointReceipt, RegistryConfirmedPrefix, RegistryIngest
   RegistryProducerSyncStatus } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { MailboxBinding, MailboxReceipt, MailboxTransition } from '@deepseek-ai/dsh-a2a-mailbox'
 import type { RegistryClientFrame, RegistryImportDelivery, RegistryImportKeyGrant, RegistryImportOutcome, RegistryInstanceReport,
+  RegistryDisclosureRefreshAuthorization, RegistryDisclosureRefreshDelivery, RegistryDisclosureRefreshReadiness,
   RegistryProducerAccessUpdate, RegistryProducerRegistration, RegistryProducerTarget, RegistryQuestionDelivery,
   RegistryServerFrame, RegistrySyncErrorCode } from './types.ts'
 
@@ -308,6 +309,40 @@ function importOutcome(input: unknown): RegistryImportOutcome {
   return { status, sessionId: opaqueIdentifier(value.sessionId) }
 }
 
+function refreshReadiness(input: Record<string, unknown>): RegistryDisclosureRefreshReadiness {
+  return {
+    sourceInstanceId: brandString<RegistryDisclosureRefreshReadiness['sourceInstanceId']>(
+      opaqueIdentifier(input.sourceInstanceId)),
+    disclosureId: identifier(input.disclosureId),
+    currentCheckpointHash: hash(input.currentCheckpointHash),
+    currentAuthorizationVersion: integer(input.currentAuthorizationVersion, 0),
+  }
+}
+
+function refreshAuthorization(input: Record<string, unknown>): RegistryDisclosureRefreshAuthorization {
+  return {
+    sourceInstanceId: brandString<RegistryDisclosureRefreshAuthorization['sourceInstanceId']>(
+      opaqueIdentifier(input.sourceInstanceId)),
+    disclosureId: identifier(input.disclosureId),
+    checkpointHash: hash(input.checkpointHash),
+  }
+}
+
+function refreshDelivery(input: Record<string, unknown>): RegistryDisclosureRefreshDelivery {
+  const prefix = confirmedPrefix(input.prefix)
+  const keyGrant = decodeRegistryImportKeyGrant(input.keyGrant, {
+    organizationId: prefix.checkpoint.organizationId,
+    instanceId: prefix.checkpoint.instanceId,
+    conversationId: prefix.conversationId,
+    disclosureId: prefix.checkpoint.disclosureId,
+  }, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+  const source = exact(input.source, ['instanceName', 'conversationTitle'])
+  return {
+    authorizationRequestId: integer(input.authorizationRequestId, 1), prefix, keyGrant,
+    source: { instanceName: displayText(source.instanceName), conversationTitle: displayText(source.conversationTitle) },
+  }
+}
+
 function excludedRequestIds(input: unknown): readonly MailboxBinding['requestId'][] {
   requireFrame(Array.isArray(input))
   const ids = input.map(value => brandString<MailboxBinding['requestId']>(opaqueIdentifier(value)))
@@ -400,6 +435,16 @@ function client(input: unknown): RegistryClientFrame {
       exact(value, ['protocolVersion', 'requestId', 'type', 'authorizationRequestId', 'outcome'])
       return { ...header, type: value.type, authorizationRequestId: integer(value.authorizationRequestId, 1),
         outcome: importOutcome(value.outcome) }
+    case 'disclosure-refresh-readiness':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'sourceInstanceId', 'disclosureId',
+        'currentCheckpointHash', 'currentAuthorizationVersion'])
+      return { ...header, type: value.type, ...refreshReadiness(value) }
+    case 'disclosure-refresh-authorize':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'sourceInstanceId', 'disclosureId', 'checkpointHash'])
+      return { ...header, type: value.type, ...refreshAuthorization(value) }
+    case 'disclosure-refresh-release':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'authorizationRequestId'])
+      return { ...header, type: value.type, authorizationRequestId: integer(value.authorizationRequestId, 1) }
     default: throw new RegistrySyncProtocolError()
   }
 }
@@ -470,6 +515,25 @@ function server(input: unknown): RegistryServerFrame {
       exact(value, ['protocolVersion', 'requestId', 'type', 'delivery'])
       return { ...header, type: value.type,
         delivery: value.delivery === null ? null : importDelivery(value.delivery) }
+    case 'disclosure-refresh-current':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'sourceInstanceId', 'disclosureId',
+        'currentCheckpointHash', 'currentAuthorizationVersion'])
+      return { ...header, type: value.type, ...refreshReadiness(value) }
+    case 'disclosure-refresh-available':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'sourceInstanceId', 'disclosureId',
+        'checkpointHash', 'authorizationVersion', 'policyVersion', 'sourceCursor', 'eventCount'])
+      return { ...header, type: value.type,
+        sourceInstanceId: brandString<Extract<RegistryServerFrame,
+          { type: 'disclosure-refresh-available' }>['sourceInstanceId']>(opaqueIdentifier(value.sourceInstanceId)),
+        disclosureId: identifier(value.disclosureId), checkpointHash: hash(value.checkpointHash),
+        authorizationVersion: integer(value.authorizationVersion, 0), policyVersion: integer(value.policyVersion, 1),
+        sourceCursor: integer(value.sourceCursor, 0), eventCount: integer(value.eventCount, 0) }
+    case 'disclosure-refresh-authorized':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'authorizationRequestId', 'prefix', 'keyGrant', 'source'])
+      return { ...header, type: value.type, ...refreshDelivery(value) }
+    case 'disclosure-refresh-released':
+      exact(value, ['protocolVersion', 'requestId', 'type', 'authorizationRequestId'])
+      return { ...header, type: value.type, authorizationRequestId: integer(value.authorizationRequestId, 1) }
     case 'error':
       exact(value, ['protocolVersion', 'requestId', 'type', 'code'])
       requireFrame(errors.includes(value.code as RegistrySyncErrorCode))

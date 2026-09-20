@@ -1,19 +1,22 @@
 /** Tenant-owned durable context-import queue delivered only to authenticated Registry Sync receivers. */
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { RegistryConnectionAuthority } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { DisclosureHash, DisclosureId, DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { DisclosureDataKeyGrantScope } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
 import { RegistryIngestError, type FreshRegistryMetadataAuthority,
   type RegistryIngestStorageScope } from '@deepseek-ai/dsh-a2a-registry-ingest'
-import { decodeRegistryImportKeyGrant, type RegistryImportDelivery, type RegistryImportKeyGrant,
+import { decodeRegistryImportKeyGrant, type RegistryDisclosureRefreshAuthorization,
+  type RegistryDisclosureRefreshDelivery, type RegistryDisclosureRefreshReadiness,
+  type RegistryDisclosureRefreshStatus, type RegistryImportDelivery, type RegistryImportKeyGrant,
   type RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { defineDomain, domainTable, type Domain, type DomainFacility, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import type { RegistryImportBroker } from './import-broker.ts'
 import type { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
-import type { RegistryDisclosureReader } from './reader.ts'
+import type { RegistryAuthorizedPrefixSnapshot, RegistryDisclosureReader } from './reader.ts'
 import type { RegistryRuntimeStore } from './runtime-store.ts'
 import type { RegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
 import type { RegistryDisclosureImportResult, RegistryDisclosureOperations,
@@ -232,6 +235,103 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
     })
   }
 
+  /** Compare one already imported session with the latest prefix still authorized for its retained owner. */
+  refreshReadiness(target: RegistryConnectionAuthority, readiness: RegistryDisclosureRefreshReadiness,
+    signal: AbortSignal): Promise<RegistryDisclosureRefreshStatus> {
+    return this.run(async () => {
+      signal.throwIfAborted()
+      const record = this.completedImport(target, readiness.sourceInstanceId, readiness.disclosureId)
+      const access = this.refreshAccess(record, target, signal)
+      const metadata = await this.reader.readMetadata(access.authority,
+        brandString<DisclosureId>(record.disclosureId), 'import', {
+          maxResponseBytes: this.config.maxAuthorizationResponseBytes,
+        })
+      if (metadata.organizationId !== record.organizationId || metadata.instanceId !== record.sourceInstanceId
+        || metadata.disclosureId !== record.disclosureId) throw new RegistryIngestError('invalid-storage')
+      return this.reader.withAuthorizedPrefix(access.authority, brandString<DisclosureId>(record.disclosureId),
+        brandString<DshInstanceId>(record.sourceInstanceId), 'import', metadata.checkpoint.checkpointHash,
+        this.config.maxAuthorizationResponseBytes, access.receive, async (snapshot) => {
+          if (snapshot === null || snapshot.metadata.organizationId !== record.organizationId
+            || snapshot.metadata.instanceId !== record.sourceInstanceId
+            || snapshot.metadata.disclosureId !== record.disclosureId
+            || snapshot.metadata.checkpoint.checkpointHash !== metadata.checkpoint.checkpointHash
+            || snapshot.metadata.authorizationVersion !== metadata.authorizationVersion
+            || snapshot.prefix.authorizationVersion !== metadata.authorizationVersion) {
+            throw new RegistryIngestError('not-found')
+          }
+          if (readiness.currentAuthorizationVersion > metadata.authorizationVersion) {
+            throw new RegistryIngestError('conflict')
+          }
+          if (readiness.currentCheckpointHash === metadata.checkpoint.checkpointHash) {
+            return { kind: 'current', sourceInstanceId: readiness.sourceInstanceId,
+              disclosureId: readiness.disclosureId, currentCheckpointHash: metadata.checkpoint.checkpointHash,
+              currentAuthorizationVersion: metadata.authorizationVersion }
+          }
+          return { kind: 'available', sourceInstanceId: readiness.sourceInstanceId,
+            disclosureId: readiness.disclosureId, checkpointHash: metadata.checkpoint.checkpointHash,
+            authorizationVersion: metadata.authorizationVersion, policyVersion: metadata.checkpoint.policyVersion,
+            sourceCursor: metadata.checkpoint.sourceCursor, eventCount: metadata.checkpoint.eventCount }
+        })
+    })
+  }
+
+  /** Deliver one detached refresh and require the same authorization and target binding again at release. */
+  withRefreshAuthorization(target: RegistryConnectionAuthority,
+    authorization: RegistryDisclosureRefreshAuthorization, authorizationRequestId: number,
+    receive: (delivery: RegistryDisclosureRefreshDelivery, signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal): Promise<void> {
+    return this.run(async () => {
+      signal.throwIfAborted()
+      const record = this.completedImport(target, authorization.sourceInstanceId, authorization.disclosureId)
+      const timeout = new AbortController()
+      const timer = setTimeout(() => { timeout.abort() }, this.config.deliveryTimeoutMs)
+      const operationSignal = AbortSignal.any([signal, this.abort.signal, timeout.signal])
+      try {
+        const access = this.refreshAccess(record, target, operationSignal)
+        const detached = await this.reader.withAuthorizedPrefix(access.authority,
+          brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
+          'import', authorization.checkpointHash, this.config.maxAuthorizationResponseBytes, access.receive,
+          async (snapshot) => this.detachedSnapshot(record, authorization.checkpointHash, snapshot))
+        const scope: DisclosureDataKeyGrantScope = Object.freeze({
+          organizationId: detached.prefix.checkpoint.organizationId,
+          instanceId: detached.prefix.checkpoint.instanceId,
+          conversationId: detached.prefix.conversationId,
+          disclosureId: detached.prefix.checkpoint.disclosureId,
+        })
+        const issued = await this.keyProvider.issueAuthorizedGrant(scope,
+          this.config.maxTrustedKeys, this.config.maxGrantBytes, operationSignal)
+        operationSignal.throwIfAborted()
+        const keyGrant = decodeRegistryImportKeyGrant(issued, scope,
+          this.config.maxTrustedKeys, this.config.maxGrantBytes)
+        const delivery = {
+          authorizationRequestId,
+          prefix: detached.prefix,
+          keyGrant,
+          source: { instanceName: record.sourceInstanceId,
+            conversationTitle: String(detached.prefix.conversationId) },
+        } satisfies RegistryDisclosureRefreshDelivery
+        if (byteLength(keyGrant) > this.config.maxGrantBytes
+          || byteLength(delivery) > this.config.maxDeliveryBytes) throw new RegistryIngestError('limit')
+        const beforeSend = this.refreshAccess(record, target, operationSignal)
+        await this.reader.withAuthorizedPrefix(beforeSend.authority,
+          brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
+          'import', authorization.checkpointHash, this.config.maxAuthorizationResponseBytes, beforeSend.receive,
+          async (snapshot) => { this.requireSameSnapshot(record, detached, snapshot) })
+        operationSignal.throwIfAborted()
+        await receive(delivery, operationSignal)
+        operationSignal.throwIfAborted()
+        this.requireTarget(target)
+        const refreshedAccess = this.refreshAccess(record, target, operationSignal)
+        await this.reader.withAuthorizedPrefix(refreshedAccess.authority,
+          brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
+          'import', authorization.checkpointHash, this.config.maxAuthorizationResponseBytes, refreshedAccess.receive,
+          async (snapshot) => { this.requireSameSnapshot(record, detached, snapshot) })
+      } finally {
+        clearTimeout(timer)
+      }
+    })
+  }
+
   /** Deliver the oldest queued item for one authenticated receiver; retry and disconnect retain it unchanged. */
   dispatch(target: RegistryConnectionAuthority,
     receive: (delivery: RegistryImportDelivery) => Promise<RegistryImportOutcome>,
@@ -261,71 +361,73 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
         return { subject, now: Date.now() }
       }, instanceId: brandString<DshInstanceId>(record.targetInstanceId),
       maxResponseBytes: this.config.maxAuthorizationResponseBytes }
-      const selected = await this.reader.withAuthorizedPrefix(authority,
-        brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
-        'import', brandString<DisclosureHash>(record.checkpointHash), this.config.maxAuthorizationResponseBytes,
-        receiveRequirement, async (snapshot) => {
-          if (snapshot === null || snapshot.metadata.organizationId !== record.organizationId
-            || snapshot.metadata.instanceId !== record.sourceInstanceId
-            || snapshot.metadata.disclosureId !== record.disclosureId
-            || snapshot.metadata.checkpoint.checkpointHash !== record.checkpointHash
-            || snapshot.prefix.authorizationVersion < record.authorizationVersion) {
-            await this.fail(record)
-            return null
-          }
-          const scope: DisclosureDataKeyGrantScope = Object.freeze({
-            organizationId: snapshot.prefix.checkpoint.organizationId,
-            instanceId: snapshot.prefix.checkpoint.instanceId,
-            conversationId: snapshot.prefix.conversationId,
-            disclosureId: snapshot.prefix.checkpoint.disclosureId,
-          })
-          let keyGrant: RegistryImportKeyGrant
-          try {
-            const issued = await this.keyProvider.issueAuthorizedGrant(scope,
-              this.config.maxTrustedKeys, this.config.maxGrantBytes, signal)
-            signal.throwIfAborted()
-            keyGrant = decodeRegistryImportKeyGrant(issued, scope,
-              this.config.maxTrustedKeys, this.config.maxGrantBytes)
-          } catch {
-            signal.throwIfAborted()
-            await this.fail(record)
-            return null
-          }
-          if (byteLength(keyGrant) > this.config.maxGrantBytes) {
-            await this.fail(record)
-            return null
-          }
-          const delivery = {
-            operationId: record.operationId,
-            targetInstanceId: brandString<DshInstanceId>(record.targetInstanceId),
-            organizationId: this.organizationId,
-            disclosureId: brandString<DisclosureId>(record.disclosureId),
-            sourceInstanceId: brandString<DshInstanceId>(record.sourceInstanceId),
-            checkpointHash: brandString<DisclosureHash>(record.checkpointHash),
-            prefix: snapshot.prefix,
-            keyGrant,
-            source: { instanceName: record.sourceInstanceId,
-              conversationTitle: String(snapshot.prefix.conversationId) },
-          } satisfies RegistryImportDelivery
-          if (byteLength(delivery) > this.config.maxDeliveryBytes) {
-            await this.fail(record)
-            return null
-          }
-          return delivery
-        })
-      if (selected === null) return false
+      const checkpointHash = brandString<DisclosureHash>(record.checkpointHash)
+      let detached: RegistryAuthorizedPrefixSnapshot
+      try {
+        detached = await this.reader.withAuthorizedPrefix(authority,
+          brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
+          'import', checkpointHash, this.config.maxAuthorizationResponseBytes, receiveRequirement,
+          async (snapshot) => this.detachedSnapshot(record, checkpointHash, snapshot))
+      } catch (error) {
+        signal.throwIfAborted()
+        if (!(error instanceof RegistryIngestError)) throw error
+        await this.fail(record)
+        return false
+      }
+      const scope: DisclosureDataKeyGrantScope = Object.freeze({
+        organizationId: detached.prefix.checkpoint.organizationId,
+        instanceId: detached.prefix.checkpoint.instanceId,
+        conversationId: detached.prefix.conversationId,
+        disclosureId: detached.prefix.checkpoint.disclosureId,
+      })
+      let keyGrant: RegistryImportKeyGrant
+      try {
+        const issued = await this.keyProvider.issueAuthorizedGrant(scope,
+          this.config.maxTrustedKeys, this.config.maxGrantBytes, signal)
+        signal.throwIfAborted()
+        keyGrant = decodeRegistryImportKeyGrant(issued, scope,
+          this.config.maxTrustedKeys, this.config.maxGrantBytes)
+      } catch {
+        signal.throwIfAborted()
+        await this.fail(record)
+        return false
+      }
+      const selected = {
+        operationId: record.operationId,
+        targetInstanceId: brandString<DshInstanceId>(record.targetInstanceId),
+        organizationId: this.organizationId,
+        disclosureId: brandString<DisclosureId>(record.disclosureId),
+        sourceInstanceId: brandString<DshInstanceId>(record.sourceInstanceId),
+        checkpointHash,
+        prefix: detached.prefix,
+        keyGrant,
+        source: { instanceName: record.sourceInstanceId,
+          conversationTitle: String(detached.prefix.conversationId) },
+      } satisfies RegistryImportDelivery
+      if (byteLength(keyGrant) > this.config.maxGrantBytes
+        || byteLength(selected) > this.config.maxDeliveryBytes) {
+        await this.fail(record)
+        return false
+      }
+      try {
+        await this.reader.withAuthorizedPrefix(authority,
+          brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
+          'import', checkpointHash, this.config.maxAuthorizationResponseBytes, receiveRequirement,
+          async (snapshot) => { this.requireSameSnapshot(record, detached, snapshot) })
+      } catch (error) {
+        signal.throwIfAborted()
+        if (!(error instanceof RegistryIngestError)) throw error
+        await this.fail(record)
+        return false
+      }
       const outcome = await this.receive(receive, selected, signal)
       signal.throwIfAborted()
       this.requireTarget(target)
       await this.reader.withAuthorizedPrefix(authority,
         brandString<DisclosureId>(record.disclosureId), brandString<DshInstanceId>(record.sourceInstanceId),
-        'import', brandString<DisclosureHash>(record.checkpointHash), this.config.maxAuthorizationResponseBytes,
+        'import', checkpointHash, this.config.maxAuthorizationResponseBytes,
         receiveRequirement, async (snapshot) => {
-          if (snapshot === null || snapshot.metadata.organizationId !== record.organizationId
-            || snapshot.metadata.instanceId !== record.sourceInstanceId
-            || snapshot.metadata.disclosureId !== record.disclosureId
-            || snapshot.metadata.checkpoint.checkpointHash !== record.checkpointHash
-            || snapshot.prefix.authorizationVersion < record.authorizationVersion) {
+          try { this.requireSameSnapshot(record, detached, snapshot) } catch {
             await this.fail(record)
             return
           }
@@ -360,6 +462,64 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
       || target.history.organizationId !== this.organizationId
       || target.connection.instanceId !== target.history.instanceId
       || target.history.status !== 'active') throw new RegistryIngestError('not-found')
+  }
+
+  private completedImport(target: RegistryConnectionAuthority, sourceInstanceId: DshInstanceId,
+    disclosureId: DisclosureId): Extract<ImportRecord, { status: 'completed' }> {
+    this.requireTarget(target)
+    const record = [...this.table.entries()].map(([, candidate]) => candidate)
+      .filter((candidate): candidate is Extract<ImportRecord, { status: 'completed' }> =>
+        candidate.status === 'completed' && candidate.targetInstanceId === target.connection.instanceId
+        && candidate.sourceInstanceId === sourceInstanceId && candidate.disclosureId === disclosureId)
+      .sort((left, right) => right.updatedAt - left.updatedAt
+        || right.operationId.localeCompare(left.operationId))[0]
+    if (record === undefined) throw new RegistryIngestError('not-found')
+    return record
+  }
+
+  private refreshAccess(record: Extract<ImportRecord, { status: 'completed' }>,
+    target: RegistryConnectionAuthority, signal: AbortSignal) {
+    const subject = { authenticated: true as const, organizationId: this.organizationId,
+      memberId: brandString<MemberId>(record.memberId), membership: 'active' as const,
+      role: 'member' as const, currentTeamIds: [] }
+    const authority: FreshRegistryMetadataAuthority = () => {
+      signal.throwIfAborted()
+      this.requireTarget(target)
+      return { subject, now: Date.now(), historyFor: () => null }
+    }
+    return { authority, receive: { authority: () => {
+      signal.throwIfAborted()
+      this.requireTarget(target)
+      return { subject, now: Date.now() }
+    }, instanceId: brandString<DshInstanceId>(record.targetInstanceId),
+    maxResponseBytes: this.config.maxAuthorizationResponseBytes } }
+  }
+
+  private detachedSnapshot(record: ImportRecord, checkpointHash: DisclosureHash,
+    snapshot: RegistryAuthorizedPrefixSnapshot | null): RegistryAuthorizedPrefixSnapshot {
+    if (snapshot === null || snapshot.metadata.organizationId !== record.organizationId
+      || snapshot.metadata.instanceId !== record.sourceInstanceId
+      || snapshot.metadata.disclosureId !== record.disclosureId
+      || snapshot.metadata.checkpoint.checkpointHash !== checkpointHash
+      || snapshot.metadata.authorizationVersion < record.authorizationVersion
+      || snapshot.prefix.authorizationVersion !== snapshot.metadata.authorizationVersion
+      || snapshot.prefix.checkpoint.organizationId !== record.organizationId
+      || snapshot.prefix.checkpoint.instanceId !== record.sourceInstanceId
+      || snapshot.prefix.checkpoint.disclosureId !== record.disclosureId
+      || snapshot.prefix.checkpoint.checkpointHash !== checkpointHash) {
+      throw new RegistryIngestError('not-found')
+    }
+    let detached: RegistryAuthorizedPrefixSnapshot
+    try { detached = structuredClone(snapshot) } catch { throw new RegistryIngestError('invalid-storage') }
+    if (byteLength(detached.metadata) > this.config.maxAuthorizationResponseBytes
+      || byteLength(detached.prefix) > this.config.maxDeliveryBytes) throw new RegistryIngestError('limit')
+    return detached
+  }
+
+  private requireSameSnapshot(record: ImportRecord, expected: RegistryAuthorizedPrefixSnapshot,
+    snapshot: RegistryAuthorizedPrefixSnapshot | null): void {
+    const current = this.detachedSnapshot(record, expected.metadata.checkpoint.checkpointHash, snapshot)
+    if (!isDeepStrictEqual(current, expected)) throw new RegistryIngestError('not-found')
   }
 
   private run<T>(operation: () => Promise<T>): Promise<T> {
@@ -427,6 +587,20 @@ export class RegistrySaasImportRouter implements RegistryDisclosureOperations, R
     receive: (delivery: RegistryImportDelivery) => Promise<RegistryImportOutcome>, signal: AbortSignal) {
     return this.withQueue(target.connection.organizationId,
       queue => queue.dispatch(target, receive, signal))
+  }
+
+  refreshReadiness(target: RegistryConnectionAuthority, readiness: RegistryDisclosureRefreshReadiness,
+    signal: AbortSignal) {
+    return this.withQueue(target.connection.organizationId,
+      queue => queue.refreshReadiness(target, readiness, signal))
+  }
+
+  withRefreshAuthorization(target: RegistryConnectionAuthority,
+    authorization: RegistryDisclosureRefreshAuthorization, authorizationRequestId: number,
+    receive: (delivery: RegistryDisclosureRefreshDelivery, signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal) {
+    return this.withQueue(target.connection.organizationId,
+      queue => queue.withRefreshAuthorization(target, authorization, authorizationRequestId, receive, signal))
   }
 
   private async withQueue<T>(organizationId: OrganizationId,
