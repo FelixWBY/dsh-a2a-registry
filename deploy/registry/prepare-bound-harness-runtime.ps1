@@ -351,7 +351,7 @@ $resolvedTarballDirectories = @($TarballDirectory | ForEach-Object {
 })
 if ($resolvedTarballDirectories.Count -ne 3 -or
   (@($resolvedTarballDirectories | Sort-Object -Unique)).Count -ne 3) {
-  throw 'TarballDirectory 必须各提供一次 dsh、vendor 和 Landlock 三个发布目录。'
+  throw 'TarballDirectory 必须各提供一次 dsh、vendor 和 system native 三个发布目录。'
 }
 $sourceGroups = @()
 foreach ($directory in $resolvedTarballDirectories) {
@@ -440,6 +440,7 @@ try {
   $dependencies = [ordered]@{}
   $expectedDeepseekVersions = @{}
   $packageEvidence = @()
+  $packageManifests = @()
   $groupPackages = @{}
   foreach ($group in $protectedGroups) {
     $names = @()
@@ -460,6 +461,7 @@ try {
       }
       $dependencies[$manifest.name] = "file:$relativeTarball"
       $expectedDeepseekVersions[$manifest.name] = $manifest.version
+      $packageManifests += $manifest
       $tarballHash = (Get-FileHash -LiteralPath $tarball.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
       $packageEvidence += [ordered]@{
         name = $manifest.name
@@ -477,6 +479,33 @@ try {
     }
   }
 
+  $approvedRegistryDeepseekVersions = @{}
+  $requiredRegistryDeepseekVersions = @{}
+  foreach ($manifest in $packageManifests) {
+    foreach ($dependencyKind in @('dependencies', 'optionalDependencies')) {
+      $dependencyProperty = $manifest.PSObject.Properties[$dependencyKind]
+      if ($null -eq $dependencyProperty -or $null -eq $dependencyProperty.Value) { continue }
+      foreach ($dependency in $dependencyProperty.Value.PSObject.Properties) {
+        if ($dependency.Name -notmatch '^@deepseek-ai/[a-z0-9._-]+$' -or
+          $dependencies.Contains($dependency.Name)) {
+          continue
+        }
+        $version = [string]$dependency.Value
+        if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+          throw "受保护输入声明的外部 DeepSeek 依赖必须固定精确版本：$($dependency.Name)"
+        }
+        if ($approvedRegistryDeepseekVersions.ContainsKey($dependency.Name) -and
+          [string]$approvedRegistryDeepseekVersions[$dependency.Name] -cne $version) {
+          throw "受保护输入对外部 DeepSeek 依赖声明了冲突版本：$($dependency.Name)"
+        }
+        $approvedRegistryDeepseekVersions[$dependency.Name] = $version
+        if ($dependencyKind -eq 'dependencies') {
+          $requiredRegistryDeepseekVersions[$dependency.Name] = $version
+        }
+      }
+    }
+  }
+
   $dshGroups = @($protectedGroups | Where-Object {
     $groupPackages[$_.Index] -contains '@deepseek-ai/dsh'
   })
@@ -484,19 +513,23 @@ try {
     $groupPackages[$_.Index] -contains '@deepseek-ai/cordis' -and
     $groupPackages[$_.Index] -contains '@deepseek-ai/schemastery'
   })
-  $landlockGroups = @($protectedGroups | Where-Object {
-    $groupPackages[$_.Index] -contains '@deepseek-ai/node-addon-landlock-run'
+  $nativeSystemGroups = @($protectedGroups | Where-Object {
+    $groupPackages[$_.Index] -contains '@deepseek-ai/node-addon-system'
   })
-  if ($dshGroups.Count -ne 1 -or $vendorGroups.Count -ne 1 -or $landlockGroups.Count -ne 1) {
-    throw 'tarball 输入无法唯一识别 dsh、vendor 和 Landlock 发布族。'
+  if ($dshGroups.Count -ne 1 -or $vendorGroups.Count -ne 1 -or $nativeSystemGroups.Count -ne 1) {
+    throw 'tarball 输入无法唯一识别 dsh、vendor 和 system native 发布族。'
   }
-  $roleIndices = @($dshGroups[0].Index, $vendorGroups[0].Index, $landlockGroups[0].Index)
+  $roleIndices = @($dshGroups[0].Index, $vendorGroups[0].Index, $nativeSystemGroups[0].Index)
   if (@($roleIndices | Sort-Object -Unique).Count -ne 3) {
-    throw 'tarball 输入无法唯一识别 dsh、vendor 和 Landlock 发布族。'
+    throw 'tarball 输入无法唯一识别 dsh、vendor 和 system native 发布族。'
   }
+  $nativeSystemPackages = @($groupPackages[$nativeSystemGroups[0].Index])
   if ($null -eq $dshGroups[0].OrderPath -or $null -eq $vendorGroups[0].OrderPath -or
-    $null -ne $landlockGroups[0].OrderPath -or $landlockGroups[0].Files.Count -ne 1) {
-    throw '发布目录的 publish-order.txt 或 Landlock 单包边界无效。'
+    $null -eq $nativeSystemGroups[0].OrderPath -or
+    @($nativeSystemPackages | Where-Object {
+      $_ -notmatch '^@deepseek-ai/node-addon-system(?:-[a-z0-9._-]+)?$'
+    }).Count -ne 0) {
+    throw '发布目录的 publish-order.txt 或 system native 包边界无效。'
   }
   $dshVersion = @($packageEvidence | Where-Object { $_.name -eq '@deepseek-ai/dsh' })[0].version
   $dshFamilyVersions = @($packageEvidence | Where-Object {
@@ -565,14 +598,19 @@ try {
     $normalized = ([string]$entryPath).Replace('\', '/')
     if ($normalized.Length -eq 0) { continue }
     $entry = $lock.packages[$entryPath]
-    if ($normalized -match '^node_modules/(@deepseek-ai/[^/]+)$' -and
-      $expectedDeepseekVersions.ContainsKey($Matches[1])) {
+    if ($normalized -match '^node_modules/(@deepseek-ai/[^/]+)$') {
       $packageName = $Matches[1]
-      if ([string]$entry.version -cne [string]$expectedDeepseekVersions[$packageName] -or
-        [string]$entry.resolved -cne [string]$dependencies[$packageName]) {
-        throw "lockfile 未精确绑定受保护输入包：$packageName"
+      if ($expectedDeepseekVersions.ContainsKey($packageName)) {
+        if ([string]$entry.version -cne [string]$expectedDeepseekVersions[$packageName] -or
+          [string]$entry.resolved -cne [string]$dependencies[$packageName]) {
+          throw "lockfile 未精确绑定受保护输入包：$packageName"
+        }
+        continue
       }
-      continue
+      if ($approvedRegistryDeepseekVersions.ContainsKey($packageName) -and
+        [string]$entry.version -cne [string]$approvedRegistryDeepseekVersions[$packageName]) {
+        throw "lockfile 未精确绑定受保护输入声明的外部 DeepSeek 依赖：$packageName"
+      }
     }
     if ($entry.ContainsKey('inBundle') -and $entry.inBundle -eq $true) { continue }
     if (-not $entry.ContainsKey('resolved') -or $entry.resolved -isnot [string] -or
@@ -594,11 +632,13 @@ try {
   foreach ($entryPath in $lock.packages.Keys) {
     $normalized = ([string]$entryPath).Replace('\', '/')
     if ($normalized -match '(?:^|/)node_modules/(@deepseek-ai/[^/]+)$') {
+      $packageName = $Matches[1]
       $installedEntryManifest = Join-Path $harnessRoot.FullName (
         $normalized.Replace('/', '\') + '\package.json')
       if ((Test-Path -LiteralPath $installedEntryManifest -PathType Leaf) -and
-        -not $dependencies.Contains($Matches[1])) {
-        throw "安装闭包混入未由输入 tarball 提供的 DeepSeek 包：$($Matches[1])"
+        -not $dependencies.Contains($packageName) -and
+        -not $approvedRegistryDeepseekVersions.ContainsKey($packageName)) {
+        throw "安装闭包混入未由输入 tarball 声明的 DeepSeek 包：$packageName"
       }
     }
   }
@@ -618,9 +658,16 @@ try {
       throw "已安装 DeepSeek 包清单无效：$relativeManifest"
     }
     $expectedName = "@deepseek-ai/$($Matches[1])"
+    $expectedVersion = if ($expectedDeepseekVersions.ContainsKey($expectedName)) {
+      [string]$expectedDeepseekVersions[$expectedName]
+    } elseif ($approvedRegistryDeepseekVersions.ContainsKey($expectedName)) {
+      [string]$approvedRegistryDeepseekVersions[$expectedName]
+    } else {
+      $null
+    }
     if ([string]$installedManifest.name -cne $expectedName -or
-      -not $expectedDeepseekVersions.ContainsKey($expectedName) -or
-      [string]$installedManifest.version -cne [string]$expectedDeepseekVersions[$expectedName]) {
+      $null -eq $expectedVersion -or
+      [string]$installedManifest.version -cne $expectedVersion) {
       throw "实际安装的 DeepSeek 包不属于受保护输入闭包：$relativeManifest"
     }
     $lockEntry = $relativeManifest.Substring(0, $relativeManifest.Length - '/package.json'.Length)
@@ -636,6 +683,11 @@ try {
     Resolve-ExistingFile $installedManifest "已安装包 $packageName" | Out-Null
     if (-not $installedDeepseekVersions.ContainsKey($packageName)) {
       throw "受保护输入包未出现在实际安装闭包：$packageName"
+    }
+  }
+  foreach ($packageName in $requiredRegistryDeepseekVersions.Keys) {
+    if (-not $installedDeepseekVersions.ContainsKey($packageName)) {
+      throw "受保护输入声明的必要外部 DeepSeek 依赖未出现在实际安装闭包：$packageName"
     }
   }
 
@@ -738,6 +790,13 @@ try {
     credentialInputs = 'external-at-launch'
     createdAt = [DateTime]::UtcNow.ToString('o')
     packages = $packageEvidence
+    registryDeepseekDependencies = @($approvedRegistryDeepseekVersions.Keys | Sort-Object | ForEach-Object {
+      [ordered]@{
+        name = $_
+        version = $approvedRegistryDeepseekVersions[$_]
+        required = $requiredRegistryDeepseekVersions.ContainsKey($_)
+      }
+    })
   }
   [IO.File]::WriteAllText($evidencePath, (($evidence | ConvertTo-Json -Depth 6) + "`n"),
     [Text.UTF8Encoding]::new($false))

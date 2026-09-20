@@ -167,17 +167,17 @@ test('Windows prepares one physical production runtime from reviewed release gro
     join(trustedNodeRoot, 'node_modules', 'npm'), { recursive: true })
 
   const sources = join(root, 'sources')
-  const outputs = [join(root, 'dsh'), join(root, 'vendor'), join(root, 'landlock')]
+  const outputs = [join(root, 'dsh'), join(root, 'vendor'), join(root, 'system-native')]
   for (const path of [sources, ...outputs]) mkdirSync(path)
   createPackage(join(sources, 'dsh'), '@deepseek-ai/dsh', '0.1.2-rc.1', true)
   createPackage(join(sources, 'cordis'), '@deepseek-ai/cordis', '4.0.2')
   createPackage(join(sources, 'schemastery'), '@deepseek-ai/schemastery', '3.18.2')
-  createPackage(join(sources, 'landlock'), '@deepseek-ai/node-addon-landlock-run', '0.1.1')
+  createPackage(join(sources, 'system-native'), '@deepseek-ai/node-addon-system', '0.1.2')
   packPackage(join(sources, 'dsh'), outputs[0])
   packPackage(join(sources, 'cordis'), outputs[1])
   packPackage(join(sources, 'schemastery'), outputs[1])
-  packPackage(join(sources, 'landlock'), outputs[2])
-  for (const output of outputs.slice(0, 2)) {
+  packPackage(join(sources, 'system-native'), outputs[2])
+  for (const output of outputs) {
     writeFileSync(join(output, 'publish-order.txt'),
       `${readdirSync(output).filter(name => name.endsWith('.tgz')).sort().join('\n')}\n`)
   }
@@ -208,6 +208,7 @@ test('Windows prepares one physical production runtime from reviewed release gro
   assert.equal(evidence.credentialInputs, 'external-at-launch')
   assert.equal(evidence.runtimeMode, 'Production')
   assert.deepEqual(evidence.validatedModes, ['ConnectionOnly', 'Production'])
+  assert.deepEqual(evidence.registryDeepseekDependencies, [])
   const aclResult = run('pwsh.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
     '@($env:RUNTIME_HARNESS,$env:RUNTIME_NODE,$env:RUNTIME_LAUNCHER) | '
