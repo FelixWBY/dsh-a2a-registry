@@ -42,6 +42,10 @@ export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, Regist
   RegistryBillingOrderState, RegistryBillingPlan, RegistryBillingProviderName, RegistryBillingVerifiedEvent,
   RegistryBillingWebhookHeaders, RegistryBillingWebhookInput } from './billing.ts'
 export { RegistryDisclosureContentProvider } from './disclosure-content-provider.ts'
+export { projectRegistryDisclosureContent,
+  RegistryDisclosureContentProjectionError } from './disclosure-content-projection.ts'
+export type { RegistryDisclosureContentProjectionLimits,
+  RegistryDisclosureDataKeyResolver } from './disclosure-content-projection.ts'
 export { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 export type { RegistryDisclosureKeyProtection, RegistryDisclosureKeyReceipt } from './disclosure-key-provider.ts'
 export {

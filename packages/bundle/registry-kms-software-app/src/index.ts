@@ -116,9 +116,9 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
   }
 
   readDataKeys(scope: DisclosureDataKeyGrantScope,
-    signal: AbortSignal): Promise<readonly DisclosureDataKey[]> {
+    maxKeys: number, signal: AbortSignal): Promise<readonly DisclosureDataKey[]> {
     return this.withStore(scope.organizationId, signal,
-      store => store.readDataKeys(scope, signal))
+      store => store.readDataKeys(scope, maxKeys, signal))
   }
 
   checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],

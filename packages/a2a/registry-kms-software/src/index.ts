@@ -359,16 +359,22 @@ export class SoftwareLocalDisclosureKeyStore {
     })
   }
 
-  /** Return all authenticated current/historical keys for one exact disclosure scope. */
-  readDataKeys(scope: DisclosureDataKeyGrantScope, signal: AbortSignal): Promise<readonly DisclosureDataKey[]> {
+  /** Return a bounded set of authenticated current/historical keys for one exact disclosure scope. */
+  readDataKeys(scope: DisclosureDataKeyGrantScope, maxKeys: number,
+    signal: AbortSignal): Promise<readonly DisclosureDataKey[]> {
     const captured = parseScope(scope)
+    const maximum = positiveInteger(maxKeys)
     requireKms(captured.organizationId === this.organizationId, 'scope-mismatch')
     return this.run(signal, () => {
-      const records = [...this.domain.table('data_keys').entries()]
-        .map(([, record]) => record)
-        .filter(record => sameScope(record.scope, captured))
-        .sort((left, right) => left.keyId.localeCompare(right.keyId))
+      const records: DataKeyRecord[] = []
+      for (const [, record] of this.domain.table('data_keys').entries()) {
+        if (!sameScope(record.scope, captured)) continue
+        // Establish the exact-scope bound before authenticating or materializing any DEK.
+        requireKms(records.length < maximum, 'limit')
+        records.push(record)
+      }
       requireKms(records.length > 0, 'not-found')
+      records.sort((left, right) => left.keyId.localeCompare(right.keyId))
       return Object.freeze(records.map((record): DisclosureDataKey => {
         const material = unwrapKey(this.requireOrganizationKey(), record.wrappedDataKey, dataKeyAad(record))
         try {

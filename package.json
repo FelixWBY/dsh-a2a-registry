@@ -15,7 +15,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "node --import tsx/esm src/dsh.ts --profile registry",
-    "test": "node --import tsx/esm --test tests/smoke.test.mjs tests/saas-device-auth.test.mjs tests/oidc-session-introspection.test.mjs tests/production-oidc.test.mjs tests/verify-registry-restore.test.mjs tests/backup-postgres-saas-state.test.mjs tests/production-deployment.test.mjs tests/production-graph.test.mjs tests/tenancy-policy-fingerprint.test.mjs tests/readiness.test.mjs tests/billing-order-store.test.mjs tests/billing-webhook.test.mjs tests/disclosure-content-provider.test.mjs tests/software-local-kms.test.mjs tests/software-local-kms-provider.test.mjs tests/production-disclosure-bridge.test.mjs tests/harness-compatibility.test.mjs tests/windows-enrollment-path-gate.test.mjs",
+    "test": "node --import tsx/esm --test tests/smoke.test.mjs tests/saas-device-auth.test.mjs tests/oidc-session-introspection.test.mjs tests/production-oidc.test.mjs tests/verify-registry-restore.test.mjs tests/backup-postgres-saas-state.test.mjs tests/production-deployment.test.mjs tests/production-graph.test.mjs tests/tenancy-policy-fingerprint.test.mjs tests/readiness.test.mjs tests/billing-order-store.test.mjs tests/billing-webhook.test.mjs tests/disclosure-content-provider.test.mjs tests/software-local-kms.test.mjs tests/software-local-kms-provider.test.mjs tests/software-local-content-provider.test.mjs tests/production-disclosure-bridge.test.mjs tests/harness-compatibility.test.mjs tests/windows-enrollment-path-gate.test.mjs",
     "test:production-oidc": "node --test tests/production-oidc.test.mjs",
     "verify:production-oidc": "node deploy/registry/verify-production-oidc.mjs",
     "test:harness-compatibility": "node --import tsx/esm --test tests/harness-compatibility.test.mjs",
@@ -45,6 +45,7 @@
     "@deepseek-ai/dsh-a2a-disclosure-crypto": "*",
     "@deepseek-ai/dsh-a2a-registry-kms-software": "*",
     "@deepseek-ai/dsh-registry-kms-software-app": "*",
+    "@deepseek-ai/dsh-registry-disclosure-content-app": "*",
     "@deepseek-ai/dsh-credentials": "*",
     "@deepseek-ai/dsh-a2a-mailbox": "*",
     "@deepseek-ai/dsh-host-frontend-static": "*",

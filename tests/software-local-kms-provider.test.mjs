@@ -143,20 +143,22 @@ test('tenant routing stays isolated and an idle LRU tenant reopens from durable 
   const firstScope = scope('organization-a', '-a')
   const secondScope = scope('organization-b', '-b')
   const firstKey = dataKey(firstScope, 'data-key:first', 0x75)
+  const firstHistoricalKey = dataKey(firstScope, 'data-key:historical', 0x77)
   const secondKey = dataKey(secondScope, 'data-key:second', 0x76)
   try {
     await provider.publishDataKey(firstScope, firstKey, signal())
+    await provider.publishDataKey(firstScope, firstHistoricalKey, signal())
     await provider.publishDataKey(secondScope, secondKey, signal())
 
-    const restored = await provider.readDataKeys(firstScope, signal())
-    assert.equal(restored.length, 1)
-    assert.equal(restored[0].keyId, firstKey.keyId)
-    const retained = exported(restored[0].key)
+    await rejectsCode(() => provider.readDataKeys(firstScope, 1, signal()), 'limit')
+    const restored = await provider.readDataKeys(firstScope, 2, signal())
+    assert.deepEqual(restored.map(item => item.keyId), [firstKey.keyId, firstHistoricalKey.keyId])
+    const retained = exported(restored.find(item => item.keyId === firstKey.keyId).key)
     try { assert.deepEqual(retained, Buffer.alloc(32, 0x75)) } finally { retained.fill(0) }
 
     await rejectsCode(() => provider.publishDataKey(firstScope,
       dataKey(firstScope, 'data-key:foreign-scope', 0x77, secondScope), signal()), 'scope-mismatch')
-    const second = await provider.readDataKeys(secondScope, signal())
+    const second = await provider.readDataKeys(secondScope, 1, signal())
     assert.equal(second.length, 1)
     assert.equal(second[0].keyId, secondKey.keyId)
   } finally {

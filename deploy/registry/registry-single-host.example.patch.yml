@@ -3,8 +3,8 @@
 # SaaS producer authentication, tenant imports, encrypted text questions, the
 # software-local disclosure-key owner and the authenticated disclosure bridge
 # are enabled by the PostgreSQL SaaS patch. Producer authentication does not
-# use a deployment-wide bearer token. Disclosure body projection remains
-# unconfigured and returns 501 until its separate content provider is added.
+# use a deployment-wide bearer token. The required PostgreSQL layer adds the
+# bounded disclosure body provider and its key-provider dependency.
 # Never add localHarness or a test-only identity to this file.
 
 - insert:

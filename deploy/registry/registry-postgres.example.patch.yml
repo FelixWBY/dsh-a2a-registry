@@ -29,6 +29,20 @@
         maxPendingOperationsPerOrganization: 64
         maxActiveOrganizations: 256
 
+    # Decrypts only the Registry-authorized fixed checkpoint prefix through the
+    # separately owned key provider. These bounds are explicit deployment
+    # policy and must stay aligned with producer and ingest limits.
+    - id: registry-disclosure-content-provider
+      name: '@deepseek-ai/dsh-registry-disclosure-content-app'
+      inject:
+        - registryDisclosureKeyProvider
+      config:
+        maxContentEvents: 1000
+        crypto:
+          maxPlaintextBytes: 65536
+          maxCiphertextBytes: 262144
+          maxTrustedKeys: 4
+
 - id: registry-storage-domain
   config:
     backend: postgres
@@ -38,6 +52,7 @@
     - storageDomain
     - credentials
     - registryDisclosureKeyProvider
+    - registryDisclosureContentProvider
   config:
     printUrl: false
     oidc:
@@ -64,6 +79,7 @@
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
       disclosureKeyProvider: true
+      disclosureContentProvider: true
       schema: registry
       schemaMode: validate
       legacyOrganizationName: !!js process.env.DSH_REGISTRY_ORGANIZATION_NAME

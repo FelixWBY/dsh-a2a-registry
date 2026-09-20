@@ -51,9 +51,9 @@ export abstract class RegistryDisclosureKeyProvider extends Service {
   abstract publishDataKey(scope: DisclosureDataKeyGrantScope, dataKey: DisclosureDataKey,
     signal: AbortSignal): Promise<RegistryDisclosureKeyReceipt>
 
-  /** Release authenticated keys only to Registry-owned content projection. */
+  /** Release at most `maxKeys` authenticated keys only to Registry-owned content projection. */
   abstract readDataKeys(scope: DisclosureDataKeyGrantScope,
-    signal: AbortSignal): Promise<readonly DisclosureDataKey[]>
+    maxKeys: number, signal: AbortSignal): Promise<readonly DisclosureDataKey[]>
 
   /** Verify one authenticated organization's retained hierarchy without exposing material. */
   abstract checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],

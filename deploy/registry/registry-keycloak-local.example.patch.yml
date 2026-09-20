@@ -48,13 +48,25 @@
         maxPendingOperationsPerOrganization: 32
         maxActiveOrganizations: 64
 
+    - id: registry-disclosure-content-provider
+      name: '@deepseek-ai/dsh-registry-disclosure-content-app'
+      inject:
+        - registryDisclosureKeyProvider
+      config:
+        maxContentEvents: 100
+        crypto:
+          maxPlaintextBytes: 65536
+          maxCiphertextBytes: 262144
+          maxTrustedKeys: 4
+
 - id: registry-runtime
-  inject: [storageDomain, credentials, registryDisclosureKeyProvider]
+  inject: [storageDomain, credentials, registryDisclosureKeyProvider, registryDisclosureContentProvider]
   config:
     printUrl: true
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
       disclosureKeyProvider: true
+      disclosureContentProvider: true
       schema: registry_saas_local
       schemaMode: validate
       allowUnsafeSharedDatabase: true

@@ -3,19 +3,16 @@
 # providers or overrides. The Registry service applies the checked single-host
 # and PostgreSQL layers before this file.
 # The PostgreSQL production layer already mounts the explicitly single-instance
-# software-local disclosure-key provider and the authenticated publication
-# bridge. Its root key must come from the environment-only credentials owner.
+# software-local disclosure-key provider, the bounded fixed-checkpoint content
+# provider and the authenticated publication bridge. The key provider's root
+# key must come from the environment-only credentials owner.
 # Replace that provider with an HSM/KMS-backed implementation before running
 # multiple Registry replicas; never add a second key provider beside it.
 #
-# A deployment-owned disclosure content plugin must use the fixed entry id
-# registry-disclosure-content-provider. The same overlay must explicitly set
-# registry-runtime.config.saas.disclosureContentProvider to true and replace
-# the complete registry-runtime inject list with storageDomain, credentials and
-# registryDisclosureContentProvider so Cordis owns their shared lifecycle.
-# Without all three declarations the production graph fails closed; without
-# any of them the Registry intentionally starts with disclosure content at 501.
-# A deployment-owned Stripe or Alipay adapter follows the same lifecycle rule:
+# Do not add or replace the fixed registry-disclosure-content-provider here;
+# the production graph pins its package, key-provider injection and explicit
+# resource bounds in the PostgreSQL layer. A deployment-owned Stripe or Alipay
+# adapter follows its own lifecycle rule:
 # use the fixed entry id registry-billing-provider, explicitly set
 # registry-runtime.config.saas.billingProvider to true, and include
 # registryBillingProvider in the complete registry-runtime inject list. Without

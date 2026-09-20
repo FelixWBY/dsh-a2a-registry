@@ -66,21 +66,53 @@ test('installable production graph is closed and rejects unsafe deployment mutat
       entry(entries, 'registry-runtime').config.ingest.questions.mailboxKeyEnv = 'DSH_REGISTRY_POSTGRES_URL'
     }, /questions must use DSH_REGISTRY_MAILBOX_KEY/u],
     ['disclosure content provider missing runtime injection', entries => {
-      entries.push({
-        id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
-      })
-      entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
-    }, /disclosureContentProvider and registryDisclosureContentProvider injection must be enabled together/u],
-    ['orphan disclosure content provider injection', entries => {
-      entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
-    }, /disclosureContentProvider and registryDisclosureContentProvider injection must be enabled together/u],
-    ['provider entry without explicit enablement', entries => entries.push({
-      id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
-    }), /disabled disclosure content requires none/u],
-    ['enabled provider missing fixed entry', entries => {
-      entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
-      entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
-    }, /requires exactly one active registry-disclosure-content-provider entry/u],
+      entry(entries, 'registry-runtime').inject = entry(entries, 'registry-runtime').inject
+        .filter(value => value !== 'registryDisclosureContentProvider')
+    }, /registry-runtime must inject registryDisclosureContentProvider/u],
+    ['disclosure content provider not explicitly enabled', entries => {
+      delete entry(entries, 'registry-runtime').config.saas.disclosureContentProvider
+    }, /registry-runtime\.saas\.disclosureContentProvider must be true/u],
+    ['disclosure content provider missing fixed entry', entries => {
+      entries.splice(entries.findIndex(row => row.id === 'registry-disclosure-content-provider'), 1)
+    }, /registry-disclosure-content-provider must have exactly one active entry/u],
+    ['disclosure content provider wrong package', entries => {
+      entry(entries, 'registry-disclosure-content-provider').name = '@example/registry-disclosure-content-provider'
+    }, /must use @deepseek-ai\/dsh-registry-disclosure-content-app/u],
+    ['duplicate disclosure content package', entries => entries.push({
+      id: 'shadow-disclosure-content-provider',
+      name: '@deepseek-ai/dsh-registry-disclosure-content-app',
+      inject: ['registryDisclosureKeyProvider'],
+      config: { maxContentEvents: 1, crypto: {
+        maxPlaintextBytes: 1, maxCiphertextBytes: 1, maxTrustedKeys: 1,
+      } },
+    }), /must have exactly one active entry with id registry-disclosure-content-provider/u],
+    ['disclosure content provider missing key injection', entries => {
+      entry(entries, 'registry-disclosure-content-provider').inject = []
+    }, /must inject registryDisclosureKeyProvider/u],
+    ['disclosure content provider has an extra injection', entries => {
+      entry(entries, 'registry-disclosure-content-provider').inject.push('credentials')
+    }, /and no other service/u],
+    ['disclosure content provider missing event bound', entries => {
+      delete entry(entries, 'registry-disclosure-content-provider').config.maxContentEvents
+    }, /maxContentEvents must be a positive safe integer/u],
+    ['disclosure content provider has an unknown top-level setting', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.maxBufferedEvents = 1000
+    }, /must contain exactly crypto, maxContentEvents/u],
+    ['disclosure content provider invalid crypto mapping', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.crypto = []
+    }, /\.crypto must be configured/u],
+    ['disclosure content provider invalid plaintext bound', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.crypto.maxPlaintextBytes = 0
+    }, /maxPlaintextBytes must be a positive safe integer/u],
+    ['disclosure content provider undersized ciphertext bound', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.crypto.maxCiphertextBytes = 1024
+    }, /maxCiphertextBytes must be at least maxPlaintextBytes/u],
+    ['disclosure content provider invalid trusted-key bound', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.crypto.maxTrustedKeys = 1.5
+    }, /maxTrustedKeys must be a positive safe integer/u],
+    ['disclosure content provider crypto cannot shadow the event bound', entries => {
+      entry(entries, 'registry-disclosure-content-provider').config.crypto.maxEvents = Number.MAX_SAFE_INTEGER
+    }, /\.crypto must contain exactly maxCiphertextBytes, maxPlaintextBytes, maxTrustedKeys/u],
     ['disclosure key provider missing runtime injection', entries => {
       entry(entries, 'registry-runtime').inject = entry(entries, 'registry-runtime').inject
         .filter(value => value !== 'registryDisclosureKeyProvider')
@@ -141,13 +173,13 @@ test('installable production graph is closed and rejects unsafe deployment mutat
     assert.match(productionGraphIssues(entries).join('\n'), expected, label)
   }
 
-  const withDisclosureContentProvider = structuredClone(accepted)
-  withDisclosureContentProvider.push({
-    id: 'registry-disclosure-content-provider', name: '@example/registry-disclosure-content-provider',
+  const disclosureContentProvider = entry(accepted, 'registry-disclosure-content-provider')
+  assert.equal(disclosureContentProvider.name, '@deepseek-ai/dsh-registry-disclosure-content-app')
+  assert.deepEqual(disclosureContentProvider.inject, ['registryDisclosureKeyProvider'])
+  assert.deepEqual(disclosureContentProvider.config, {
+    maxContentEvents: 1000,
+    crypto: { maxPlaintextBytes: 65536, maxCiphertextBytes: 262144, maxTrustedKeys: 4 },
   })
-  entry(withDisclosureContentProvider, 'registry-runtime').config.saas.disclosureContentProvider = true
-  entry(withDisclosureContentProvider, 'registry-runtime').inject.push('registryDisclosureContentProvider')
-  assert.deepEqual(productionGraphIssues(withDisclosureContentProvider), [])
 
   const withBillingProvider = structuredClone(accepted)
   withBillingProvider.push({ id: 'registry-billing-provider', name: '@example/registry-billing-provider' })

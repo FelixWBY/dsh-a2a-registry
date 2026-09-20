@@ -109,7 +109,7 @@ test('software-local hierarchy persists only wrapped keys and survives a clean r
 
     ctx = await runtime(home)
     const restarted = await openStore(ctx, organizationId, master, new AbortController())
-    const retained = await restarted.readDataKeys(grantScope, operationSignal())
+    const retained = await restarted.readDataKeys(grantScope, limits.maxDataKeys, operationSignal())
     assert.equal(retained.length, 1)
     assert.equal(retained[0].keyId, published.keyId)
     assert.deepEqual(exported(retained[0].key), Buffer.alloc(32, 0x22))
@@ -160,10 +160,63 @@ test('publish rejects cross-tenant scope and conflicting material without replac
     const foreignScope = scope('organization-b')
     await rejectsCode(() => store.publishDataKey(foreignScope,
       dataKey(foreignScope, 'data-key:foreign', 0x33), operationSignal()), 'scope-mismatch')
-    const result = await store.readDataKeys(grantScope, operationSignal())
+    const result = await store.readDataKeys(grantScope, limits.maxDataKeys, operationSignal())
     assert.deepEqual(exported(result[0].key), Buffer.alloc(32, 0x31))
     lifecycle.abort()
     await rejectsCode(() => store.checkReadiness(operationSignal()), 'closed')
+    await store.close()
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('bounded exact-scope reads validate maxKeys and reject before any DEK unwrap', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-bounded-read-'))
+  const organizationId = 'organization-bounded-read'
+  const grantScope = scope(organizationId, '-target')
+  const otherScope = scope(organizationId, '-other')
+  const ctx = await runtime(home)
+  let dataKeys
+  const facility = {
+    async open(specification) {
+      const domain = await ctx.storageDomain.open(specification)
+      dataKeys = domain.table('data_keys')
+      return domain
+    },
+  }
+  try {
+    const store = await openSoftwareLocalDisclosureKeyStore(facility, {
+      organizationId,
+      rootKey: rootKey(0x34),
+      storage: { domainNamePrefix: 'kms_bounded_read', tenantId: organizationId },
+      limits,
+      signal: new AbortController().signal,
+    })
+    await store.publishDataKey(grantScope, dataKey(grantScope, 'data-key:b', 0x35), operationSignal())
+    await store.publishDataKey(otherScope, dataKey(otherScope, 'data-key:other', 0x36), operationSignal())
+    await store.publishDataKey(grantScope, dataKey(grantScope, 'data-key:a', 0x37), operationSignal())
+
+    for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '2', null, undefined]) {
+      await rejectsCode(() => store.readDataKeys(grantScope, invalid, operationSignal()), 'invalid-input')
+    }
+    const retained = await store.readDataKeys(grantScope, 2, operationSignal())
+    assert.deepEqual(retained.map(item => item.keyId), ['data-key:a', 'data-key:b'])
+    assert.deepEqual(exported(retained[0].key), Buffer.alloc(32, 0x37))
+    assert.deepEqual(exported(retained[1].key), Buffer.alloc(32, 0x35))
+
+    const [recordKey, record] = [...dataKeys.entries()]
+      .find(([, candidate]) => candidate.scope.disclosureId === grantScope.disclosureId)
+    const firstTag = record.wrappedDataKey.tag.at(0)
+    await dataKeys.put(recordKey, Object.freeze({
+      ...record,
+      wrappedDataKey: Object.freeze({
+        ...record.wrappedDataKey,
+        tag: `${firstTag === 'A' ? 'B' : 'A'}${record.wrappedDataKey.tag.slice(1)}`,
+      }),
+    }))
+    await rejectsCode(() => store.readDataKeys(grantScope, 1, operationSignal()), 'limit')
+    await rejectsCode(() => store.readDataKeys(grantScope, 2, operationSignal()), 'authentication-failed')
     await store.close()
   } finally {
     await ctx.fiber.dispose()
@@ -221,7 +274,7 @@ test('an ambiguous committed write quarantines the handle and an idempotent rest
     assert.equal(openedDescriptor.name,
       softwareLocalDisclosureKeyDomainName('software_local_kms', organizationId))
     await rejectsCode(() => store.publishDataKey(grantScope, published, operationSignal()), 'storage-failed')
-    await rejectsCode(() => store.readDataKeys(grantScope, operationSignal()), 'unavailable')
+    await rejectsCode(() => store.readDataKeys(grantScope, limits.maxDataKeys, operationSignal()), 'unavailable')
     await store.close()
     store = undefined
   } finally {
@@ -236,7 +289,7 @@ test('an ambiguous committed write quarantines the handle and an idempotent rest
     const restarted = await runtime(home)
     try {
       const recovered = await openStore(restarted, organizationId, master, new AbortController())
-      const retained = await recovered.readDataKeys(grantScope, operationSignal())
+      const retained = await recovered.readDataKeys(grantScope, limits.maxDataKeys, operationSignal())
       assert.deepEqual(exported(retained[0].key), Buffer.alloc(32, 0x39))
       assert.deepEqual(await recovered.publishDataKey(grantScope, published, operationSignal()), {
         scope: grantScope, keyId: published.keyId, assurance: 'software-local',

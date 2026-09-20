@@ -9,6 +9,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const BUNDLE_PATCH = resolve(ROOT, 'packages/bundle/registry-app/cordis.patch.yml')
 const CREDENTIALS_PROVIDER = '@deepseek-ai/dsh-credentials-local'
 const DISCLOSURE_CONTENT_PROVIDER_ENTRY = 'registry-disclosure-content-provider'
+const DISCLOSURE_CONTENT_PROVIDER_NAME = '@deepseek-ai/dsh-registry-disclosure-content-app'
 const DISCLOSURE_CONTENT_PROVIDER_SERVICE = 'registryDisclosureContentProvider'
 const DISCLOSURE_KEY_PROVIDER_ENTRY = 'registry-disclosure-key-provider'
 const DISCLOSURE_KEY_PROVIDER_NAME = '@deepseek-ai/dsh-registry-kms-software-app'
@@ -83,6 +84,26 @@ function unsafeSharedDatabase(value, label, issues) {
   }
 }
 
+function positiveSafeInteger(value, label, issues) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    issues.push(`${label} must be a positive safe integer`)
+    return false
+  }
+  return true
+}
+
+function exactObjectKeys(value, expected, label, issues) {
+  const selected = record(value)
+  if (selected === undefined) return false
+  const actual = Object.keys(selected).sort()
+  const required = [...expected].sort()
+  if (actual.length !== required.length || actual.some((key, index) => key !== required[index])) {
+    issues.push(`${label} must contain exactly ${required.join(', ')}`)
+    return false
+  }
+  return true
+}
+
 /** Return every fail-closed production invariant violated by one already-composed entry graph. */
 export function productionGraphIssues(composedEntries, composeWarnings = []) {
   const issues = composeWarnings.map(message => `configuration patch did not apply cleanly: ${message}`)
@@ -135,20 +156,41 @@ export function productionGraphIssues(composedEntries, composeWarnings = []) {
     issues.push('registry-runtime must inject storageDomain and credentials')
   }
   const saas = requiredRecord(runtimeConfig?.saas, 'registry-runtime.saas', issues)
-  const disclosureContentProviders = entries.filter(entry => entry.id === DISCLOSURE_CONTENT_PROVIDER_ENTRY)
+  const disclosureContentProvider = selectedEntry(entries, DISCLOSURE_CONTENT_PROVIDER_ENTRY,
+    DISCLOSURE_CONTENT_PROVIDER_NAME, issues)
+  if (!Array.isArray(disclosureContentProvider?.inject)
+    || disclosureContentProvider.inject.length !== 1
+    || disclosureContentProvider.inject[0] !== DISCLOSURE_KEY_PROVIDER_SERVICE) {
+    issues.push(`${DISCLOSURE_CONTENT_PROVIDER_ENTRY} must inject ${DISCLOSURE_KEY_PROVIDER_SERVICE} and no other service`)
+  }
+  const disclosureContentConfig = objectConfig(disclosureContentProvider,
+    DISCLOSURE_CONTENT_PROVIDER_ENTRY, issues)
+  exactObjectKeys(disclosureContentConfig, ['maxContentEvents', 'crypto'],
+    DISCLOSURE_CONTENT_PROVIDER_ENTRY, issues)
+  positiveSafeInteger(disclosureContentConfig?.maxContentEvents,
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.maxContentEvents`, issues)
+  const disclosureContentCrypto = requiredRecord(disclosureContentConfig?.crypto,
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto`, issues)
+  exactObjectKeys(disclosureContentCrypto,
+    ['maxPlaintextBytes', 'maxCiphertextBytes', 'maxTrustedKeys'],
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto`, issues)
+  const hasPlaintextLimit = positiveSafeInteger(disclosureContentCrypto?.maxPlaintextBytes,
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto.maxPlaintextBytes`, issues)
+  const hasCiphertextLimit = positiveSafeInteger(disclosureContentCrypto?.maxCiphertextBytes,
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto.maxCiphertextBytes`, issues)
+  positiveSafeInteger(disclosureContentCrypto?.maxTrustedKeys,
+    `${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto.maxTrustedKeys`, issues)
+  if (hasPlaintextLimit && hasCiphertextLimit
+    && disclosureContentCrypto.maxCiphertextBytes < disclosureContentCrypto.maxPlaintextBytes) {
+    issues.push(`${DISCLOSURE_CONTENT_PROVIDER_ENTRY}.crypto.maxCiphertextBytes must be at least maxPlaintextBytes`)
+  }
   const injectsDisclosureContentProvider = Array.isArray(runtime?.inject)
     && runtime.inject.includes(DISCLOSURE_CONTENT_PROVIDER_SERVICE)
-  const enablesDisclosureContentProvider = saas?.disclosureContentProvider === true
-  if (saas?.disclosureContentProvider !== undefined
-    && saas.disclosureContentProvider !== true && saas.disclosureContentProvider !== false) {
-    issues.push('registry-runtime.saas.disclosureContentProvider must be a literal boolean')
+  if (saas?.disclosureContentProvider !== true) {
+    issues.push('registry-runtime.saas.disclosureContentProvider must be true')
   }
-  if (enablesDisclosureContentProvider !== injectsDisclosureContentProvider) {
-    issues.push(`registry-runtime.saas.disclosureContentProvider and ${DISCLOSURE_CONTENT_PROVIDER_SERVICE} injection must be enabled together`)
-  }
-  if (enablesDisclosureContentProvider ? disclosureContentProviders.length !== 1
-    : disclosureContentProviders.length !== 0) {
-    issues.push(`enabled disclosure content requires exactly one active ${DISCLOSURE_CONTENT_PROVIDER_ENTRY} entry; disabled disclosure content requires none`)
+  if (!injectsDisclosureContentProvider) {
+    issues.push(`registry-runtime must inject ${DISCLOSURE_CONTENT_PROVIDER_SERVICE}`)
   }
   const disclosureKeyProviders = entries.filter(entry => entry.id === DISCLOSURE_KEY_PROVIDER_ENTRY)
   const softwareKeyProviders = entries.filter(entry => entry.name === DISCLOSURE_KEY_PROVIDER_NAME)
@@ -316,6 +358,7 @@ function main() {
       '- credentials: inherited environment only; writable stores disabled',
       '- listener: 127.0.0.1; authoritative storage and tenancy: PostgreSQL validate mode',
       '- identity: production OIDC with per-request token introspection',
+      '- disclosure content: fixed bounded provider backed by the configured key provider',
       '- local and test-only providers: absent',
       '',
     ].join('\n'))

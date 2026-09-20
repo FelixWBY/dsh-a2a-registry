@@ -27,7 +27,7 @@ npm run verify:production-oidc -- \
 
 该检查严格核对发现文档 issuer、必需 HTTPS 端点、Authorization Code、PKCE S256 和可选 grant／scope 声明，再用随机不存在 token 验证 Introspection 只返回精确的非活动对象；不会跟随重定向，也不会把 secret、响应正文或随机 token 写入输出。身份服务可以把受信任端点部署在不同 HTTPS origin。`--allow-loopback-http` 只允许本机回环测试，不能出现在生产验收。工具通过仍不等于真实身份闭环完成；正式注册、登录、退出和管理员停用后下一请求失效必须另行实测。
 
-普通服务器或已有身份服务使用仓库内已经过配置图门禁的基础层和 PostgreSQL 层，再叠加部署者自己的最终 overlay。先把空的 `registry-production.example.patch.yml` 复制到 `/etc/dsh/registry-production.patch.yml`；当前 PostgreSQL 层已经固定装配单实例 software-local KMS，最终 overlay 只增加经过审查的正文、支付或其他可选生产 provider。以后替换为 HSM／托管 KMS 时，应替换同一个固定条目，并同步修改配置图验证器，不能再叠加第二个 KMS：
+普通服务器或已有身份服务使用仓库内已经过配置图门禁的基础层和 PostgreSQL 层，再叠加部署者自己的最终 overlay。先把空的 `registry-production.example.patch.yml` 复制到 `/etc/dsh/registry-production.patch.yml`；当前 PostgreSQL 层已经固定装配单实例 software-local KMS 和正文投影 provider，最终 overlay 只增加经过审查的支付或其他可选生产 provider。以后替换为 HSM／托管 KMS 时，应替换同一个固定条目，并同步修改配置图验证器，不能再叠加第二个 KMS：
 
 ```sh
 npm start -- \
@@ -36,7 +36,7 @@ npm start -- \
   --patch /etc/dsh/registry-production.patch.yml
 ```
 
-`registry/registry-single-host.example.patch.yml` 是生产基础模板，内建 provider 只解析启动进程继承的环境变量，不能读取 `.env`、本地凭据文件或写入秘密；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由、PostgreSQL RLS、单实例 software-local disclosure KMS 和受认证的 publication bridge。由于 Loader 的 `config` patch 是整体替换，PostgreSQL 层显式携带完整 OIDC、API、限流、告警、同步、KMS 与 bridge 配置，不能删成看似等价的局部片段。`verify-production-graph.mjs` 会按启动顺序合成同一组 patch，并在缺少 credentials、非回环监听、非 PostgreSQL domain、迁移模式、不安全共库、本地／测试插件、非 introspection OIDC，或 KMS 固定条目／注入／显式启用／bridge 任一缺失时阻止启动。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；Harness 开发分支已有持久发布、确定 Session 导入、提问消费和无工具执行源码，但尚未固化发布或完成真实设备部署验收。Registry 已提供独立 `registryDisclosureContentProvider` 接线层，但模板尚未配置真实实现，因此固定 checkpoint 正文读取接口仍返回 501；生产 overlay 必须使用固定条目标识 `registry-disclosure-content-provider`、显式设置 `saas.disclosureContentProvider: true`，并将 `registryDisclosureContentProvider` 加入运行时 `inject`。支付适配器同样必须同时使用固定条目标识 `registry-billing-provider`、显式设置 `saas.billingProvider: true`，并将 `registryBillingProvider` 加入运行时 `inject`；未配置时方案、结账和异步通知都保持关闭。正文与支付扩展各自要求三项同时存在或同时缺省，避免并发加载、卸载或热替换留下失效实例；生产 KMS/bridge 则是必需图节点，缺失时直接阻止启动。
+`registry/registry-single-host.example.patch.yml` 是生产基础模板，内建 provider 只解析启动进程继承的环境变量，不能读取 `.env`、本地凭据文件或写入秘密；继续叠加 `registry/registry-postgres.example.patch.yml` 才启用多组织 SaaS 控制面、组织运行时路由、PostgreSQL RLS、单实例 software-local disclosure KMS、固定 checkpoint 正文投影和受认证的 publication bridge。由于 Loader 的 `config` patch 是整体替换，PostgreSQL 层显式携带完整 OIDC、API、限流、告警、同步、KMS、正文投影与 bridge 配置，不能删成看似等价的局部片段。正文条目固定为 `registry-disclosure-content-provider` 和 `@deepseek-ai/dsh-registry-disclosure-content-app`，只依赖 `registryDisclosureKeyProvider`，并显式限制事件数、明密文字节与受信任密钥数；运行时同时显式启用并注入 `registryDisclosureContentProvider`。`verify-production-graph.mjs` 会按启动顺序合成同一组 patch，并在缺少 credentials、非回环监听、非 PostgreSQL domain、迁移模式、不安全共库、本地／测试插件、非 introspection OIDC，或 KMS／正文 provider 的固定条目、包名、注入、显式边界、启用状态及 bridge 任一不合格时阻止启动。`registry/registry.env.example` 列出所需环境变量。SaaS 的设备认证、按租户持久导入队列和加密提问邮箱均由 Registry 内建提供；Harness 开发分支已有持久发布、确定 Session 导入、提问消费和无工具执行源码，但尚未固化发布或完成真实设备部署验收。支付适配器仍须同时使用固定条目标识 `registry-billing-provider`、显式设置 `saas.billingProvider: true`，并将 `registryBillingProvider` 加入运行时 `inject`；未配置时方案、结账和异步通知都保持关闭。支付扩展的三项声明必须同时存在或同时缺省，避免并发加载、卸载或热替换留下失效实例；生产 KMS、正文 provider 和 bridge 则是必需图节点，缺失时直接阻止启动。
 
 ## 公网入口
 
@@ -71,7 +71,7 @@ Harness 仍是单独安装的外部程序。其中 `/opt/deepseek-harness` 是 H
 
 升级前已经生成的 V1 状态文件仍可继续 `confirm` 或 `export-env`，但只会导出原有五项变量并仅用于 WSS 连接；工具不会从旧设备 secret 推导或伪造 `dshb1`。如需 HTTPS disclosure publication，必须先在 Registry 撤销旧设备，再走一次新绑定生成独立 bridge secret。
 
-`registry/harness-registry-connection.example.patch.yml` 是最小连接模板，只启用生产设备鉴权、在线状态和断线重连，不会启用披露发布、导入、提问、KMS 或任何远程工具执行。它可以先用于验证真实绑定和 WSS 链路。`registry/harness-production-publication.example.patch.yml` 才是完整披露链路的配置参考：内建 HTTPS bridge 已提供授权目录、容量、密钥就绪和作用域密钥发布；仍须补齐生产 `sessionDisclosureRefresh`、Registry 固定检查点正文 provider、真实模型执行与联合验收。把选定并审核后的模板复制为 `/etc/dsh/harness-production.patch.yml`；Harness 主机还需只读安装本 Registry 仓库的部署检查器到 `/opt/dsh-a2a-registry`，systemd 启动前会从该路径执行门禁。`registry/harness.env.example` 与 `registry/dsh-harness.service.example` 分别提供环境变量和进程托管参考。
+`registry/harness-registry-connection.example.patch.yml` 是最小连接模板，只启用生产设备鉴权、在线状态和断线重连，不会启用披露发布、导入、提问、KMS 或任何远程工具执行。它可以先用于验证真实绑定和 WSS 链路。`registry/harness-production-publication.example.patch.yml` 才是完整披露链路的配置参考：内建 HTTPS bridge 已提供授权目录、容量、密钥就绪和作用域密钥发布，Registry PostgreSQL 层也已装配固定检查点正文 provider；仍须补齐生产 `sessionDisclosureRefresh`、真实模型执行与联合验收。把选定并审核后的模板复制为 `/etc/dsh/harness-production.patch.yml`；Harness 主机还需只读安装本 Registry 仓库的部署检查器到 `/opt/dsh-a2a-registry`，systemd 启动前会从该路径执行门禁。`registry/harness.env.example` 与 `registry/dsh-harness.service.example` 分别提供环境变量和进程托管参考。
 
 `check-production-environment.mjs harness` 和 `all` 是公网完整 publication 门禁，因此固定要求六项新凭据（包括 `DSH_REGISTRY_DISCLOSURE_TOKEN`），并要求 `DSH_REGISTRY_DISCLOSURE_BRIDGE_URL` 严格等于 `https://<REGISTRY_DOMAIN>/a2a/v1/disclosure-publication`；不能带端口、凭据、查询或片段。它们不是旧设备 connection-only 的兼容检查。Windows 的 connection-only 启动器会严格接受旧五项或新六项环境文件。
 

@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { composeEntries, loadOverlayPatches } from '@deepseek-ai/dsh-app-boot'
 import {
   buildHttpRedirectProbes,
   verifyHttpRedirectValue,
@@ -12,6 +13,26 @@ import {
 } from '../deploy/registry/verify-public-registry.mjs'
 
 const registryVariables = /^(?:DSH_|REGISTRY_DOMAIN$|REGISTRY_BACKUP_PASSWORD$)/u
+
+function deploymentEntries(...patches) {
+  return composeEntries([
+    'packages/bundle/registry-app/cordis.patch.yml',
+    ...patches,
+  ].map(path => loadOverlayPatches('production-deployment-test', resolve(path))))
+}
+
+function assertDisclosureContentProvider(entries, maxContentEvents) {
+  const provider = entries.find(entry => entry.id === 'registry-disclosure-content-provider')
+  assert.equal(provider?.name, '@deepseek-ai/dsh-registry-disclosure-content-app')
+  assert.deepEqual(provider?.inject, ['registryDisclosureKeyProvider'])
+  assert.deepEqual(provider?.config, {
+    maxContentEvents,
+    crypto: { maxPlaintextBytes: 65536, maxCiphertextBytes: 262144, maxTrustedKeys: 4 },
+  })
+  const runtime = entries.find(entry => entry.id === 'registry-runtime')
+  assert.equal(runtime?.config?.saas?.disclosureContentProvider, true)
+  assert.ok(runtime?.inject?.includes('registryDisclosureContentProvider'))
+}
 
 function productionEnvironment() {
   const env = Object.fromEntries(Object.entries(process.env)
@@ -74,6 +95,17 @@ function preflight(env, scope = 'registry') {
     cwd: new URL('..', import.meta.url), env, encoding: 'utf8',
   })
 }
+
+test('Registry deployment overlays install the bounded disclosure content provider', () => {
+  assertDisclosureContentProvider(deploymentEntries(
+    'deploy/registry/registry-single-host.example.patch.yml',
+    'deploy/registry/registry-postgres.example.patch.yml',
+    'deploy/registry/registry-production.example.patch.yml',
+  ), 1000)
+  assertDisclosureContentProvider(deploymentEntries(
+    'deploy/registry/registry-keycloak-local.example.patch.yml',
+  ), 100)
+})
 
 test('production Registry preflight requires the PostgreSQL SaaS inputs', () => {
   const valid = productionEnvironment()

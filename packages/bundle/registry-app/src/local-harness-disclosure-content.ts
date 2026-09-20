@@ -2,7 +2,6 @@
 import { timingSafeEqual } from 'node:crypto'
 import {
   decodeDisclosureDataKeyGrant,
-  decryptDisclosurePayload,
   disclosureDataKeyCredential,
   encodeDisclosureDataKeyGrant,
   unwrapDisclosureDataKey,
@@ -15,7 +14,8 @@ import {
 } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
 import type { RegistryConfirmedPrefix } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import type { RegistryDisclosureContent, RegistryDisclosureContentEvent } from './operations.ts'
+import { projectRegistryDisclosureContent } from './disclosure-content-projection.ts'
+import type { RegistryDisclosureContent } from './operations.ts'
 
 /** Payload-free failure category used by the signed escrow adapter. */
 export class LocalHarnessDisclosureContentError extends Error {
@@ -119,20 +119,6 @@ export async function requireRegistryDisclosureDataKey(credentials: CredentialPr
   if (key.keyId !== keyId) fail('conflict')
 }
 
-function projectEvent(event: ReturnType<typeof decryptDisclosurePayload>, disclosureSeq: number,
-  occurredAt: number): RegistryDisclosureContentEvent {
-  switch (event.type) {
-    case 'conversation.user-message':
-    case 'conversation.assistant-message':
-      return { disclosureSeq, occurredAt, type: event.type, text: event.text }
-    case 'conversation.tool-result-summary':
-      return { disclosureSeq, occurredAt, type: event.type, toolName: event.toolName,
-        outcome: event.outcome, text: event.text }
-    case 'conversation.title':
-      return { disclosureSeq, occurredAt, type: event.type, title: event.title }
-  }
-}
-
 /**
  * Resolve the Registry-owned key afresh and decrypt one verified confirmed prefix only in memory.
  * @param credentials - Registry-owned Credentials provider.
@@ -146,47 +132,14 @@ function projectEvent(event: ReturnType<typeof decryptDisclosurePayload>, disclo
 export async function readRegistryDisclosureContent(credentials: CredentialProvider,
   prefix: RegistryConfirmedPrefix, limits: DisclosureCryptoLimits, maxEvents: number,
   maxResponseBytes: number, signal: AbortSignal): Promise<RegistryDisclosureContent> {
-  signal.throwIfAborted()
-  const checkpoint = prefix.checkpoint
-  if (!Number.isSafeInteger(maxEvents) || maxEvents <= 0 || prefix.events.length > maxEvents
-    || prefix.events.length !== checkpoint.eventCount
-    || checkpoint.lastDisclosureSeq !== prefix.events.length - 1) fail('limit')
-  const scope: DisclosureDataKeyGrantScope = {
-    organizationId: checkpoint.organizationId,
-    instanceId: checkpoint.instanceId,
-    conversationId: prefix.conversationId,
-    disclosureId: checkpoint.disclosureId,
-  }
-  let record: Awaited<ReturnType<CredentialProvider['readRecord']>>
-  try { record = await credentials.readRecord(disclosureDataKeyCredential('registry-app', scope)) } catch {
-    return fail('unavailable')
-  }
-  if (record === undefined) fail('unavailable')
-  let keys: readonly DisclosureDataKey[]
-  try { keys = decodeDisclosureDataKeyGrant(record, scope, limits.maxTrustedKeys) } catch { return fail('unavailable') }
-  const events = prefix.events.map((envelope, index): RegistryDisclosureContentEvent => {
-    if (envelope.disclosureSeq !== index || envelope.organizationId !== checkpoint.organizationId
-      || envelope.instanceId !== checkpoint.instanceId || envelope.conversationId !== prefix.conversationId
-      || envelope.disclosureId !== checkpoint.disclosureId || envelope.policyVersion !== checkpoint.policyVersion) {
-      fail('unavailable')
+  return projectRegistryDisclosureContent(async (scope, maxKeys, operationSignal) => {
+    operationSignal.throwIfAborted()
+    let record: Awaited<ReturnType<CredentialProvider['readRecord']>>
+    try { record = await credentials.readRecord(disclosureDataKeyCredential('registry-app', scope)) } catch {
+      return fail('unavailable')
     }
-    let event: ReturnType<typeof decryptDisclosurePayload>
-    try {
-      event = decryptDisclosurePayload(envelope.ciphertext, {
-        organizationId: envelope.organizationId,
-        instanceId: envelope.instanceId,
-        conversationId: envelope.conversationId,
-        disclosureId: envelope.disclosureId,
-        eventId: envelope.eventId,
-        eventType: envelope.eventType,
-        policyVersion: envelope.policyVersion,
-      }, keys, limits)
-    } catch { return fail('unavailable') }
-    return projectEvent(event, envelope.disclosureSeq, envelope.occurredAt)
-  })
-  signal.throwIfAborted()
-  const value: RegistryDisclosureContent = { checkpointHash: checkpoint.checkpointHash, events }
-  if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes <= 0
-    || Buffer.byteLength(JSON.stringify(value), 'utf8') > maxResponseBytes) fail('limit')
-  return value
+    operationSignal.throwIfAborted()
+    if (record === undefined) fail('unavailable')
+    try { return decodeDisclosureDataKeyGrant(record, scope, maxKeys) } catch { return fail('unavailable') }
+  }, prefix, { ...limits, maxEvents }, maxResponseBytes, signal)
 }
