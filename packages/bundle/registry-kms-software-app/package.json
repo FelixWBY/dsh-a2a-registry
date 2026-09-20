@@ -1,0 +1,20 @@
+{
+  "name": "@deepseek-ai/dsh-registry-kms-software-app",
+  "version": "0.1.2-rc.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-a2a-disclosure-crypto": "*",
+    "@deepseek-ai/dsh-a2a-registry-kms-software": "*",
+    "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-registry-app": "*",
+    "@deepseek-ai/dsh-storage-domain": "*"
+  }
+}

@@ -1,6 +1,6 @@
 [Unit]
 Description=DeepSeek Harness A2A device
-Documentation=file:/opt/deepseek-harness/deploy/registry/README.md
+Documentation=file:/opt/dsh-a2a-registry/deploy/registry/README.md
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=60
@@ -14,7 +14,7 @@ Environment=NODE_ENV=production
 EnvironmentFile=/run/secrets/dsh-harness.env
 UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 WorkingDirectory=/srv/dsh-harness-workspace
-ExecStartPre=/usr/bin/node /opt/deepseek-harness/deploy/registry/check-production-environment.mjs harness
+ExecStartPre=/usr/bin/node /opt/dsh-a2a-registry/deploy/registry/check-production-environment.mjs harness
 ExecStart=/usr/bin/node /opt/deepseek-harness/apps/cli/lib/bin.js --profile web --patch /etc/dsh/harness-production.patch.yml --no-open
 Restart=on-failure
 RestartSec=5s

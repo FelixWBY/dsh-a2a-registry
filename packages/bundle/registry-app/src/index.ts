@@ -28,6 +28,9 @@ import { RegistrySaasImportRouter } from './saas-import-queue.ts'
 import { RegistrySaasQuestionRouter, validateRegistrySaasMailboxCredential } from './saas-question-mailbox.ts'
 import { createRegistrySaasDisclosureOperations } from './saas-disclosure-operations.ts'
 import { RegistryReadinessProbe } from './readiness.ts'
+import {
+  installRegistryProductionDisclosureBridge, RegistryProductionDisclosureBridgeConfigSchema,
+  type RegistryProductionDisclosureBridgeConfig } from './production-disclosure-bridge.ts'
 import type { RegistryDisclosureOperations } from './operations.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
@@ -41,6 +44,11 @@ export type { RegistryBillingCheckout, RegistryBillingCheckoutAttachment, Regist
 export { RegistryDisclosureContentProvider } from './disclosure-content-provider.ts'
 export { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 export type { RegistryDisclosureKeyProtection, RegistryDisclosureKeyReceipt } from './disclosure-key-provider.ts'
+export {
+  REGISTRY_PRODUCTION_DISCLOSURE_BRIDGE_PATH, RegistryProductionDisclosureBridge,
+  RegistryProductionDisclosureBridgeConfigSchema,
+  installRegistryProductionDisclosureBridge } from './production-disclosure-bridge.ts'
+export type { RegistryProductionDisclosureBridgeConfig } from './production-disclosure-bridge.ts'
 export { RegistryOidcAccountAuthenticator, RegistryOidcAccountAuthConfigSchema } from './oidc-account-auth.ts'
 export type { RegistryOidcAccountAuthConfig } from './oidc-account-auth.ts'
 export { RegistryTenancyError } from './tenancy.ts'
@@ -112,6 +120,8 @@ export interface RegistrySaasConfig extends Omit<PostgresRegistryTenancyConfig, 
   databaseUrlEnv: string
   /** Explicitly enable the deployment-owned disclosure content service; false keeps browser reads at 501. */
   disclosureContentProvider: boolean
+  /** Explicitly enable the tenant-scoped disclosure key service required by the production bridge. */
+  disclosureKeyProvider: boolean
   /** Explicitly enable the deployment-owned checkout and verified webhook service. */
   billingProvider: boolean
   /** Presentation name for the pre-SaaS organization retained during migration. */
@@ -132,6 +142,8 @@ export interface Config {
   saas?: RegistrySaasConfig
   /** Optional dedicated same-host SQLite owner shared by browser and producer-sync admission. */
   sharedAdmission?: RegistrySharedAdmissionConfig
+  /** Private authenticated HTTPS adapter consumed by production Harness publication. */
+  productionDisclosureBridge?: RegistryProductionDisclosureBridgeConfig
   /** Requires storageDomain; SaaS binding sync is built in, while standalone sync requires an injected authenticator. */
   ingest?: RegistryIngestRuntimeConfig
   /** Requires storageDomain and opens only a Registry-side mailbox cleanup owner. */
@@ -146,6 +158,7 @@ const schema: z<Config> = z.object({
   saas: z.union([z.object({
     databaseUrlEnv: z.string().role('credential-ref').required(),
     disclosureContentProvider: z.boolean().default(false),
+    disclosureKeyProvider: z.boolean().default(false),
     billingProvider: z.boolean().default(false),
     schema: z.string().default('registry'),
     schemaMode: z.union([z.const('migrate'), z.const('validate')]).default('migrate'),
@@ -158,6 +171,7 @@ const schema: z<Config> = z.object({
     statementTimeoutMs: z.natural().min(1_000).max(120_000).default(15_000),
   }).required()]),
   sharedAdmission: z.union([RegistrySharedAdmissionConfigSchema]),
+  productionDisclosureBridge: z.union([RegistryProductionDisclosureBridgeConfigSchema]),
   ingest: z.union([ingestRuntime.Config]),
   mailboxMaintenance: z.union([mailboxMaintenance.Config]),
   localHarness: z.union([localHarnessOperations.Config]),
@@ -169,6 +183,12 @@ export const Config: z<Config> = z.transform(schema, (value) => {
   }
   if (value.saas !== undefined && (value.localHarness !== undefined || value.mailboxMaintenance !== undefined)) {
     throw new z.ValidationError('Registry SaaS cannot use fixed-organization Local Harness or mailbox owners', {})
+  }
+  if (value.productionDisclosureBridge !== undefined && (value.saas === undefined
+    || value.saas.disclosureKeyProvider !== true
+    || value.ingest?.directory === undefined || value.ingest.bindings === undefined)) {
+    throw new z.ValidationError(
+      'Registry production disclosure bridge requires SaaS directory, bindings and disclosure key provider', {})
   }
   if (value.saas !== undefined && value.ingest?.imports === undefined) {
     throw new z.ValidationError('Registry SaaS requires the durable tenant import queue', {})
@@ -384,6 +404,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error
       }
     }
+  }
+  if (config.productionDisclosureBridge !== undefined) {
+    const bridge = installRegistryProductionDisclosureBridge(ctx, structuredClone(config.productionDisclosureBridge))
+    ctx.effect(() => () => bridge.close(), 'registry-app: production disclosure bridge lifetime')
   }
   if (config.oidc !== undefined) {
     if (ctx.get('credentials') === undefined) {

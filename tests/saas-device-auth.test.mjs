@@ -12,9 +12,14 @@ import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import {
+  decodeRegistryBridgeToken,
+  decodeRegistryDeviceToken,
+  encodeRegistryBridgeToken,
   encodeRegistryDeviceToken,
   generateInstanceKeyPair,
+  generateRegistryBridgeSecret,
   generateRegistryDeviceSecret,
+  hashRegistryBridgeSecret,
   hashRegistryDeviceSecret,
   signDisclosureCheckpoint,
   signDisclosureEvent,
@@ -273,9 +278,12 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
 
     const keyPair = generateInstanceKeyPair()
     const secret = generateRegistryDeviceSecret()
+    const bridgeSecret = generateRegistryBridgeSecret()
+    assert.notEqual(bridgeSecret, secret)
     const ticket = await runtimeA.enrollment.start({
       publicKeySpki: keyPair.publicKeySpki,
       deviceSecretHash: hashRegistryDeviceSecret(secret),
+      bridgeSecretHash: hashRegistryBridgeSecret(bridgeSecret),
       instanceName: 'Tenant A producer',
       requestedScopes: ['disclosure.sync', 'a2a.receive'],
     })
@@ -325,6 +333,49 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
 
     const url = `ws://127.0.0.1:${ctx.webServer.port}${REGISTRY_SYNC_PATH}`
     const token = encodeRegistryDeviceToken({ organizationId: organizationA, bindingId: ticket.bindingId, secret })
+    const bridgeToken = encodeRegistryBridgeToken({
+      organizationId: organizationA, bindingId: ticket.bindingId, secret: bridgeSecret,
+    })
+    assert.deepEqual(decodeRegistryBridgeToken(bridgeToken), {
+      organizationId: organizationA, bindingId: ticket.bindingId, secret: bridgeSecret,
+    })
+    assert.throws(() => decodeRegistryBridgeToken(token))
+    assert.throws(() => decodeRegistryDeviceToken(bridgeToken))
+    assert.notEqual(hashRegistryBridgeSecret(bridgeSecret), hashRegistryDeviceSecret(bridgeSecret))
+    const deviceAuthority = await runtimeA.store.authenticateBindingCredential(ticket.bindingId,
+      hashRegistryDeviceSecret(secret), hashRegistryBridgeSecret(secret))
+    assert.equal(deviceAuthority.connection.instanceId, ticket.challenge.instanceId)
+    const bridgeAuthority = await runtimeA.store.authenticateBridgeCredential(ticket.bindingId,
+      hashRegistryBridgeSecret(bridgeSecret), hashRegistryDeviceSecret(bridgeSecret))
+    assert.equal(bridgeAuthority.bindingId, ticket.bindingId)
+    assert.equal(bridgeAuthority.organizationId, organizationA)
+    assert.equal(bridgeAuthority.instanceId, ticket.challenge.instanceId)
+    assert.equal(bridgeAuthority.memberId, memberA)
+    assert.equal(bridgeAuthority.producer.connection.organizationId, organizationA)
+    assert.equal(bridgeAuthority.producer.connection.instanceId, ticket.challenge.instanceId)
+    assert.equal(bridgeAuthority.producer.connection.keyId, keyPair.keyId)
+    const wrongBridgeSecret = generateRegistryBridgeSecret()
+    await assert.rejects(runtimeA.store.authenticateBridgeCredential(ticket.bindingId,
+      hashRegistryBridgeSecret(wrongBridgeSecret), hashRegistryDeviceSecret(wrongBridgeSecret)),
+      error => error?.code === 'not-found')
+    await runtimeA.store.run(async (ingest) => {
+      const domain = ingest.domain
+      const original = domain.table('bindings').get(ticket.bindingId)
+      assert.equal(original?.version, 6)
+      await domain.putMany([{ table: 'bindings', key: ticket.bindingId,
+        value: { ...original, bridgeSecretHash: hashRegistryBridgeSecret(secret) } }])
+    })
+    await assert.rejects(runtimeA.store.authenticateBindingCredential(ticket.bindingId,
+      hashRegistryDeviceSecret(secret), hashRegistryBridgeSecret(secret)), error => error?.code === 'not-found')
+    await assert.rejects(runtimeA.store.authenticateBridgeCredential(ticket.bindingId,
+      hashRegistryBridgeSecret(secret), hashRegistryDeviceSecret(secret)), error => error?.code === 'not-found')
+    await runtimeA.store.run(async (ingest) => {
+      const domain = ingest.domain
+      const original = domain.table('bindings').get(ticket.bindingId)
+      assert.equal(original?.version, 6)
+      await domain.putMany([{ table: 'bindings', key: ticket.bindingId,
+        value: { ...original, bridgeSecretHash: hashRegistryBridgeSecret(bridgeSecret) } }])
+    })
     const expectedIdentity = {
       organizationId: organizationA,
       instanceId: ticket.challenge.instanceId,
@@ -804,6 +855,19 @@ test('SaaS device authentication is bound to the selected tenant runtime', { tim
       assert.equal(await ingest.domain.table('bindings').delete(duplicateBindingId), true)
     })
 
+    await runtimeA.store.run(async (ingest) => {
+      const domain = ingest.domain
+      const original = domain.table('bindings').get(ticket.bindingId)
+      assert.equal(original?.version, 6)
+      const { bridgeSecretHash: _bridgeSecretHash, ...v5 } = original
+      await domain.putMany([{ table: 'bindings', key: ticket.bindingId, value: { ...v5, version: 5 } }])
+    })
+    assert.equal((await runtimeA.store.authenticateBindingCredential(ticket.bindingId,
+      hashRegistryDeviceSecret(secret), hashRegistryBridgeSecret(secret))).connection.instanceId,
+      ticket.challenge.instanceId)
+    await assert.rejects(runtimeA.store.authenticateBridgeCredential(ticket.bindingId,
+      hashRegistryBridgeSecret(bridgeSecret), hashRegistryDeviceSecret(bridgeSecret)),
+      error => error?.code === 'not-found')
     await runtimeA.store.run(async (ingest) => {
       const domain = ingest.domain
       const original = domain.table('bindings').get(ticket.bindingId)

@@ -71,6 +71,19 @@ function Wait-Https([string]$uri, [string]$caCertificate, [int]$attempts = 60) {
   throw "TLS service did not become ready: $uri"
 }
 
+function Wait-DisclosureBridge([string]$uri, [string]$caCertificate, [int]$attempts = 60) {
+  for ($attempt = 0; $attempt -lt $attempts; $attempt += 1) {
+    # A missing bearer must reach the Registry bridge and fail at its authentication boundary.
+    # Any other status means Caddy is stale, the route is absent, or the wrong service answered.
+    $status = & curl.exe --silent --ssl-no-revoke --cacert $caCertificate `
+      --noproxy localhost --request POST --header 'Content-Type: application/json' `
+      --data '{}' --output NUL --write-out '%{http_code}' $uri 2>$null
+    if ($LASTEXITCODE -eq 0 -and $status -eq '401') { return }
+    Start-Sleep -Seconds 1
+  }
+  throw "Disclosure bridge did not reject an unauthenticated request as expected: $uri"
+}
+
 function Set-LocalRealmConfiguration([string]$username, [string]$password) {
   $token = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3182/realms/master/protocol/openid-connect/token' `
     -ContentType 'application/x-www-form-urlencoded' `
@@ -210,11 +223,16 @@ if (Test-Path -LiteralPath $privateConfigPath) {
     clientSecret = New-Secret 32
     sessionSecret = New-Secret 48
     mailboxKey = New-Secret 32
+    disclosureRootKey = New-Secret 32
   }
   [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
 if ($null -eq $privateConfig.PSObject.Properties['mailboxKey']) {
   $privateConfig | Add-Member -NotePropertyName mailboxKey -NotePropertyValue (New-Secret 32)
+  [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+}
+if ($null -eq $privateConfig.PSObject.Properties['disclosureRootKey']) {
+  $privateConfig | Add-Member -NotePropertyName disclosureRootKey -NotePropertyValue (New-Secret 32)
   [IO.File]::WriteAllText($privateConfigPath, ($privateConfig | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
 
@@ -242,6 +260,7 @@ try {
   $env:DSH_REGISTRY_POSTGRES_URL = $databaseUrlLine.Substring('DATABASE_URL='.Length)
   $env:DSH_LOCAL_REGISTRY_SESSION_SECRET = $privateConfig.sessionSecret
   $env:DSH_LOCAL_REGISTRY_MAILBOX_KEY = $privateConfig.mailboxKey
+  $env:DSH_REGISTRY_DISCLOSURE_ROOT_KEY = $privateConfig.disclosureRootKey
   $registry = Start-Process -FilePath $NodePath `
     -ArgumentList @('--import', 'tsx/esm', 'src/dsh.ts', '--profile', 'registry', '--patch', (Join-Path $PSScriptRoot 'registry-keycloak-local.example.patch.yml')) `
     -WorkingDirectory $repositoryRoot `
@@ -250,7 +269,12 @@ try {
     -WindowStyle Hidden -PassThru
 
   Wait-Http 'http://127.0.0.1:3181/readyz'
+  # The local Caddyfile is bind-mounted. Restart the existing container explicitly so
+  # a newly added WSS/HTTPS route is not masked by Caddy's previously loaded config.
+  & docker.exe --context desktop-linux compose -f $composePath restart caddy | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot reload the local Caddy routing configuration' }
   Wait-Https 'https://localhost:3183/readyz' $caCertificatePath
+  Wait-DisclosureBridge 'https://localhost:3183/a2a/v1/disclosure-publication' $caCertificatePath
 } catch {
   if ($null -ne $registry -and -not $registry.HasExited) { Stop-Process -Id $registry.Id }
   if ($localStackStarted) { & docker.exe --context desktop-linux compose -f $composePath stop | Out-Null }
@@ -264,6 +288,7 @@ try {
   issuer = 'http://127.0.0.1:3182/realms/dsh-local'
   registry = 'http://127.0.0.1:3181/#/sign-in'
   sync = 'wss://localhost:3183/a2a/v1/sync'
+  disclosureBridge = 'https://localhost:3183/a2a/v1/disclosure-publication'
   caCertificate = $caCertificatePath
   username = $privateConfig.username
   privateConfig = $privateConfigPath

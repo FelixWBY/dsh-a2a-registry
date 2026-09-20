@@ -4,19 +4,21 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import { defineDomain, domainTable, type Domain, type DomainFacility, type DomainRecordWrite } from '@deepseek-ai/dsh-storage-domain'
 import { InstanceSignatureError, verifyDisclosureCheckpoint, verifyDisclosureEvent } from '@deepseek-ai/dsh-a2a-device-identity'
 import type { InstanceKeyHistory, InstanceVerificationContext,
-  RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
+  RegistryBridgeSecretHash, RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeDisclosureCheckpoint, decodeDisclosureEventEnvelope, type DisclosureCheckpoint, type DisclosureConversationId,
   type DisclosureHash, type DisclosureId, type DshInstanceId, type OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import { canUploadDisclosure, invalidateDisclosureAuthorization, transitionDisclosureControl, updateDisclosureAccess,
   type DisclosureAccessUpdate, type DisclosureAction, type DisclosureControlState } from '@deepseek-ai/dsh-a2a-registry-domain'
-import type { DisclosureSubject } from '@deepseek-ai/dsh-a2a-registry-domain'
+import type { DisclosureSubject, MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { decodeRegistryAudience } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import { approveBinding, authenticateBindingCredential as resolveBindingCredential, confirmedBindingHistory, confirmBinding, inspectBinding,
+import { approveBinding, authenticateBindingCredential as resolveBindingCredential,
+  authenticateBridgeCredential as resolveBridgeCredential, confirmedBindingHistory, confirmBinding, inspectBinding,
   parseBinding, rejectBinding, renameBinding, reviewBinding, revokeBinding, startBinding } from './binding.ts'
 import type { RegistryBindingConfig, RegistryBindingId, RegistryBindingInvalidation, RegistryBindingReceipt, RegistryBindingRecord,
   RegistryBindingRequest, RegistryBindingReview, RegistryBindingScope, RegistryBindingTicket } from './binding-types.ts'
 import { changeDirectory, directorySubject, initialDirectory, parseDirectory, validateDirectoryConfig } from './directory.ts'
-import type { FreshRegistryDirectoryAuthority, RegistryDirectoryChange, RegistryDirectoryConfig, RegistryDirectoryReceipt, RegistryDirectoryState } from './directory-types.ts'
+import type { FreshRegistryDirectoryAuthority, RegistryDirectoryChange, RegistryDirectoryConfig, RegistryDirectoryMember,
+  RegistryDirectoryReceipt, RegistryDirectoryState } from './directory-types.ts'
 import { appendCheckpoint, appendEvent, audit, receiptOf, type LiveRecord, type Mutation } from './aggregate.ts'
 import { byteLength, fitStopRecord, parseRecord, recordKey, RegistryIngestError, requireIngest, stopReserveBytes,
   validateLimits, type IngestRecord, type VerifiedRecord } from './record.ts'
@@ -41,6 +43,15 @@ export type { RegistryAuditAction, RegistryAuditActor, RegistryAuditLimits, Regi
 /** Explicit opt-in operation journal. Capacity or persistence failures block every operation, including deletion. */
 export interface RegistryAuditConfig extends RegistryAuditLimits {
   readonly failurePolicy: 'block-all'
+}
+
+/** Current per-request authority returned only after a v6 bridge credential is revalidated. */
+export interface RegistryBridgeAuthority {
+  readonly bindingId: RegistryBindingId
+  readonly organizationId: OrganizationId
+  readonly instanceId: DshInstanceId
+  readonly memberId: MemberId
+  readonly producer: RegistryProducerAuthority
 }
 
 interface ActiveAudit {
@@ -254,6 +265,7 @@ export class RegistryIngest {
   private readonly invalidations = new Set<{ readonly listener: (event: RegistryDisclosureInvalidation) => void | Promise<void> }>()
   private readonly auditCompletions = new Set<{ readonly listener: (record: RegistryAuditRecord) => void | Promise<void> }>()
   private readonly bindingInvalidations = new Set<{ readonly listener: (event: RegistryBindingInvalidation) => void | Promise<void> }>()
+  private directoryMembers = new Map<MemberId, RegistryDirectoryMember>()
 
   /** @param domain - Validated exclusive domain; use openRegistryIngest rather than constructing manually.
    * @param organizationId - Organization whose singleton binding was durably verified before construction.
@@ -268,6 +280,10 @@ export class RegistryIngest {
     private readonly bindingConfig?: RegistryBindingConfig) {
     this.table = domain.table('disclosures')
     this.journalTable = domain.table('audit')
+    const directory = domain.table('owner').get('organization')?.directory
+    if (directory !== null && directory !== undefined) {
+      this.directoryMembers = new Map(directory.members.map(member => [member.memberId, member]))
+    }
   }
 
   /** Persist a bounded enrollment attempt before returning its one-time code.
@@ -513,6 +529,7 @@ export class RegistryIngest {
       const result = { revision: next.revision, invalidatedDisclosures: records.length }
       await this.complete({ kind: 'directory', ...result, changed: next !== directory }, undefined,
         next === directory ? undefined : { state: next, records })
+      if (next !== directory) this.directoryMembers = new Map(next.members.map(member => [member.memberId, member]))
       for (const record of records) this.publishInvalidation(record.record)
       if (next !== directory) {
         const activeMembers = new Set(next.members.filter(member => member.state === 'active').map(member => member.memberId))
@@ -981,9 +998,11 @@ export class RegistryIngest {
   }
 
   /** Resolve a device-only secret commitment to current confirmed authority inside the binding owner queue.
+   * Both hashes must come from the same presented raw secret; V6 uses the bridge-domain hash to reject reuse.
    * This is transport-provider input, never a browser review or reusable authorization snapshot. */
   authenticateBindingCredential(bindingId: RegistryBindingId,
-    presentedHash: RegistryDeviceSecretHash): Promise<RegistryProducerAuthority> {
+    presentedHash: RegistryDeviceSecretHash,
+    sameRawBridgeHash: RegistryBridgeSecretHash): Promise<RegistryProducerAuthority> {
     return this.enqueue(async () => {
       const bindingConfig = this.bindingConfig
       requireIngest(bindingConfig !== undefined, 'not-found')
@@ -991,10 +1010,34 @@ export class RegistryIngest {
       requireIngest(record.challenge.organizationId === this.organizationId, 'not-found')
       const state = record.state
       requireIngest(state.kind === 'confirmed', 'not-found')
-      const member = this.directory().members.find(candidate => candidate.memberId === state.memberId)
+      const member = this.directoryMembers.get(state.memberId)
       requireIngest(member !== undefined, 'not-found')
-      return structuredClone(resolveBindingCredential(record, member, presentedHash,
+      return structuredClone(resolveBindingCredential(record, member, presentedHash, sameRawBridgeHash,
         Date.now(), bindingConfig.audience))
+    })
+  }
+
+  /** Resolve a v6 dshb1 bearer in O(1) binding lookup for one HTTPS bridge request.
+   * Both hashes must come from the same presented raw secret; the device-domain hash rejects reuse. The
+   * confirmed state, active member, tenant, instance and disclosure.sync scope are also rechecked. */
+  authenticateBridgeCredential(bindingId: RegistryBindingId,
+    presentedHash: RegistryBridgeSecretHash,
+    sameRawDeviceHash: RegistryDeviceSecretHash): Promise<RegistryBridgeAuthority> {
+    return this.enqueue(async () => {
+      const bindingConfig = this.bindingConfig
+      requireIngest(bindingConfig !== undefined, 'not-found')
+      const record = this.binding(bindingId)
+      requireIngest(record.bindingId === bindingId && record.challenge.organizationId === this.organizationId
+        && record.requestedScopes.includes('disclosure.sync'), 'not-found')
+      const state = record.state
+      requireIngest(state.kind === 'confirmed', 'not-found')
+      const member = this.directoryMembers.get(state.memberId)
+      requireIngest(member !== undefined, 'not-found')
+      const producer = resolveBridgeCredential(record, member, presentedHash, sameRawDeviceHash,
+        Date.now(), bindingConfig.audience)
+      const { organizationId, instanceId } = producer.connection
+      requireIngest(organizationId === this.organizationId && instanceId === record.challenge.instanceId, 'not-found')
+      return structuredClone({ bindingId, organizationId, instanceId, memberId: member.memberId, producer })
     })
   }
 

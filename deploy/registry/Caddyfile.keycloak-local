@@ -6,8 +6,8 @@ https://localhost {
 	tls internal
 	encode gzip
 	route {
-		@sync path /a2a/v1/sync
-		reverse_proxy @sync host.docker.internal:3181 {
+		@registry_a2a path /a2a/v1/sync /a2a/v1/disclosure-publication
+		reverse_proxy @registry_a2a host.docker.internal:3181 {
 			health_uri /readyz
 			health_interval 10s
 			health_timeout 2s

@@ -13,11 +13,31 @@
         idleTimeoutMs: 30000
         statementTimeoutMs: 15000
 
+    # MVP software envelope-key owner. The root key is resolved only from the
+    # production environment-only credentials provider; this process must stay
+    # single-instance until a distributed/HSM-backed provider replaces it.
+    - id: registry-disclosure-key-provider
+      name: '@deepseek-ai/dsh-registry-kms-software-app'
+      inject:
+        - storageDomain
+        - credentials
+      config:
+        singleInstance: true
+        rootKeyId: !!js process.env.DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID
+        domainNamePrefix: a2a_registry_disclosure_keys
+        maxDataKeysPerOrganization: 100000
+        maxPendingOperationsPerOrganization: 64
+        maxActiveOrganizations: 256
+
 - id: registry-storage-domain
   config:
     backend: postgres
 
 - id: registry-runtime
+  inject:
+    - storageDomain
+    - credentials
+    - registryDisclosureKeyProvider
   config:
     printUrl: false
     oidc:
@@ -43,6 +63,7 @@
       maxDirectoryBytes: 10485760
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
+      disclosureKeyProvider: true
       schema: registry
       schemaMode: validate
       legacyOrganizationName: !!js process.env.DSH_REGISTRY_ORGANIZATION_NAME
@@ -51,6 +72,18 @@
       maxActiveOrganizations: 256
       idleTimeoutMs: 30000
       statementTimeoutMs: 15000
+    productionDisclosureBridge:
+      requestTimeoutMs: 10000
+      maxConcurrentRequests: 128
+      maxRequestBytes: 16384
+      maxResponseBytes: 1048576
+      maxDirectoryBytes: 1048576
+      maxAudienceEntries: 10000
+      maxDisplayNameCharacters: 256
+      maxActivePublications: 100
+      maxPreviewBytes: 65536
+      maxTargets: 1000
+      maxPublicationLifetimeMs: 604800000
     sharedAdmission:
       path: !!js process.env.DSH_REGISTRY_ADMISSION_SQLITE_PATH
       namespace: registry-production-v1

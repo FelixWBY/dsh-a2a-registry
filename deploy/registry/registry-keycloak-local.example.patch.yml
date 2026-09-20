@@ -35,12 +35,26 @@
       config:
         watch: false
 
+    - id: registry-disclosure-key-provider
+      name: '@deepseek-ai/dsh-registry-kms-software-app'
+      inject:
+        - storageDomain
+        - credentials
+      config:
+        singleInstance: true
+        rootKeyId: local-acceptance-root-v1
+        domainNamePrefix: a2a_registry_local_disclosure_keys
+        maxDataKeysPerOrganization: 2000
+        maxPendingOperationsPerOrganization: 32
+        maxActiveOrganizations: 64
+
 - id: registry-runtime
-  inject: [storageDomain, credentials]
+  inject: [storageDomain, credentials, registryDisclosureKeyProvider]
   config:
     printUrl: true
     saas:
       databaseUrlEnv: DSH_REGISTRY_POSTGRES_URL
+      disclosureKeyProvider: true
       schema: registry_saas_local
       schemaMode: validate
       allowUnsafeSharedDatabase: true
@@ -50,6 +64,18 @@
       maxActiveOrganizations: 64
       idleTimeoutMs: 30000
       statementTimeoutMs: 15000
+    productionDisclosureBridge:
+      requestTimeoutMs: 10000
+      maxConcurrentRequests: 32
+      maxRequestBytes: 16384
+      maxResponseBytes: 1048576
+      maxDirectoryBytes: 1048576
+      maxAudienceEntries: 1000
+      maxDisplayNameCharacters: 128
+      maxActivePublications: 100
+      maxPreviewBytes: 65536
+      maxTargets: 100
+      maxPublicationLifetimeMs: 604800000
     oidc:
       mode: loopback-development
       issuer: http://127.0.0.1:3182/realms/dsh-local

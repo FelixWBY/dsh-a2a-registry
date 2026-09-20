@@ -6,7 +6,8 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, ran
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const STATE_VERSION = 1
+const LEGACY_STATE_VERSION = 1
+const STATE_VERSION = 2
 const MAX_RESPONSE_BYTES = 32 * 1024
 const MAX_STATE_BYTES = 64 * 1024
 const REQUEST_TIMEOUT_MS = 15_000
@@ -19,6 +20,7 @@ const BASE64URL_32 = /^[A-Za-z0-9_-]{43}$/u
 const KEY_ID = /^sha256:[0-9a-f]{64}$/u
 const ALLOWED_SCOPES = new Set(['disclosure.sync', 'a2a.receive'])
 const DEVICE_SECRET_HASH_DOMAIN = Buffer.from('dsh:a2a:registry-device-secret:v1\0', 'utf8')
+const BRIDGE_SECRET_HASH_DOMAIN = Buffer.from('dsh:a2a:registry-disclosure-bridge-secret:v1\0', 'utf8')
 
 class CliFailure extends Error {
   constructor(message, exitCode = 1) {
@@ -70,10 +72,22 @@ function generateRegistryDeviceSecret() {
   return randomBytes(32).toString('base64url')
 }
 
+function generateRegistryBridgeSecret() {
+  return randomBytes(32).toString('base64url')
+}
+
 function hashRegistryDeviceSecret(secret) {
   if (!canonicalBase64Url(secret, 32)) fail('设备状态文件无效。')
-  return `sha256:${createHash('sha256').update(DEVICE_SECRET_HASH_DOMAIN)
-    .update(Buffer.from(secret, 'base64url')).digest('hex')}`
+  const bytes = Buffer.from(secret, 'base64url')
+  try { return `sha256:${createHash('sha256').update(DEVICE_SECRET_HASH_DOMAIN).update(bytes).digest('hex')}` }
+  finally { bytes.fill(0) }
+}
+
+function hashRegistryBridgeSecret(secret) {
+  if (!canonicalBase64Url(secret, 32)) fail('设备状态文件无效。')
+  const bytes = Buffer.from(secret, 'base64url')
+  try { return `sha256:${createHash('sha256').update(BRIDGE_SECRET_HASH_DOMAIN).update(bytes).digest('hex')}` }
+  finally { bytes.fill(0) }
 }
 
 function encodeRegistryDeviceToken({ organizationId, bindingId, secret }) {
@@ -102,6 +116,35 @@ function decodeRegistryDeviceToken(token) {
     || Buffer.from(organizationId, 'utf8').toString('base64url') !== parts[1]) fail('设备状态文件无效。')
   const result = { organizationId, bindingId: parts[2], secret: parts[3] }
   if (encodeRegistryDeviceToken(result) !== token) fail('设备状态文件无效。')
+  return result
+}
+
+function encodeRegistryBridgeToken({ organizationId, bindingId, secret }) {
+  if (!IDENTIFIER.test(organizationId) || !UUID.test(bindingId) || !canonicalBase64Url(secret, 32)) {
+    fail('设备状态文件无效。')
+  }
+  const encodedOrganization = Buffer.from(organizationId, 'utf8').toString('base64url')
+  const token = `dshb1.${encodedOrganization}.${bindingId}.${secret}`
+  if (Buffer.byteLength(token, 'utf8') > 512) fail('设备状态文件无效。')
+  return token
+}
+
+function decodeRegistryBridgeToken(token) {
+  if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > 512) fail('设备状态文件无效。')
+  const parts = token.split('.')
+  if (parts.length !== 4 || parts[0] !== 'dshb1' || !UUID.test(parts[2] ?? '')
+    || !canonicalBase64Url(parts[3], 32) || !/^[A-Za-z0-9_-]+$/u.test(parts[1] ?? '')) {
+    fail('设备状态文件无效。')
+  }
+  const organizationBytes = Buffer.from(parts[1], 'base64url')
+  if (organizationBytes.length === 0 || organizationBytes.toString('base64url') !== parts[1]) {
+    fail('设备状态文件无效。')
+  }
+  const organizationId = organizationBytes.toString('utf8')
+  if (!IDENTIFIER.test(organizationId)
+    || Buffer.from(organizationId, 'utf8').toString('base64url') !== parts[1]) fail('设备状态文件无效。')
+  const result = { organizationId, bindingId: parts[2], secret: parts[3] }
+  if (encodeRegistryBridgeToken(result) !== token) fail('设备状态文件无效。')
   return result
 }
 
@@ -461,16 +504,21 @@ function canonicalChallenge(value) {
 }
 
 function pendingState(input) {
-  const state = exactRecord(input, ['version', 'phase', 'registryOrigin', 'organizationId', 'bindingId',
-    'instanceId', 'keyId', 'instanceName', 'requestedScopes', 'expiresAt', 'challenge', 'pairingCode',
-    'deviceSecret', 'privateKeyPkcs8'])
-  if (state === null || state.version !== STATE_VERSION || state.phase !== 'pending'
+  const legacy = input?.version === LEGACY_STATE_VERSION
+  const keys = ['version', 'phase', 'registryOrigin', 'organizationId', 'bindingId', 'instanceId', 'keyId',
+    'instanceName', 'requestedScopes', 'expiresAt', 'challenge', 'pairingCode', 'deviceSecret',
+    ...(legacy ? [] : ['bridgeSecret']), 'privateKeyPkcs8']
+  const state = exactRecord(input, keys)
+  if (state === null || ![LEGACY_STATE_VERSION, STATE_VERSION].includes(state.version)
+    || state.phase !== 'pending'
     || typeof state.bindingId !== 'string' || !UUID.test(state.bindingId)
     || typeof state.organizationId !== 'string' || !IDENTIFIER.test(state.organizationId)
     || typeof state.instanceId !== 'string' || !IDENTIFIER.test(state.instanceId)
     || typeof state.keyId !== 'string' || !KEY_ID.test(state.keyId)
     || typeof state.pairingCode !== 'string' || !BASE64URL_32.test(state.pairingCode)
     || typeof state.deviceSecret !== 'string' || !BASE64URL_32.test(state.deviceSecret)
+    || (!legacy && (typeof state.bridgeSecret !== 'string' || !BASE64URL_32.test(state.bridgeSecret)
+      || state.bridgeSecret === state.deviceSecret))
     || !Array.isArray(state.requestedScopes) || state.requestedScopes.length === 0
     || state.requestedScopes.some(scope => !ALLOWED_SCOPES.has(scope))
     || new Set(state.requestedScopes).size !== state.requestedScopes.length
@@ -485,19 +533,27 @@ function pendingState(input) {
   const keyId = `sha256:${createHash('sha256').update(spki).digest('hex')}`
   if (keyId !== state.keyId) fail('设备状态文件无效。')
   try { hashRegistryDeviceSecret(state.deviceSecret) } catch { fail('设备状态文件无效。') }
+  if (!legacy) {
+    try { hashRegistryBridgeSecret(state.bridgeSecret) } catch { fail('设备状态文件无效。') }
+  }
   return { state, challenge, key }
 }
 
 function confirmedState(input) {
-  const state = exactRecord(input, ['version', 'phase', 'registryOrigin', 'organizationId', 'bindingId',
-    'instanceId', 'keyId', 'instanceName', 'requestedScopes', 'syncUrl', 'deviceSecretHash', 'deviceToken',
-    'privateKeyPkcs8'])
-  if (state === null || state.version !== STATE_VERSION || state.phase !== 'confirmed'
+  const legacy = input?.version === LEGACY_STATE_VERSION
+  const keys = ['version', 'phase', 'registryOrigin', 'organizationId', 'bindingId', 'instanceId', 'keyId',
+    'instanceName', 'requestedScopes', 'syncUrl', 'deviceSecretHash',
+    ...(legacy ? [] : ['bridgeSecretHash']), 'deviceToken', ...(legacy ? [] : ['bridgeToken']),
+    'privateKeyPkcs8']
+  const state = exactRecord(input, keys)
+  if (state === null || ![LEGACY_STATE_VERSION, STATE_VERSION].includes(state.version)
+    || state.phase !== 'confirmed'
     || typeof state.bindingId !== 'string' || !UUID.test(state.bindingId)
     || typeof state.organizationId !== 'string' || !IDENTIFIER.test(state.organizationId)
     || typeof state.instanceId !== 'string' || !IDENTIFIER.test(state.instanceId)
     || typeof state.keyId !== 'string' || !KEY_ID.test(state.keyId) || typeof state.syncUrl !== 'string'
     || typeof state.deviceSecretHash !== 'string' || !KEY_ID.test(state.deviceSecretHash)
+    || (!legacy && (typeof state.bridgeSecretHash !== 'string' || !KEY_ID.test(state.bridgeSecretHash)))
     || !Array.isArray(state.requestedScopes) || state.requestedScopes.length === 0
     || state.requestedScopes.some(scope => !ALLOWED_SCOPES.has(scope))
     || new Set(state.requestedScopes).size !== state.requestedScopes.length) fail('设备状态文件无效。')
@@ -519,6 +575,16 @@ function confirmedState(input) {
     fail('设备状态文件无效。')
   }
   if (hashRegistryDeviceSecret(decoded.secret) !== state.deviceSecretHash) fail('设备状态文件无效。')
+  if (!legacy) {
+    if (typeof state.bridgeToken !== 'string') fail('设备状态文件无效。')
+    let decodedBridge
+    try {
+      decodedBridge = decodeRegistryBridgeToken(state.bridgeToken)
+    } catch { fail('设备状态文件无效。') }
+    if (decodedBridge.organizationId !== state.organizationId || decodedBridge.bindingId !== state.bindingId
+      || hashRegistryBridgeSecret(decodedBridge.secret) !== state.bridgeSecretHash
+      || decodedBridge.secret === decoded.secret) fail('设备状态文件无效。')
+  }
   return state
 }
 
@@ -528,11 +594,13 @@ async function start(options) {
   try {
     const keyPair = generateInstanceKeyPair()
     const deviceSecret = generateRegistryDeviceSecret()
+    const bridgeSecret = generateRegistryBridgeSecret()
     const url = new URL(`/registry-api/v1/organizations/${encodeURIComponent(options.organizationId)}/bindings/start`,
       options.registryOrigin)
     const value = await postJson(url, {
       publicKeySpki: keyPair.publicKeySpki,
       deviceSecretHash: hashRegistryDeviceSecret(deviceSecret),
+      bridgeSecretHash: hashRegistryBridgeSecret(bridgeSecret),
       instanceName: options.instanceName,
       requestedScopes: options.scopes,
     }, '设备绑定启动')
@@ -559,6 +627,7 @@ async function start(options) {
       challenge,
       pairingCode: ticket.code,
       deviceSecret,
+      bridgeSecret,
       privateKeyPkcs8: exported.toString('base64url'),
     }
     exported.fill(0)
@@ -594,15 +663,24 @@ async function confirm(options) {
     fail('Registry 返回了无效响应。')
   }
   let deviceToken
+  let bridgeToken
+  const legacy = state.version === LEGACY_STATE_VERSION
   try {
     deviceToken = encodeRegistryDeviceToken({
       organizationId: state.organizationId,
       bindingId: state.bindingId,
       secret: state.deviceSecret,
     })
+    if (!legacy) {
+      bridgeToken = encodeRegistryBridgeToken({
+        organizationId: state.organizationId,
+        bindingId: state.bindingId,
+        secret: state.bridgeSecret,
+      })
+    }
   } catch { fail('设备状态文件无效。') }
   const confirmed = {
-    version: STATE_VERSION,
+    version: state.version,
     phase: 'confirmed',
     registryOrigin: state.registryOrigin,
     organizationId: state.organizationId,
@@ -613,14 +691,22 @@ async function confirm(options) {
     requestedScopes: state.requestedScopes,
     syncUrl: challenge.audience,
     deviceSecretHash: hashRegistryDeviceSecret(state.deviceSecret),
+    ...(!legacy ? { bridgeSecretHash: hashRegistryBridgeSecret(state.bridgeSecret) } : {}),
     deviceToken,
+    ...(!legacy ? { bridgeToken } : {}),
     privateKeyPkcs8: state.privateKeyPkcs8,
   }
   await replaceAtomically(options.statePath, `${JSON.stringify(confirmed, null, 2)}\n`)
   process.stdout.write([
     'registry-device-enrollment: 设备绑定已确认。',
-    '待审批状态已原子替换；配对码和独立 raw secret 字段已移除。',
-    '设备 secret 已封装进 dsh1 token；token 和私钥仍是长期敏感凭据。',
+    ...(legacy ? [
+      '旧版待审批状态已确认；设备 secret 已封装进 dsh1 token。',
+      '该凭据仅支持 WSS 连接；如需 disclosure publication，请撤销旧设备并重新绑定。',
+    ] : [
+      '待审批状态已原子替换；配对码和两个独立 raw secret 字段已移除。',
+      'WSS 设备 secret 与 disclosure bridge secret 分别封装进 dsh1、dshb1 token。',
+      '两个 token 和私钥仍是长期敏感凭据，不能互换或复用。',
+    ]),
     '下一步运行 export-env，为 Harness 生成独占环境文件。',
     '',
   ].join('\n'))
@@ -634,6 +720,7 @@ async function exportEnvironment(options) {
     `DSH_INSTANCE_ID=${state.instanceId}`,
     `DSH_REGISTRY_SYNC_URL=${state.syncUrl}`,
     `DSH_REGISTRY_DEVICE_TOKEN=${state.deviceToken}`,
+    ...(state.version === STATE_VERSION ? [`DSH_REGISTRY_DISCLOSURE_TOKEN=${state.bridgeToken}`] : []),
     `DSH_REGISTRY_DEVICE_PRIVATE_KEY=${state.privateKeyPkcs8}`,
     '',
   ].join('\n')
@@ -641,6 +728,9 @@ async function exportEnvironment(options) {
   process.stdout.write([
     'registry-device-enrollment: Harness 环境文件已生成。',
     '文件包含设备凭据，不要上传、发送或提交到 Git。',
+    ...(state.version === LEGACY_STATE_VERSION
+      ? ['旧版五项环境文件仅支持 WSS 连接；启用 disclosure publication 必须撤销旧设备并重新绑定。']
+      : []),
     '',
   ].join('\n'))
 }

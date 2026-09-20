@@ -1,7 +1,8 @@
 /** Binding candidates are not connection credentials or account authentication. */
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { RegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
-import type { InstanceKeyId, RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
+import type { InstanceKeyId, RegistryBridgeSecretHash,
+  RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import type { DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 
@@ -30,6 +31,8 @@ export interface RegistryBindingRequest {
   readonly publicKeySpki: string
   /** Device-only secret commitment; the raw secret never crosses enrollment storage or browser review. */
   readonly deviceSecretHash: RegistryDeviceSecretHash
+  /** Independent HTTPS bridge-secret commitment; it must never reuse the WSS device secret. */
+  readonly bridgeSecretHash: RegistryBridgeSecretHash
   readonly instanceName: string
   readonly requestedScopes: readonly RegistryBindingScope[]
 }
@@ -101,10 +104,17 @@ export interface RegistryBindingRecordV5 extends RegistryBindingRecordBase {
   readonly deviceSecretHash: RegistryDeviceSecretHash
 }
 
-export type RegistryBindingRecord = RegistryBindingRecordV4 | RegistryBindingRecordV5
+/** Current enrollment record with independently revocable WSS and HTTPS bridge credentials. */
+export interface RegistryBindingRecordV6 extends RegistryBindingRecordBase {
+  readonly version: 6
+  readonly deviceSecretHash: RegistryDeviceSecretHash
+  readonly bridgeSecretHash: RegistryBridgeSecretHash
+}
+
+export type RegistryBindingRecord = RegistryBindingRecordV4 | RegistryBindingRecordV5 | RegistryBindingRecordV6
 
 /** Return the code once to the initiating device; persist only the record. */
 export interface RegistryBindingStart {
   readonly code: string
-  readonly record: RegistryBindingRecordV5
+  readonly record: RegistryBindingRecordV6
 }

@@ -10,6 +10,9 @@ const BUNDLE_PATCH = resolve(ROOT, 'packages/bundle/registry-app/cordis.patch.ym
 const CREDENTIALS_PROVIDER = '@deepseek-ai/dsh-credentials-local'
 const DISCLOSURE_CONTENT_PROVIDER_ENTRY = 'registry-disclosure-content-provider'
 const DISCLOSURE_CONTENT_PROVIDER_SERVICE = 'registryDisclosureContentProvider'
+const DISCLOSURE_KEY_PROVIDER_ENTRY = 'registry-disclosure-key-provider'
+const DISCLOSURE_KEY_PROVIDER_NAME = '@deepseek-ai/dsh-registry-kms-software-app'
+const DISCLOSURE_KEY_PROVIDER_SERVICE = 'registryDisclosureKeyProvider'
 const BILLING_PROVIDER_ENTRY = 'registry-billing-provider'
 const BILLING_PROVIDER_SERVICE = 'registryBillingProvider'
 const TEST_CONFIGURATION_VALUES = new Set(['test-only', 'local-test', 'loopback-development'])
@@ -146,6 +149,48 @@ export function productionGraphIssues(composedEntries, composeWarnings = []) {
   if (enablesDisclosureContentProvider ? disclosureContentProviders.length !== 1
     : disclosureContentProviders.length !== 0) {
     issues.push(`enabled disclosure content requires exactly one active ${DISCLOSURE_CONTENT_PROVIDER_ENTRY} entry; disabled disclosure content requires none`)
+  }
+  const disclosureKeyProviders = entries.filter(entry => entry.id === DISCLOSURE_KEY_PROVIDER_ENTRY)
+  const softwareKeyProviders = entries.filter(entry => entry.name === DISCLOSURE_KEY_PROVIDER_NAME)
+  const injectsDisclosureKeyProvider = Array.isArray(runtime?.inject)
+    && runtime.inject.includes(DISCLOSURE_KEY_PROVIDER_SERVICE)
+  const enablesDisclosureKeyProvider = saas?.disclosureKeyProvider === true
+  if (saas?.disclosureKeyProvider !== undefined
+    && saas.disclosureKeyProvider !== true && saas.disclosureKeyProvider !== false) {
+    issues.push('registry-runtime.saas.disclosureKeyProvider must be a literal boolean')
+  }
+  if (enablesDisclosureKeyProvider !== injectsDisclosureKeyProvider) {
+    issues.push(`registry-runtime.saas.disclosureKeyProvider and ${DISCLOSURE_KEY_PROVIDER_SERVICE} injection must be enabled together`)
+  }
+  if (enablesDisclosureKeyProvider ? disclosureKeyProviders.length !== 1 : disclosureKeyProviders.length !== 0) {
+    issues.push(`enabled disclosure keys require exactly one active ${DISCLOSURE_KEY_PROVIDER_ENTRY} entry; disabled disclosure keys require none`)
+  }
+  if (enablesDisclosureKeyProvider ? softwareKeyProviders.length !== 1
+    || softwareKeyProviders[0] !== disclosureKeyProviders[0] : softwareKeyProviders.length !== 0) {
+    issues.push(`enabled disclosure keys require one ${DISCLOSURE_KEY_PROVIDER_NAME} at ${DISCLOSURE_KEY_PROVIDER_ENTRY}; disabled disclosure keys require none`)
+  }
+  if (disclosureKeyProviders.length === 1) {
+    const provider = disclosureKeyProviders[0]
+    if (provider.name !== DISCLOSURE_KEY_PROVIDER_NAME) {
+      issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY} must use ${DISCLOSURE_KEY_PROVIDER_NAME}`)
+    }
+    if (!Array.isArray(provider.inject) || !provider.inject.includes('storageDomain')
+      || !provider.inject.includes('credentials')) {
+      issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY} must inject storageDomain and credentials`)
+    }
+    const providerConfig = objectConfig(provider, DISCLOSURE_KEY_PROVIDER_ENTRY, issues)
+    if (providerConfig?.singleInstance !== true) {
+      issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY}.singleInstance must be true`)
+    }
+    if (!isExactExpression(providerConfig?.rootKeyId,
+      'process.env.DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID')) {
+      issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY}.rootKeyId must use DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID`)
+    }
+  }
+  const disclosureBridge = requiredRecord(runtimeConfig?.productionDisclosureBridge,
+    'registry-runtime.productionDisclosureBridge', issues)
+  if (disclosureBridge !== undefined && !enablesDisclosureKeyProvider) {
+    issues.push('registry-runtime.productionDisclosureBridge requires the disclosure key provider')
   }
   const billingProviders = entries.filter(entry => entry.id === BILLING_PROVIDER_ENTRY)
   const injectsBillingProvider = Array.isArray(runtime?.inject) && runtime.inject.includes(BILLING_PROVIDER_SERVICE)

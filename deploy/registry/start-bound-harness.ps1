@@ -35,13 +35,14 @@ if ($null -ne (Get-Item -LiteralPath 'Env:NODE_OPTIONS' -ErrorAction SilentlyCon
   throw '启动 Harness 前必须移除 NODE_OPTIONS。'
 }
 
-$deviceEnvironmentNames = @(
+$requiredDeviceEnvironmentNames = @(
   'DSH_REGISTRY_ORGANIZATION_ID',
   'DSH_INSTANCE_ID',
   'DSH_REGISTRY_SYNC_URL',
   'DSH_REGISTRY_DEVICE_TOKEN',
   'DSH_REGISTRY_DEVICE_PRIVATE_KEY'
 )
+$deviceEnvironmentNames = @($requiredDeviceEnvironmentNames) + @('DSH_REGISTRY_DISCLOSURE_TOKEN')
 
 . (Join-Path $PSScriptRoot 'windows-private-path-gate.ps1')
 
@@ -83,7 +84,7 @@ function Read-EnrollmentEnvironment([string]$Path) {
     $name = $line.Substring(0, $separator)
     $value = $line.Substring($separator + 1)
     if ($deviceEnvironmentNames -cnotcontains $name) {
-      throw 'enrollment 环境文件只能包含绑定工具导出的五个变量。'
+      throw 'enrollment 环境文件只能包含绑定工具导出的五项连接变量及可选的 disclosure token。'
     }
     if ($values.ContainsKey($name)) {
       throw 'enrollment 环境文件中的变量不能重复。'
@@ -94,9 +95,10 @@ function Read-EnrollmentEnvironment([string]$Path) {
     }
     $values[$name] = $value
   }
-  if ($values.Count -ne $deviceEnvironmentNames.Count -or
-    @($deviceEnvironmentNames | Where-Object { -not $values.ContainsKey($_) }).Count -ne 0) {
-    throw 'enrollment 环境文件必须各包含一次绑定工具导出的五个变量。'
+  if (($values.Count -ne $requiredDeviceEnvironmentNames.Count -and
+      $values.Count -ne $deviceEnvironmentNames.Count) -or
+    @($requiredDeviceEnvironmentNames | Where-Object { -not $values.ContainsKey($_) }).Count -ne 0) {
+    throw 'enrollment 环境文件必须严格包含旧版五项连接变量，或包含新增独立 disclosure token 的六项变量。'
   }
   if ($values['DSH_REGISTRY_ORGANIZATION_ID'] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$' -or
     $values['DSH_INSTANCE_ID'] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$') {
@@ -115,6 +117,11 @@ function Read-EnrollmentEnvironment([string]$Path) {
   if ($values['DSH_REGISTRY_DEVICE_TOKEN'].Length -gt 512 -or
     $values['DSH_REGISTRY_DEVICE_TOKEN'] -notmatch '^dsh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$' -or
     $values['DSH_REGISTRY_DEVICE_PRIVATE_KEY'] -notmatch '^[A-Za-z0-9_-]+$') {
+    throw 'enrollment 环境文件中的设备凭据格式无效。'
+  }
+  if ($values.ContainsKey('DSH_REGISTRY_DISCLOSURE_TOKEN') -and
+    ($values['DSH_REGISTRY_DISCLOSURE_TOKEN'].Length -gt 512 -or
+      $values['DSH_REGISTRY_DISCLOSURE_TOKEN'] -notmatch '^dshb1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$')) {
     throw 'enrollment 环境文件中的设备凭据格式无效。'
   }
   return $values
@@ -164,20 +171,38 @@ const canonical = (value, expectedBytes) => {
   return bytes
 }
 let keyBytes
+let deviceSecretBytes
+let disclosureSecretBytes
 let valid = false
 try {
   const organizationId = process.env.DSH_REGISTRY_ORGANIZATION_ID ?? ''
   const token = process.env.DSH_REGISTRY_DEVICE_TOKEN ?? ''
+  const disclosureToken = process.env.DSH_REGISTRY_DISCLOSURE_TOKEN ?? ''
+  const hasDisclosureToken = disclosureToken.length > 0
   const privateKey = process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY ?? ''
   const parts = token.split('.')
+  const disclosureParts = disclosureToken.split('.')
   if (!identifier.test(organizationId) || Buffer.byteLength(token, 'utf8') > 512
     || parts.length !== 4 || parts[0] !== 'dsh1' || !uuid.test(parts[2] ?? '')) throw new Error()
+  if (hasDisclosureToken && (Buffer.byteLength(disclosureToken, 'utf8') > 512
+    || disclosureParts.length !== 4 || disclosureParts[0] !== 'dshb1'
+    || !uuid.test(disclosureParts[2] ?? ''))) throw new Error()
   const organizationBytes = canonical(parts[1])
-  const secretBytes = canonical(parts[3], 32)
-  if (organizationBytes === undefined || secretBytes === undefined) throw new Error()
+  deviceSecretBytes = canonical(parts[3], 32)
+  const disclosureOrganizationBytes = hasDisclosureToken ? canonical(disclosureParts[1]) : undefined
+  disclosureSecretBytes = hasDisclosureToken ? canonical(disclosureParts[3], 32) : undefined
+  if (organizationBytes === undefined || deviceSecretBytes === undefined
+    || (hasDisclosureToken
+      && (disclosureOrganizationBytes === undefined || disclosureSecretBytes === undefined))) throw new Error()
   const selectedOrganization = organizationBytes.toString('utf8')
   if (!identifier.test(selectedOrganization) || selectedOrganization !== organizationId
     || Buffer.from(selectedOrganization, 'utf8').toString('base64url') !== parts[1]) throw new Error()
+  if (hasDisclosureToken) {
+    const selectedDisclosureOrganization = disclosureOrganizationBytes.toString('utf8')
+    if (selectedDisclosureOrganization !== organizationId
+      || Buffer.from(selectedDisclosureOrganization, 'utf8').toString('base64url') !== disclosureParts[1]
+      || disclosureParts[2] !== parts[2] || disclosureSecretBytes.equals(deviceSecretBytes)) throw new Error()
+  }
   keyBytes = canonical(privateKey)
   if (keyBytes === undefined) throw new Error()
   const key = createPrivateKey({ key: keyBytes, format: 'der', type: 'pkcs8' })
@@ -187,7 +212,11 @@ try {
   }
   valid = true
 } catch {}
-finally { if (keyBytes !== undefined) keyBytes.fill(0) }
+finally {
+  if (keyBytes !== undefined) keyBytes.fill(0)
+  if (deviceSecretBytes !== undefined) deviceSecretBytes.fill(0)
+  if (disclosureSecretBytes !== undefined) disclosureSecretBytes.fill(0)
+}
 if (!valid) process.exit(1)
 '@
   $encodedValidator = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($validator))
@@ -195,6 +224,9 @@ if (!valid) process.exit(1)
     DSH_REGISTRY_ORGANIZATION_ID = $Values['DSH_REGISTRY_ORGANIZATION_ID']
     DSH_REGISTRY_DEVICE_TOKEN = $Values['DSH_REGISTRY_DEVICE_TOKEN']
     DSH_REGISTRY_DEVICE_PRIVATE_KEY = $Values['DSH_REGISTRY_DEVICE_PRIVATE_KEY']
+  }
+  if ($Values.ContainsKey('DSH_REGISTRY_DISCLOSURE_TOKEN')) {
+    $validationEnvironment['DSH_REGISTRY_DISCLOSURE_TOKEN'] = $Values['DSH_REGISTRY_DISCLOSURE_TOKEN']
   }
   try {
     $validation = Start-WhitelistedProcess @{
@@ -287,7 +319,7 @@ try {
     NODE_EXTRA_CA_CERTS = $CaCertificate
     NODE_TLS_REJECT_UNAUTHORIZED = '1'
   }
-  foreach ($name in $deviceEnvironmentNames) {
+  foreach ($name in @($deviceEnvironment.Keys)) {
     $childEnvironment[$name] = $deviceEnvironment[$name]
   }
 
@@ -350,7 +382,7 @@ try {
     foreach ($name in @($childEnvironment.Keys)) { $childEnvironment[$name] = $null }
     $childEnvironment = $null
   }
-  foreach ($name in $deviceEnvironmentNames) { $deviceEnvironment[$name] = $null }
+  foreach ($name in @($deviceEnvironment.Keys)) { $deviceEnvironment[$name] = $null }
   $deviceEnvironment = $null
 }
 

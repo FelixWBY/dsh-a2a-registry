@@ -1,7 +1,8 @@
-# Production Harness-to-Registry A2A foundation. Copy into a deployment-owned
-# patch and add real providers for productionDisclosureAuthority,
-# registryDisclosureKeyPublisher and sessionDisclosureRefresh. This file
-# deliberately invents none of them.
+# Production Harness-to-Registry A2A foundation. The bundled HTTPS bridge
+# supplies productionDisclosureAuthority and registryDisclosureKeyPublisher
+# through the Registry-owned endpoint and the independently enrolled dshb1
+# credential. A production sessionDisclosureRefresh provider is still required
+# before policy changes can refresh an already-open Session automatically.
 
 - id: web-runtime
   inject:
@@ -38,6 +39,14 @@
         retryCapMs: 30000
         retryJitterMin: 0.5
         retryJitterMax: 1
+    productionDisclosureHttpsBridge:
+      mode: https-bridge
+      url: !!js process.env.DSH_REGISTRY_DISCLOSURE_BRIDGE_URL
+      tokenEnv: DSH_REGISTRY_DISCLOSURE_TOKEN
+      requestTimeoutMs: 10000
+      maxResponseBytes: 1048576
+      maxAudienceEntries: 10000
+      maxDisplayNameCharacters: 256
     productionDisclosurePublication:
       mode: production
       storageRoot: !!js process.env.DSH_DISCLOSURE_STATE_PATH

@@ -2,9 +2,9 @@
 
 请按[独立部署说明](../README.md)操作。本目录提供独立 Registry、外部 Harness、OIDC 和多租户 PostgreSQL 所需的配置模板及本地运维工具，不再使用原单体仓库的启动命令。
 
-生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时、PostgreSQL RLS、持久导入队列和加密提问邮箱。把 `registry-production.example.patch.yml` 安装为 `/etc/dsh/registry-production.patch.yml`，只在该最终 overlay 增加部署专属 provider；systemd 示例会对启动所用的同一组三层 patch 运行 `verify-production-graph.mjs`。真实 KMS 适配器只能实现独立 `registryDisclosureContentProvider`，不得注册或替换整套 `registryDisclosureOperations`；其条目标识必须是 `registry-disclosure-content-provider`，同时完整保留 Registry 运行时配置并设置 `saas.disclosureContentProvider: true`，再把服务名加入该运行时的 `inject`。支付适配器的固定条目标识是 `registry-billing-provider`，必须同时设置 `saas.billingProvider: true` 并注入 `registryBillingProvider`。生产图门禁要求每组各自三项同时存在或同时缺省，使 Loader 建立启动与卸载依赖。生产 credentials provider 仅解析服务启动环境，文件、`.env` 和写入路径全部关闭。所有 `.example` 文件均不包含真实凭据；除只读安装的基础层外，部署副本应放在仓库外。`DSH_REGISTRY_MAILBOX_KEY` 必须是秘密管理器注入的规范 base64url 32 字节根密钥；Registry 按组织派生邮箱密钥，轮换前必须先完成现有密文的迁移演练，不能直接替换后丢失回复解密能力。
+生产基础配置叠加 `registry-postgres.example.patch.yml` 后启用 SaaS 模式、自助组织创建／切换、按组织延迟加载运行时、PostgreSQL RLS、持久导入队列、加密提问邮箱、单实例 software-local disclosure KMS 和受认证的 Harness publication bridge。把 `registry-production.example.patch.yml` 安装为 `/etc/dsh/registry-production.patch.yml`，只在该最终 overlay 增加部署专属 provider；systemd 示例会对启动所用的同一组三层 patch 运行 `verify-production-graph.mjs`。正文解密／投影适配器只能实现独立 `registryDisclosureContentProvider`，不得注册或替换整套 `registryDisclosureOperations`；其条目标识必须是 `registry-disclosure-content-provider`，同时完整保留 Registry 运行时配置并设置 `saas.disclosureContentProvider: true`，再把服务名加入该运行时的 `inject`。支付适配器的固定条目标识是 `registry-billing-provider`，必须同时设置 `saas.billingProvider: true` 并注入 `registryBillingProvider`。生产图门禁要求每组各自三项同时存在或同时缺省，使 Loader 建立启动与卸载依赖。生产 credentials provider 仅解析服务启动环境，文件、`.env` 和写入路径全部关闭。所有 `.example` 文件均不包含真实凭据；除只读安装的基础层外，部署副本应放在仓库外。`DSH_REGISTRY_MAILBOX_KEY` 必须是秘密管理器注入的规范 base64url 32 字节根密钥；Registry 按组织派生邮箱密钥，轮换前必须先完成现有密文的迁移演练，不能直接替换后丢失回复解密能力。software-local disclosure KMS 另用 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID` 标记根密钥版本，并从秘密管理读取规范 base64url 32 字节 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY`；不得与邮箱根密钥复用，标识或材料变更前必须完成密文迁移和恢复演练。该实现明确不是 HSM，也不支持多副本并发写；扩容前必须替换为分布式／硬件托管 provider。
 
-SaaS 设备同步使用 v5 绑定内建认证：Harness 在本机生成 Ed25519 密钥和独立的 32 字节设备 secret，只把公钥与 secret 摘要提交给 Registry。成员审批并由 Harness 签名确认后，本机保存 `dsh1` 设备 token 和私钥；连接 WSS 时仍须签署 Registry 的一次性随机挑战。人工配对码、网页账号会话和共享测试密钥都不能替代设备凭据。
+新 SaaS 设备使用 v6 绑定：Harness 在本机生成 Ed25519 密钥、独立的 WSS 设备 secret 和 disclosure bridge secret，只把公钥与两个域分离摘要提交给 Registry。成员审批并由 Harness 签名确认后，本机分别保存 `dsh1`、`dshb1` 和私钥；连接 WSS 仍须签署 Registry 的一次性随机挑战，HTTPS bridge 则在每次请求重新验证当前绑定、成员和 `disclosure.sync`。旧 v4/v5 记录继续支持原有读取或 WSS 兼容，但不能获得 bridge 权限。人工配对码、网页账号会话和共享测试密钥都不能替代设备凭据。
 
 ## 正式 OIDC 验收
 
@@ -54,7 +54,9 @@ node deploy/registry/enroll-registry-device.mjs export-env `
   --output C:\dsh-private\harness-registry.env
 ```
 
-确认成功会在再次复核路径和 ACL 后原子替换状态文件，删除配对码和独立 raw secret 字段；同一个设备 secret 已封装进 `dsh1` token，因此 token 与 Ed25519 PKCS8 私钥仍是长期敏感凭据。导出的五个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供启用完整披露链路的 `harness-production-publication.example.patch.yml` 使用；后者还必须配置 KMS 与披露权威实现。两个文件都含设备凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
+确认成功会在再次复核路径和 ACL 后原子替换状态文件，删除配对码和两个独立 raw secret 字段；WSS 设备 secret 与 disclosure bridge secret 分别封装进 `dsh1`、`dshb1` token。导出的六个变量可供只启用鉴权、在线状态与重连的 `harness-registry-connection.example.patch.yml` 使用，也可供 `harness-production-publication.example.patch.yml` 调用内建 HTTPS bridge 完成权限、容量和数据密钥提供。自动刷新既有 Session 和 Registry 正文投影仍需各自的生产 provider。两个文件都含长期敏感凭据，必须只允许 Harness 服务账号读取，不能上传、发送或提交到 Git；需要重做时请先在 Registry 撤销旧设备，再由运维人员明确移走旧文件。
+
+升级前遗留的 V1 待确认状态仍可完成 `confirm`，V1 已确认状态仍可 `export-env`；两者都只保留原有 `dsh1`，导出严格五项变量，仅支持 connection-only WSS。工具不会把旧 secret 复用为 `dshb1`，也不会把 V1 状态静默升级为可发布状态。要启用 HTTPS disclosure publication，必须撤销旧设备并重新绑定。`check-production-environment.mjs harness`／`all` 对应公网完整 publication，仍固定要求新六项凭据，并要求 `DSH_REGISTRY_DISCLOSURE_BRIDGE_URL` 精确指向同一 `REGISTRY_DOMAIN` 的 `/a2a/v1/disclosure-publication` HTTPS 地址，不接受显式端口、凭据、查询或片段。
 
 在连接某个 Harness 源码版本前，先运行无秘密的线协议兼容检查：
 
@@ -111,7 +113,7 @@ Remove-Item Env:NODE_OPTIONS, Env:NODE_PATH -ErrorAction SilentlyContinue
 
 上述产物必须在真实设备切换前由 `start-bound-harness.ps1` 完成本机 Web 启动验收；它只证明 CLI 与 connection-only 配置可以合成，不证明依赖安装脚本无关。后续完整 Agent／PTY／本机持久化链路若需要 `node-pty`、`koffi` 等安装产物，必须另做“无秘密构建账号生成并签名 → 最终服务账号只物化和复核”的两阶段交付，再实跑相应功能；当前准备器不提供脚本开启开关，也不得在已经保存设备密钥的服务账号中执行第三方安装脚本。
 
-Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动连接专用 overlay。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和 overlay 一起放进受保护目录。启动器只绑定 `127.0.0.1`，端口默认是 3080，也可用 `-Port` 选择 1–65535 范围内的独立空闲端口；它不会停止或替换占用端口的进程。它只接受绑定工具导出的五个变量且每项恰好一次，校验 token 所属组织和 Ed25519 PKCS8 私钥，不会显示变量值。启动器拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
+Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动连接专用 overlay。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和 overlay 一起放进受保护目录。启动器只绑定 `127.0.0.1`，端口默认是 3080，也可用 `-Port` 选择 1–65535 范围内的独立空闲端口；它不会停止或替换占用端口的进程。它严格接受旧版五项或新版六项变量且每项恰好一次：五项只校验 `dsh1`、组织与 Ed25519 PKCS8 私钥；六项还会校验 `dshb1` 与 `dsh1` 选择同一组织和绑定且 secret 相互独立。启动器不会显示变量值。它拒绝带 `NODE_OPTIONS` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式设备配置；`NODE_PATH` 与其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 
 先在真实 Harness 服务账号下创建三个私有目录，并在写入 enrollment 状态／环境文件前关闭继承。启动器会再次检查目录与环境文件的实际 ACL：Allow 条目只可属于当前账号、`SYSTEM` 或本机管理员，私有目录本身必须已关闭继承。日志可能包含一次性 Web 启动 URL，也按凭据处理。以下示例只授权当前账号与 `SYSTEM`；如确需管理员恢复权限，可另外授予 `*S-1-5-32-544`：
 
@@ -148,6 +150,6 @@ PostgreSQL 必须在停服后按 `deploy/postgres/split-registry-runtime-role.sq
 
 生产探针分为两层：`/healthz` 只报告进程存活；SaaS `/readyz` 会同时通过实际 storage pool 与 tenancy pool 读取权威 schema 版本标记，并拒绝任何非 PostgreSQL 的 domain 路由。数据库失联、任一标记缺失或应用尚未加载完成时 readiness 返回 503，恢复后无需重启即可回到 200。读取使用单飞、2 秒 HTTP 有界等待、1.5 秒查询超时和 1 秒结果缓存；新建连接仍受连接池 10 秒硬上限约束，避免网络半开时永久占住探针。不要把 `/healthz` 改成 Caddy 的流量就绪门禁。公网验证还会以不跟随跳转的方式直连 HTTP 80，只接受同域、同路径与查询、无凭据的 HTTPS 443 永久跳转；端口 80 不得代理 Registry 业务响应。
 
-本地开发先启动仓库提供的 PostgreSQL 容器。首次初始化或结构升级时，先停止 3081／3181 两个 Registry，再显式运行 `start-local-keycloak.ps1 -UpgradeDatabase`；它执行一次 `split → migrate → split` 后启动站点。日常运行只执行 `start-local-keycloak.ps1`，不会改数据库结构，只由在线进程做只读校验。脚本启动固定版本 Keycloak、打开用户自助注册，并用固定版本 Caddy 在 `wss://localhost:3183/a2a/v1/sync` 提供本地 TLS 设备同步入口；内部 CA 根证书路径会随启动结果返回。Harness 连接此本地地址时须把返回路径设为该进程的 `NODE_EXTRA_CA_CERTS`，不能关闭 TLS 校验。生成的凭据和 CA 数据只写入 Git 忽略且限制当前用户访问的 `.artifacts`。`-RegistryOnly` 不启动或停止现有 Keycloak／Caddy，只复用已经就绪的本地容器。本地 Keycloak 与内部 CA 均不得用于生产。
+本地开发先启动仓库提供的 PostgreSQL 容器。首次初始化或结构升级时，先停止 3081／3181 两个 Registry，再显式运行 `start-local-keycloak.ps1 -UpgradeDatabase`；它执行一次 `split → migrate → split` 后启动站点。日常运行只执行 `start-local-keycloak.ps1`，不会改数据库结构，只由在线进程做只读校验。脚本启动固定版本 Keycloak、打开用户自助注册，并用固定版本 Caddy 同时提供 `wss://localhost:3183/a2a/v1/sync` 和 `https://localhost:3183/a2a/v1/disclosure-publication`；本地 software-local KMS 根密钥只保存在受限的 `.artifacts` 私有配置中并以环境凭据注入。内部 CA 根证书路径会随启动结果返回。Harness 连接这两个本地地址时须把返回路径设为该进程的 `NODE_EXTRA_CA_CERTS`，不能关闭 TLS 校验。生成的凭据和 CA 数据只写入 Git 忽略且限制当前用户访问的 `.artifacts`。`-RegistryOnly` 不启动或停止现有 Keycloak／Caddy，只复用已经就绪的本地容器。本地 Keycloak、software-local 根密钥与内部 CA 均不得用于生产。
 
 已有单组织 PostgreSQL storage v1 上线前必须停写、备份并迁移。使用默认只读计划、显式 schema 和预期计数的 [v1 到 v2 迁移工具](migrate-postgres-storage-v1-to-v2.md)；不要把硬编码 `registry` 的旧 SQL 用到其他 schema。

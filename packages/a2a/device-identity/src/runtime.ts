@@ -9,15 +9,23 @@ import type { LocalRegistryConnection, RegistryChallenge, RegistryChallengeAttem
 
 export type * from './runtime-types.ts'
 export {
+  REGISTRY_BRIDGE_TOKEN_MAX_BYTES,
   REGISTRY_DEVICE_TOKEN_MAX_BYTES,
+  RegistryBridgeTokenError,
   RegistryDeviceTokenError,
+  decodeRegistryBridgeSecretHash,
+  decodeRegistryBridgeToken,
   decodeRegistryDeviceSecretHash,
   decodeRegistryDeviceToken,
+  encodeRegistryBridgeToken,
   encodeRegistryDeviceToken,
+  generateRegistryBridgeSecret,
   generateRegistryDeviceSecret,
+  hashRegistryBridgeSecret,
   hashRegistryDeviceSecret,
 } from './device-token.ts'
-export type { RegistryDeviceSecretHash, RegistryDeviceTokenParts } from './device-token.ts'
+export type { RegistryBridgeSecretHash, RegistryBridgeTokenParts,
+  RegistryDeviceSecretHash, RegistryDeviceTokenParts } from './device-token.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

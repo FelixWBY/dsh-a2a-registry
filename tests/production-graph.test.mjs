@@ -81,6 +81,35 @@ test('installable production graph is closed and rejects unsafe deployment mutat
       entry(entries, 'registry-runtime').config.saas.disclosureContentProvider = true
       entry(entries, 'registry-runtime').inject.push('registryDisclosureContentProvider')
     }, /requires exactly one active registry-disclosure-content-provider entry/u],
+    ['disclosure key provider missing runtime injection', entries => {
+      entry(entries, 'registry-runtime').inject = entry(entries, 'registry-runtime').inject
+        .filter(value => value !== 'registryDisclosureKeyProvider')
+    }, /disclosureKeyProvider and registryDisclosureKeyProvider injection must be enabled together/u],
+    ['disclosure key provider missing fixed entry', entries => {
+      entries.splice(entries.findIndex(row => row.id === 'registry-disclosure-key-provider'), 1)
+    }, /enabled disclosure keys require exactly one active registry-disclosure-key-provider entry/u],
+    ['disclosure key provider wrong package', entries => {
+      entry(entries, 'registry-disclosure-key-provider').name = '@example/registry-disclosure-key-provider'
+    }, /must use @deepseek-ai\/dsh-registry-kms-software-app/u],
+    ['duplicate software disclosure key provider', entries => entries.push({
+      id: 'shadow-disclosure-key-provider', name: '@deepseek-ai/dsh-registry-kms-software-app',
+      inject: ['storageDomain', 'credentials'], config: { singleInstance: true, rootKeyId: 'shadow' },
+    }), /require one @deepseek-ai\/dsh-registry-kms-software-app/u],
+    ['disclosure key provider without single-instance acknowledgement', entries => {
+      entry(entries, 'registry-disclosure-key-provider').config.singleInstance = false
+    }, /singleInstance must be true/u],
+    ['disclosure key provider embedded root id', entries => {
+      entry(entries, 'registry-disclosure-key-provider').config.rootKeyId = 'root-v1'
+    }, /rootKeyId must use DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID/u],
+    ['production bridge missing', entries => {
+      delete entry(entries, 'registry-runtime').config.productionDisclosureBridge
+    }, /registry-runtime\.productionDisclosureBridge must be configured/u],
+    ['production bridge without key provider enablement', entries => {
+      entry(entries, 'registry-runtime').config.saas.disclosureKeyProvider = false
+      entry(entries, 'registry-runtime').inject = entry(entries, 'registry-runtime').inject
+        .filter(value => value !== 'registryDisclosureKeyProvider')
+      entries.splice(entries.findIndex(row => row.id === 'registry-disclosure-key-provider'), 1)
+    }, /productionDisclosureBridge requires the disclosure key provider/u],
     ['billing provider missing runtime injection', entries => {
       entries.push({ id: 'registry-billing-provider', name: '@example/registry-billing-provider' })
       entry(entries, 'registry-runtime').config.saas.billingProvider = true

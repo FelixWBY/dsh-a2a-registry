@@ -1,10 +1,10 @@
 # Single-host production foundation. Its credentials provider resolves only the
 # inherited service environment: it cannot read .env or credential files and cannot write secrets.
-# SaaS producer authentication,
-# tenant imports and encrypted text questions are enabled by the PostgreSQL SaaS patch;
-# producer authentication does not use a deployment-wide bearer token. Disclosure body
-# decryption remains unconfigured and returns 501 until its KMS provider is added;
-# unfinished P-KMS does not by itself prevent Registry startup.
+# SaaS producer authentication, tenant imports, encrypted text questions, the
+# software-local disclosure-key owner and the authenticated disclosure bridge
+# are enabled by the PostgreSQL SaaS patch. Producer authentication does not
+# use a deployment-wide bearer token. Disclosure body projection remains
+# unconfigured and returns 501 until its separate content provider is added.
 # Never add localHarness or a test-only identity to this file.
 
 - insert:

@@ -9,6 +9,7 @@ import {
   RegistryProducerAuthenticator,
   decodeRegistryAudience,
   decodeRegistryDeviceToken,
+  hashRegistryBridgeSecret,
   hashRegistryDeviceSecret,
   verifyRegistryChallenge,
   type AuthenticatedRegistryConnection,
@@ -17,6 +18,7 @@ import {
   type RegistryChallengeAttempt,
   type RegistryConnectionAuthority,
   type RegistryConnectionIdentity,
+  type RegistryBridgeSecretHash,
   type RegistryDeviceSecretHash,
 } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { RegistryRuntimeInvalidation } from './runtime-store.ts'
@@ -84,6 +86,7 @@ class BindingCredentialLease {
 
   constructor(readonly runtime: RegistryRuntimeStoreLease, readonly organizationId: OrganizationId,
     readonly bindingId: RegistryBindingId, readonly presentedHash: RegistryDeviceSecretHash,
+    readonly sameRawBridgeHash: RegistryBridgeSecretHash,
     signals: readonly AbortSignal[]) {
     const stop = (): void => { this.invalidated.abort() }
     for (const signal of signals) {
@@ -102,7 +105,8 @@ class BindingCredentialLease {
   }
 
   authenticate(): Promise<RegistryConnectionAuthority> {
-    return this.runtime.store.authenticateBindingCredential(this.bindingId, this.presentedHash)
+    return this.runtime.store.authenticateBindingCredential(this.bindingId, this.presentedHash,
+      this.sameRawBridgeHash)
   }
 
   release(): void {
@@ -292,6 +296,7 @@ export class RegistryBindingProducerAuthenticator extends RegistryProducerAuthen
     requireAuthentication(audience === this.config.audience)
     const decoded = decodeRegistryDeviceToken(token, this.maxTokenBytes)
     const presentedHash = hashRegistryDeviceSecret(decoded.secret)
+    const sameRawBridgeHash = hashRegistryBridgeSecret(decoded.secret)
     const bindingId = brandString<RegistryBindingId>(decoded.bindingId)
     throwIfAborted(this.lifetime.signal, signal)
     const runtime = await this.resolveRuntime(decoded.organizationId)
@@ -299,6 +304,7 @@ export class RegistryBindingProducerAuthenticator extends RegistryProducerAuthen
     try {
       requireAuthentication(runtime.store.active() && runtime.store.organizationId === decoded.organizationId)
       lease = new BindingCredentialLease(runtime, decoded.organizationId, bindingId, presentedHash,
+        sameRawBridgeHash,
         [this.lifetime.signal, signal])
       const authority = checkedAuthority(await lease.authenticate(), decoded.organizationId)
       lease.identity = Object.freeze({ organizationId: authority.connection.organizationId,

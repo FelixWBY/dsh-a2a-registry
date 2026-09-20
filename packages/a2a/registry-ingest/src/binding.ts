@@ -2,14 +2,16 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { decodeInstanceKeyHistory, decodeRegistryDeviceSecretHash,
-  type InstanceKeyHistory, type InstanceKeyId, type RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
+import { decodeInstanceKeyHistory, decodeRegistryBridgeSecretHash, decodeRegistryDeviceSecretHash,
+  type InstanceKeyHistory, type InstanceKeyId, type RegistryBridgeSecretHash,
+  type RegistryDeviceSecretHash } from '@deepseek-ai/dsh-a2a-device-identity'
 import { decodeRegistryAudience, decodeRegistryChallenge, verifyRegistryChallenge } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
 import type { DisclosureSubject, MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import type { RegistryDirectoryMember } from './directory-types.ts'
 import type { RegistryBindingId, RegistryBindingLimits, RegistryBindingRecord, RegistryBindingRequest,
-  RegistryBindingReview, RegistryBindingScope, RegistryBindingStart, RegistryBindingRecordV5 } from './binding-types.ts'
+  RegistryBindingReview, RegistryBindingScope, RegistryBindingStart, RegistryBindingRecordV5,
+  RegistryBindingRecordV6 } from './binding-types.ts'
 import type { RegistryProducerAuthority } from './types.ts'
 import { byteLength, RegistryIngestError, requireIngest } from './record.ts'
 
@@ -19,7 +21,8 @@ const memberId = z.string().max(128).regex(/^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za
 const intent = { instanceName: z.string(), requestedScopes: z.array(z.enum(['disclosure.sync', 'a2a.receive']))
   .min(1).max(2).refine(value => new Set(value).size === value.length).readonly() }
 const deviceSecretHash = z.string().regex(/^sha256:[0-9a-f]{64}$/u).transform(decodeRegistryDeviceSecretHash)
-const requestSchema = z.strictObject({ publicKeySpki: z.string(), deviceSecretHash, ...intent })
+const bridgeSecretHash = z.string().regex(/^sha256:[0-9a-f]{64}$/u).transform(decodeRegistryBridgeSecretHash)
+const requestSchema = z.strictObject({ publicKeySpki: z.string(), deviceSecretHash, bridgeSecretHash, ...intent })
 const state = z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('pending') }),
     z.strictObject({ kind: z.literal('approved'), memberId, approvedAt: integer }),
@@ -35,6 +38,7 @@ const recordFields = {
 const schema = z.discriminatedUnion('version', [
   z.strictObject({ version: z.literal(4), ...recordFields }).readonly(),
   z.strictObject({ version: z.literal(5), ...recordFields, deviceSecretHash }).readonly(),
+  z.strictObject({ version: z.literal(6), ...recordFields, deviceSecretHash, bridgeSecretHash }).readonly(),
 ])
 
 function history(record: RegistryBindingRecord): InstanceKeyHistory {
@@ -43,7 +47,7 @@ function history(record: RegistryBindingRecord): InstanceKeyHistory {
     publicKeySpki: record.publicKeySpki, validFrom: record.createdAt, validUntil: null, revokedAt: null }] })
 }
 
-function credentialHistory(record: RegistryBindingRecordV5 & {
+function credentialHistory(record: (RegistryBindingRecordV5 | RegistryBindingRecordV6) & {
   readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
 }): InstanceKeyHistory {
   const { organizationId, instanceId, keyId } = record.challenge
@@ -52,7 +56,7 @@ function credentialHistory(record: RegistryBindingRecordV5 & {
 }
 
 /** Resolve the only key history a current confirmed SaaS binding may authorize.
- * V5 history is rebuilt from the binding; legacy V4 may use an external history only after its retained
+ * V5/V6 history is rebuilt from the binding; legacy V4 may use an external history only after its retained
  * key is matched. The caller owns uniqueness of the selected instance. */
 export function confirmedBindingHistory(record: RegistryBindingRecord, member: RegistryDirectoryMember,
   organizationId: OrganizationId, now: number, audience: string,
@@ -63,9 +67,9 @@ export function confirmedBindingHistory(record: RegistryBindingRecord, member: R
     && Number.isSafeInteger(now) && now >= record.state.confirmedAt
     && (requiredScope === undefined || record.requestedScopes.includes(requiredScope)), 'not-found')
   let currentHistory: InstanceKeyHistory
-  if (record.version === 5) {
+  if (record.version !== 4) {
     try {
-      currentHistory = credentialHistory(record as RegistryBindingRecordV5 & {
+      currentHistory = credentialHistory(record as (RegistryBindingRecordV5 | RegistryBindingRecordV6) & {
         readonly state: Extract<RegistryBindingRecord['state'], { readonly kind: 'confirmed' }>
       })
     } catch { throw new RegistryIngestError('not-found') }
@@ -86,6 +90,13 @@ export function confirmedBindingHistory(record: RegistryBindingRecord, member: R
 
 function codeHash(code: string): string {
   return createHash('sha256').update(code, 'utf8').digest('hex')
+}
+
+function sameSecretHash(retainedHash: string, presentedHash: string): boolean {
+  const retained = Buffer.from(retainedHash.slice('sha256:'.length), 'hex')
+  const presented = Buffer.from(presentedHash.slice('sha256:'.length), 'hex')
+  try { return retained.length === 32 && presented.length === 32 && timingSafeEqual(retained, presented) }
+  finally { retained.fill(0); presented.fill(0) }
 }
 
 function current(record: RegistryBindingRecord, now: number): void {
@@ -149,10 +160,11 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
   let parsedRequest: RegistryBindingRequest
   try { parsedRequest = requestSchema.parse(request) } catch { throw new RegistryIngestError('invalid-input') }
   name(parsedRequest.instanceName, limits)
-  const { publicKeySpki, deviceSecretHash: secretHash, instanceName, requestedScopes } = parsedRequest
+  const { publicKeySpki, deviceSecretHash: secretHash, bridgeSecretHash: bridgeHash,
+    instanceName, requestedScopes } = parsedRequest
   const code = randomBytes(32).toString('base64url')
-  const record: RegistryBindingRecordV5 = { version: 5, bindingId: brandString<RegistryBindingId>(randomUUID()), createdAt: now,
-    instanceName, requestedScopes, deviceSecretHash: secretHash,
+  const record: RegistryBindingRecordV6 = { version: 6, bindingId: brandString<RegistryBindingId>(randomUUID()), createdAt: now,
+    instanceName, requestedScopes, deviceSecretHash: secretHash, bridgeSecretHash: bridgeHash,
     challenge: { version: 1, audience: decodeRegistryAudience(audience), organizationId,
       instanceId: brandString<DshInstanceId>(randomUUID()),
       keyId: brandString<InstanceKeyId>(`sha256:${createHash('sha256').update(Buffer.from(publicKeySpki, 'base64url')).digest('hex')}`),
@@ -160,7 +172,7 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
     publicKeySpki, codeHash: codeHash(code), state: { kind: 'pending' } }
   try {
     const parsed = parseBinding(record, limits)
-    requireIngest(parsed.version === 5, 'invalid-input')
+    requireIngest(parsed.version === 6, 'invalid-input')
     const reserved = parseBinding({ ...parsed, state: { kind: 'revoked', memberId: 'x'.repeat(128),
       approvedAt: parsed.challenge.expiresAt - 1, confirmedAt: parsed.challenge.expiresAt - 1,
       revokedAt: Number.MAX_SAFE_INTEGER } }, limits)
@@ -171,17 +183,47 @@ export function startBinding(organizationId: OrganizationId, audience: string, r
   }
 }
 
-/** Resolve one confirmed v5 binding into current device authority without exposing its stored digest.
- * The serialized owner supplies the current approving member and configured audience. */
+/** Resolve one confirmed v5/v6 binding into current device authority without exposing its stored digest.
+ * The transport must derive both presented hashes from the same decoded dsh1 raw secret. V6 rejects a
+ * cross-domain match with its retained bridge verifier, while V5 remains compatible. */
 export function authenticateBindingCredential(record: RegistryBindingRecord, member: RegistryDirectoryMember,
-  presentedHash: RegistryDeviceSecretHash, now: number, audience: string): RegistryProducerAuthority {
-  requireIngest(record.version === 5 && record.state.kind === 'confirmed', 'not-found')
+  presentedHash: RegistryDeviceSecretHash, sameRawBridgeHash: RegistryBridgeSecretHash,
+  now: number, audience: string): RegistryProducerAuthority {
+  requireIngest(record.version !== 4 && record.state.kind === 'confirmed', 'not-found')
   let selectedHash: RegistryDeviceSecretHash
   try { selectedHash = decodeRegistryDeviceSecretHash(presentedHash) } catch { throw new RegistryIngestError('not-found') }
-  const retained = Buffer.from(record.deviceSecretHash.slice('sha256:'.length), 'hex')
-  const presented = Buffer.from(selectedHash.slice('sha256:'.length), 'hex')
-  requireIngest(retained.length === 32 && presented.length === 32 && timingSafeEqual(retained, presented), 'not-found')
+  requireIngest(sameSecretHash(record.deviceSecretHash, selectedHash), 'not-found')
+  if (record.version === 6) {
+    let selectedBridgeHash: RegistryBridgeSecretHash
+    try { selectedBridgeHash = decodeRegistryBridgeSecretHash(sameRawBridgeHash) } catch {
+      throw new RegistryIngestError('not-found')
+    }
+    requireIngest(!sameSecretHash(record.bridgeSecretHash, selectedBridgeHash), 'not-found')
+  }
   const currentHistory = confirmedBindingHistory(record, member, record.challenge.organizationId, now, audience)
+  const { organizationId, instanceId, keyId } = record.challenge
+  requireIngest(currentHistory.organizationId === organizationId && currentHistory.instanceId === instanceId
+    && currentHistory.keys.length === 1 && currentHistory.keys[0]?.keyId === keyId, 'not-found')
+  return { connection: { organizationId, instanceId, keyId, now }, history: currentHistory }
+}
+
+/** Resolve one confirmed v6 binding into current disclosure-bridge authority.
+ * The transport must derive both presented hashes from the same decoded dshb1 raw secret. A cross-domain
+ * match with the retained device verifier proves secret reuse and fails closed. */
+export function authenticateBridgeCredential(record: RegistryBindingRecord, member: RegistryDirectoryMember,
+  presentedHash: RegistryBridgeSecretHash, sameRawDeviceHash: RegistryDeviceSecretHash,
+  now: number, audience: string): RegistryProducerAuthority {
+  requireIngest(record.version === 6 && record.state.kind === 'confirmed', 'not-found')
+  let selectedHash: RegistryBridgeSecretHash
+  let selectedDeviceHash: RegistryDeviceSecretHash
+  try {
+    selectedHash = decodeRegistryBridgeSecretHash(presentedHash)
+    selectedDeviceHash = decodeRegistryDeviceSecretHash(sameRawDeviceHash)
+  } catch { throw new RegistryIngestError('not-found') }
+  requireIngest(sameSecretHash(record.bridgeSecretHash, selectedHash), 'not-found')
+  requireIngest(!sameSecretHash(record.deviceSecretHash, selectedDeviceHash), 'not-found')
+  const currentHistory = confirmedBindingHistory(record, member, record.challenge.organizationId, now,
+    audience, 'disclosure.sync')
   const { organizationId, instanceId, keyId } = record.challenge
   requireIngest(currentHistory.organizationId === organizationId && currentHistory.instanceId === instanceId
     && currentHistory.keys.length === 1 && currentHistory.keys[0]?.keyId === keyId, 'not-found')

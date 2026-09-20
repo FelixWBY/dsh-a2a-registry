@@ -55,6 +55,7 @@ export abstract class RegistryDisclosureKeyProvider extends Service {
   abstract readDataKeys(scope: DisclosureDataKeyGrantScope,
     signal: AbortSignal): Promise<readonly DisclosureDataKey[]>
 
-  /** Verify the provider can authenticate its retained hierarchy without exposing material. */
-  abstract checkReadiness(signal: AbortSignal): Promise<boolean>
+  /** Verify one authenticated organization's retained hierarchy without exposing material. */
+  abstract checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],
+    signal: AbortSignal): Promise<boolean>
 }

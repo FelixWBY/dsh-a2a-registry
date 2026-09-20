@@ -2,6 +2,12 @@
 # /etc/dsh/registry-production.patch.yml and add only reviewed production
 # providers or overrides. The Registry service applies the checked single-host
 # and PostgreSQL layers before this file.
+# The PostgreSQL production layer already mounts the explicitly single-instance
+# software-local disclosure-key provider and the authenticated publication
+# bridge. Its root key must come from the environment-only credentials owner.
+# Replace that provider with an HSM/KMS-backed implementation before running
+# multiple Registry replicas; never add a second key provider beside it.
+#
 # A deployment-owned disclosure content plugin must use the fixed entry id
 # registry-disclosure-content-provider. The same overlay must explicitly set
 # registry-runtime.config.saas.disclosureContentProvider to true and replace

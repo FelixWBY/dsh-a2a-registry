@@ -63,14 +63,34 @@ function deviceToken(value, expectedOrganizationId) {
     || !canonicalBase64Url(parts[1]) || !canonicalBase64Url(parts[3], 32)
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(parts[2])) {
     issue('DSH_REGISTRY_DEVICE_TOKEN must be one canonical dsh1 device credential')
-    return
+    return null
   }
   const organizationId = Buffer.from(parts[1], 'base64url').toString('utf8')
   if (Buffer.from(organizationId, 'utf8').toString('base64url') !== parts[1]
     || !/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u.test(organizationId)
     || organizationId !== expectedOrganizationId) {
     issue('DSH_REGISTRY_DEVICE_TOKEN must select DSH_REGISTRY_ORGANIZATION_ID')
+    return null
   }
+  return { bindingId: parts[2], secret: parts[3] }
+}
+
+function disclosureToken(value, expectedOrganizationId) {
+  const parts = value.split('.')
+  if (parts.length !== 4 || parts[0] !== 'dshb1'
+    || !canonicalBase64Url(parts[1]) || !canonicalBase64Url(parts[3], 32)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(parts[2])) {
+    issue('DSH_REGISTRY_DISCLOSURE_TOKEN must be one canonical dshb1 bridge credential')
+    return null
+  }
+  const organizationId = Buffer.from(parts[1], 'base64url').toString('utf8')
+  if (Buffer.from(organizationId, 'utf8').toString('base64url') !== parts[1]
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/u.test(organizationId)
+    || organizationId !== expectedOrganizationId) {
+    issue('DSH_REGISTRY_DISCLOSURE_TOKEN must select DSH_REGISTRY_ORGANIZATION_ID')
+    return null
+  }
+  return { bindingId: parts[2], secret: parts[3] }
 }
 
 function devicePrivateKey(value) {
@@ -170,6 +190,23 @@ function syncUrl(name, value, domain) {
   }
 }
 
+function disclosureBridgeUrl(name, value, domain) {
+  let parsed
+  try {
+    parsed = new URL(value)
+  } catch {
+    issue(`${name} must be an absolute URL`)
+    return
+  }
+  const expected = `https://${domain.toLowerCase()}/a2a/v1/disclosure-publication`
+  if (value !== expected || parsed.href !== expected || parsed.protocol !== 'https:'
+    || parsed.username.length > 0 || parsed.password.length > 0 || parsed.port !== ''
+    || parsed.pathname !== '/a2a/v1/disclosure-publication'
+    || parsed.search.length > 0 || parsed.hash.length > 0) {
+    issue(`${name} must be the exact public HTTPS disclosure bridge URL on REGISTRY_DOMAIN`)
+  }
+}
+
 function absolutePath(name, value) {
   if (value.length === 0) return ''
   if (!isAbsolute(value)) {
@@ -206,6 +243,10 @@ if (checkRegistry) {
   required('DSH_REGISTRY_OIDC_CLIENT_ID')
   const audience = required('DSH_REGISTRY_SYNC_AUDIENCE')
   if (audience.length > 0 && domain.length > 0) syncUrl('DSH_REGISTRY_SYNC_AUDIENCE', audience, domain)
+  const disclosureRootKeyId = required('DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID')
+  if (disclosureRootKeyId.length > 0) {
+    identifier('DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID', disclosureRootKeyId)
+  }
 }
 
 // The production Registry scope is the public multi-tenant SaaS contract. A
@@ -243,6 +284,10 @@ if (checkHarness) {
   if (registrySyncUrl.length > 0 && domain.length > 0) {
     syncUrl('DSH_REGISTRY_SYNC_URL', registrySyncUrl, domain)
   }
+  const disclosureBridge = required('DSH_REGISTRY_DISCLOSURE_BRIDGE_URL')
+  if (disclosureBridge.length > 0 && domain.length > 0) {
+    disclosureBridgeUrl('DSH_REGISTRY_DISCLOSURE_BRIDGE_URL', disclosureBridge, domain)
+  }
 }
 
 const pathNames = [
@@ -271,9 +316,11 @@ const secrets = [
     ['DSH_REGISTRY_OIDC_CLIENT_SECRET', 16],
     ['DSH_REGISTRY_SESSION_SECRET', 32],
     ['DSH_REGISTRY_MAILBOX_KEY', 32],
+    ['DSH_REGISTRY_DISCLOSURE_ROOT_KEY', 32],
   ] : []),
   ...(checkHarness ? [
     ['DSH_REGISTRY_DEVICE_TOKEN', 16],
+    ['DSH_REGISTRY_DISCLOSURE_TOKEN', 16],
     ['DSH_REGISTRY_DEVICE_PRIVATE_KEY', 32],
   ] : []),
 ]
@@ -283,11 +330,26 @@ if (checkRegistry) {
   if (mailboxKey.length > 0 && !canonicalBase64Url(mailboxKey, 32)) {
     issue('DSH_REGISTRY_MAILBOX_KEY must be canonical base64url 32-byte key material')
   }
+  const disclosureRootKey = process.env.DSH_REGISTRY_DISCLOSURE_ROOT_KEY?.trim() ?? ''
+  if (disclosureRootKey.length > 0 && !canonicalBase64Url(disclosureRootKey, 32)) {
+    issue('DSH_REGISTRY_DISCLOSURE_ROOT_KEY must be canonical base64url 32-byte key material')
+  }
+  if (mailboxKey.length > 0 && disclosureRootKey.length > 0 && mailboxKey === disclosureRootKey) {
+    issue('DSH_REGISTRY_DISCLOSURE_ROOT_KEY must be independent from DSH_REGISTRY_MAILBOX_KEY')
+  }
 }
 if (checkHarness) {
   const token = process.env.DSH_REGISTRY_DEVICE_TOKEN?.trim() ?? ''
+  const disclosure = process.env.DSH_REGISTRY_DISCLOSURE_TOKEN?.trim() ?? ''
   const privateKey = process.env.DSH_REGISTRY_DEVICE_PRIVATE_KEY?.trim() ?? ''
-  if (token.length > 0 && selectedOrganizationId.length > 0) deviceToken(token, selectedOrganizationId)
+  const device = token.length > 0 && selectedOrganizationId.length > 0
+    ? deviceToken(token, selectedOrganizationId) : null
+  const bridge = disclosure.length > 0 && selectedOrganizationId.length > 0
+    ? disclosureToken(disclosure, selectedOrganizationId) : null
+  if (device !== null && bridge !== null
+    && (device.bindingId !== bridge.bindingId || device.secret === bridge.secret)) {
+    issue('Harness dsh1 and dshb1 credentials must select the same binding and use independent secrets')
+  }
   if (privateKey.length > 0) devicePrivateKey(privateKey)
 }
 
