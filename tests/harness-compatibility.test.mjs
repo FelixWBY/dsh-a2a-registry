@@ -67,6 +67,31 @@ test('Harness compatibility fixtures cover publication, import release and quest
     .map(frame => frame.outcome.status), ['completed', 'retry'])
 })
 
+test('Registry Sync import key grants are canonical, unique and fixed-prefix scoped', () => {
+  const encoded = wireFixtures().serverFrames[6]
+  const accepted = decodeRegistryServerFrame(encoded, MAX_FRAME_BYTES)
+  assert.equal(accepted.type, 'import-dispatch')
+  assert.equal(accepted.delivery.keyGrant.version, 1)
+  assert.equal(Buffer.from(accepted.delivery.keyGrant.keys[0].material, 'base64url').byteLength, 32)
+
+  const baseline = JSON.parse(encoded)
+  const rejected = [
+    value => { delete value.delivery.keyGrant },
+    value => { value.delivery.keyGrant.scope.conversationId = 'other-conversation' },
+    value => { value.delivery.keyGrant.keys = [] },
+    value => { value.delivery.keyGrant.keys[0].material += '=' },
+    value => { value.delivery.keyGrant.keys[0].material = Buffer.alloc(31, 4).toString('base64url') },
+    value => { value.delivery.keyGrant.keys.push(structuredClone(value.delivery.keyGrant.keys[0])) },
+    value => { value.delivery.keyGrant.extra = true },
+  ]
+  for (const mutate of rejected) {
+    const candidate = structuredClone(baseline)
+    mutate(candidate)
+    assert.throws(() => decodeRegistryServerFrame(JSON.stringify(candidate), MAX_FRAME_BYTES),
+      /invalid Registry synchronization frame/u)
+  }
+})
+
 test('Harness compatibility checker accepts only the connection-only composed Web row', () => {
   const connectionOnly = `
 - id: web-runtime

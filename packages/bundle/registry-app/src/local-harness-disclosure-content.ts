@@ -13,6 +13,7 @@ import {
   type WrappedDisclosureDataKey,
 } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
 import type { RegistryConfirmedPrefix } from '@deepseek-ai/dsh-a2a-registry-ingest'
+import { decodeRegistryImportKeyGrant, type RegistryImportKeyGrant } from '@deepseek-ai/dsh-a2a-registry-sync'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { projectRegistryDisclosureContent } from './disclosure-content-projection.ts'
 import type { RegistryDisclosureContent } from './operations.ts'
@@ -142,4 +143,31 @@ export async function readRegistryDisclosureContent(credentials: CredentialProvi
     if (record === undefined) fail('unavailable')
     try { return decodeDisclosureDataKeyGrant(record, scope, maxKeys) } catch { return fail('unavailable') }
   }, prefix, { ...limits, maxEvents }, maxResponseBytes, signal)
+}
+
+/** Export the exact local-test escrow grant for one already-authorized Sync import prefix. */
+export async function readRegistryDisclosureDataKeyGrant(credentials: CredentialProvider,
+  prefix: RegistryConfirmedPrefix, maxTrustedKeys: number, maxGrantBytes: number,
+  signal: AbortSignal): Promise<RegistryImportKeyGrant> {
+  signal.throwIfAborted()
+  if (!Number.isSafeInteger(maxTrustedKeys) || maxTrustedKeys <= 0
+    || !Number.isSafeInteger(maxGrantBytes) || maxGrantBytes <= 0) fail('limit')
+  const scope: DisclosureDataKeyGrantScope = {
+    organizationId: prefix.checkpoint.organizationId,
+    instanceId: prefix.checkpoint.instanceId,
+    conversationId: prefix.conversationId,
+    disclosureId: prefix.checkpoint.disclosureId,
+  }
+  let record: Awaited<ReturnType<CredentialProvider['readRecord']>>
+  try { record = await credentials.readRecord(disclosureDataKeyCredential('registry-app', scope)) } catch {
+    return fail('unavailable')
+  }
+  signal.throwIfAborted()
+  if (record === undefined) fail('unavailable')
+  try {
+    const keys = decodeDisclosureDataKeyGrant(record, scope, maxTrustedKeys)
+    const encoded = encodeDisclosureDataKeyGrant('registry-app', scope, keys)
+    if (encoded.record.kind !== 'grant') return fail('unavailable')
+    return decodeRegistryImportKeyGrant(encoded.record.payload, scope, maxTrustedKeys, maxGrantBytes)
+  } catch { return fail('unavailable') }
 }

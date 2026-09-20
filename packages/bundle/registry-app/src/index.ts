@@ -32,6 +32,7 @@ import {
   installRegistryProductionDisclosureBridge, RegistryProductionDisclosureBridgeConfigSchema,
   type RegistryProductionDisclosureBridgeConfig } from './production-disclosure-bridge.ts'
 import type { RegistryDisclosureOperations } from './operations.ts'
+import type { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 export type { RegistryDisclosureControl } from './control.ts'
 export type { RegistryDirectory } from './directory.ts'
 export type { RegistryEnrollment } from './enrollment.ts'
@@ -197,6 +198,10 @@ export const Config: z<Config> = z.transform(schema, (value) => {
   if (value.saas !== undefined && value.ingest?.imports === undefined) {
     throw new z.ValidationError('Registry SaaS requires the durable tenant import queue', {})
   }
+  if (value.saas !== undefined && value.ingest?.imports !== undefined
+    && value.saas.disclosureKeyProvider !== true) {
+    throw new z.ValidationError('Registry SaaS imports require the disclosure key provider', {})
+  }
   if (value.saas !== undefined && value.ingest?.questions === undefined) {
     throw new z.ValidationError('Registry SaaS requires the durable tenant question mailbox', {})
   }
@@ -295,8 +300,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (config.saas === undefined) await ctx.plugin(ingestRuntime, config.ingest)
     else {
       const credentials: CredentialProvider | undefined = ctx.get('credentials')
+      const disclosureKeyProvider: RegistryDisclosureKeyProvider | undefined =
+        config.saas.disclosureKeyProvider ? ctx.get('registryDisclosureKeyProvider') : undefined
       if (credentials === undefined) {
         throw new Error('Registry SaaS requires registry-runtime inject: [storageDomain, credentials]')
+      }
+      if (disclosureKeyProvider === undefined) {
+        throw new Error('Registry SaaS imports require registry-runtime inject: [registryDisclosureKeyProvider]')
       }
       await validateRegistrySaasMailboxCredential(credentials, config.ingest.questions!.mailboxKeyEnv)
       const databaseUrl = await credentials.resolve(credentialRef(config.saas.databaseUrlEnv))
@@ -334,7 +344,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         await tenancy.ensureLegacyOrganization({ organizationId: config.ingest.organizationId,
           displayName: config.saas.legacyOrganizationName })
         router = new DefaultRegistryTenantRuntimeRouter(ctx, tenancy, structuredClone(config.ingest),
-          config.ingest.organizationId, config.saas.maxActiveOrganizations)
+          config.ingest.organizationId, config.saas.maxActiveOrganizations, disclosureKeyProvider)
         const activeRouter = router
         productionBridgeRouter = activeRouter
         withdrawRouter = ctx.provide('registryTenantRouter', activeRouter)

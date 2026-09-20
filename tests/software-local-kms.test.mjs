@@ -429,6 +429,7 @@ test('RegistryDisclosureKeyProvider is a unique narrow service with explicit sof
       return Promise.resolve({ scope: scopeValue, keyId: key.keyId, assurance: this.protection.assurance })
     }
     readDataKeys() { return Promise.resolve([]) }
+    issueAuthorizedGrant() { return Promise.reject(new Error('test provider never exports grants')) }
     checkReadiness() { return Promise.resolve(true) }
   }
   const ctx = new Context()

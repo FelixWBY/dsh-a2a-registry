@@ -205,6 +205,8 @@
         maxRecordBytes: 4096
         maxAuthorizationResponseBytes: 262144
         maxDeliveryBytes: 1047552
+        maxGrantBytes: 4096
+        maxTrustedKeys: 4
         deliveryTimeoutMs: 15000
       questions:
         mailboxKeyEnv: DSH_REGISTRY_MAILBOX_KEY

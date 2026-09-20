@@ -70,6 +70,7 @@ class MemoryKeyProvider extends RegistryDisclosureKeyProvider {
   }
 
   readDataKeys() { return Promise.reject(new Error('bridge never reads keys')) }
+  issueAuthorizedGrant() { return Promise.reject(new Error('bridge never exports grants')) }
 }
 
 function producer() {

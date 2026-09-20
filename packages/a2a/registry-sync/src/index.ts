@@ -8,7 +8,7 @@ import { DISCLOSURE_CONTROL_STATES, REGISTRY_INGEST_STATES, type MemberId,
 import type { RegistryCheckpointReceipt, RegistryConfirmedPrefix, RegistryIngestReceipt,
   RegistryProducerSyncStatus } from '@deepseek-ai/dsh-a2a-registry-ingest'
 import type { MailboxBinding, MailboxReceipt, MailboxTransition } from '@deepseek-ai/dsh-a2a-mailbox'
-import type { RegistryClientFrame, RegistryImportDelivery, RegistryImportOutcome, RegistryInstanceReport,
+import type { RegistryClientFrame, RegistryImportDelivery, RegistryImportKeyGrant, RegistryImportOutcome, RegistryInstanceReport,
   RegistryProducerAccessUpdate, RegistryProducerRegistration, RegistryProducerTarget, RegistryQuestionDelivery,
   RegistryServerFrame, RegistrySyncErrorCode } from './types.ts'
 
@@ -200,6 +200,55 @@ function confirmedPrefix(input: unknown): RegistryConfirmedPrefix {
   return { authorizationVersion: integer(value.authorizationVersion, 0), conversationId, checkpoint, events }
 }
 
+function canonicalKeyMaterial(input: unknown): string {
+  requireFrame(typeof input === 'string' && /^[A-Za-z0-9_-]{43}$/u.test(input))
+  const bytes = Buffer.from(input, 'base64url')
+  try { requireFrame(bytes.byteLength === 32 && bytes.toString('base64url') === input) }
+  finally { bytes.fill(0) }
+  return input
+}
+
+/** Validate and detach one bounded raw-key grant for an already authorized exact scope. */
+export function decodeRegistryImportKeyGrant(input: unknown, expectedScope: RegistryImportKeyGrant['scope'],
+  maxKeys: number, maxBytes: number): RegistryImportKeyGrant {
+  integer(maxKeys, 1)
+  integer(maxBytes, 1)
+  let serialized: string
+  try {
+    const candidate = JSON.stringify(input)
+    requireFrame(typeof candidate === 'string')
+    serialized = candidate
+  } catch { throw new RegistrySyncProtocolError() }
+  bounded(serialized, maxBytes)
+  let detached: unknown
+  try { detached = JSON.parse(serialized) as unknown } catch { throw new RegistrySyncProtocolError() }
+  const value = exact(detached, ['version', 'scope', 'keys'])
+  requireFrame(value.version === 1)
+  const selectedScope = exact(value.scope, ['organizationId', 'instanceId', 'conversationId', 'disclosureId'])
+  const scope: RegistryImportKeyGrant['scope'] = {
+    organizationId: brandString<RegistryImportKeyGrant['scope']['organizationId']>(
+      opaqueIdentifier(selectedScope.organizationId)),
+    instanceId: brandString<RegistryImportKeyGrant['scope']['instanceId']>(opaqueIdentifier(selectedScope.instanceId)),
+    conversationId: brandString<RegistryImportKeyGrant['scope']['conversationId']>(
+      opaqueIdentifier(selectedScope.conversationId)),
+    disclosureId: identifier(selectedScope.disclosureId),
+  }
+  requireFrame(scope.organizationId === expectedScope.organizationId
+    && scope.instanceId === expectedScope.instanceId
+    && scope.conversationId === expectedScope.conversationId
+    && scope.disclosureId === expectedScope.disclosureId
+    && Array.isArray(value.keys) && value.keys.length > 0 && value.keys.length <= maxKeys)
+  const seen = new Set<string>()
+  const keys = value.keys.map((inputKey): RegistryImportKeyGrant['keys'][number] => {
+    const selectedKey = exact(inputKey, ['keyId', 'material'])
+    const keyId = opaqueIdentifier(selectedKey.keyId)
+    requireFrame(!seen.has(keyId))
+    seen.add(keyId)
+    return { keyId, material: canonicalKeyMaterial(selectedKey.material) }
+  })
+  return { version: 1, scope, keys }
+}
+
 function displayText(input: unknown): string {
   requireFrame(typeof input === 'string' && input.length > 0 && input.isWellFormed() && !input.includes('\0'))
   return input
@@ -224,8 +273,14 @@ function questionDelivery(input: unknown): RegistryQuestionDelivery {
 
 function importDelivery(input: unknown): RegistryImportDelivery {
   const value = exact(input, ['operationId', 'targetInstanceId', 'organizationId', 'disclosureId',
-    'sourceInstanceId', 'checkpointHash', 'prefix', 'source'])
+    'sourceInstanceId', 'checkpointHash', 'prefix', 'keyGrant', 'source'])
   const prefix = confirmedPrefix(value.prefix)
+  const keyGrant = decodeRegistryImportKeyGrant(value.keyGrant, {
+    organizationId: prefix.checkpoint.organizationId,
+    instanceId: prefix.checkpoint.instanceId,
+    conversationId: prefix.conversationId,
+    disclosureId: prefix.checkpoint.disclosureId,
+  }, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
   const source = exact(value.source, ['instanceName', 'conversationTitle'])
   const operationId = opaqueIdentifier(value.operationId)
   const targetInstanceId = brandString<RegistryImportDelivery['targetInstanceId']>(opaqueIdentifier(value.targetInstanceId))
@@ -237,7 +292,7 @@ function importDelivery(input: unknown): RegistryImportDelivery {
     && prefix.checkpoint.instanceId === sourceInstanceId
     && prefix.checkpoint.disclosureId === disclosureId
     && prefix.checkpoint.checkpointHash === checkpointHash)
-  return { operationId, targetInstanceId, organizationId, disclosureId, sourceInstanceId, checkpointHash, prefix,
+  return { operationId, targetInstanceId, organizationId, disclosureId, sourceInstanceId, checkpointHash, prefix, keyGrant,
     source: { instanceName: displayText(source.instanceName), conversationTitle: displayText(source.conversationTitle) } }
 }
 

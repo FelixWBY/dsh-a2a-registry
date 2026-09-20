@@ -53,6 +53,22 @@ export interface RegistryQuestionDelivery {
   }
 }
 
+/** Canonical raw AES-256 key material granted only for one fixed import prefix. */
+export interface RegistryImportKeyGrant {
+  readonly version: 1
+  readonly scope: {
+    readonly organizationId: OrganizationId
+    readonly instanceId: DshInstanceId
+    readonly conversationId: DisclosureConversationId
+    readonly disclosureId: DisclosureId
+  }
+  readonly keys: readonly {
+    readonly keyId: string
+    /** Canonical unpadded base64url encoding of exactly 32 bytes. */
+    readonly material: string
+  }[]
+}
+
 /** One checkpoint-pinned context import released only to its authenticated target instance. */
 export interface RegistryImportDelivery {
   readonly operationId: string
@@ -62,6 +78,7 @@ export interface RegistryImportDelivery {
   readonly sourceInstanceId: DshInstanceId
   readonly checkpointHash: DisclosureHash
   readonly prefix: RegistryConfirmedPrefix
+  readonly keyGrant: RegistryImportKeyGrant
   readonly source: {
     readonly instanceName: string
     readonly conversationTitle: string

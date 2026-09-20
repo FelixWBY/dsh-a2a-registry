@@ -94,6 +94,7 @@ function questionError(error: MailboxError): RegistrySyncErrorCode {
 /** Reject a broken broker boundary before any untrusted receiver observes cross-tenant or mismatched content. */
 function requireImportDelivery(delivery: RegistryImportDelivery, target: RegistryConnectionAuthority): void {
   const checkpoint = delivery.prefix.checkpoint
+  const grantScope = delivery.keyGrant.scope
   if (delivery.organizationId !== target.connection.organizationId
     || delivery.targetInstanceId !== target.connection.instanceId
     || delivery.organizationId !== target.history.organizationId
@@ -101,7 +102,11 @@ function requireImportDelivery(delivery: RegistryImportDelivery, target: Registr
     || checkpoint.organizationId !== delivery.organizationId
     || checkpoint.instanceId !== delivery.sourceInstanceId
     || checkpoint.disclosureId !== delivery.disclosureId
-    || checkpoint.checkpointHash !== delivery.checkpointHash) {
+    || checkpoint.checkpointHash !== delivery.checkpointHash
+    || grantScope.organizationId !== checkpoint.organizationId
+    || grantScope.instanceId !== checkpoint.instanceId
+    || grantScope.conversationId !== delivery.prefix.conversationId
+    || grantScope.disclosureId !== checkpoint.disclosureId) {
     throw new RegistryIngestError('invalid-storage')
   }
 }

@@ -3,13 +3,16 @@ import { createHash } from 'node:crypto'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { RegistryConnectionAuthority } from '@deepseek-ai/dsh-a2a-device-identity/runtime'
 import type { DisclosureHash, DisclosureId, DshInstanceId, OrganizationId } from '@deepseek-ai/dsh-a2a-protocol'
+import type { DisclosureDataKeyGrantScope } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
 import { RegistryIngestError, type FreshRegistryMetadataAuthority,
   type RegistryIngestStorageScope } from '@deepseek-ai/dsh-a2a-registry-ingest'
-import type { RegistryImportDelivery, RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
+import { decodeRegistryImportKeyGrant, type RegistryImportDelivery, type RegistryImportKeyGrant,
+  type RegistryImportOutcome } from '@deepseek-ai/dsh-a2a-registry-sync'
 import type { MemberId } from '@deepseek-ai/dsh-a2a-registry-domain'
 import { defineDomain, domainTable, type Domain, type DomainFacility, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import type { RegistryImportBroker } from './import-broker.ts'
+import type { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 import type { RegistryDisclosureReader } from './reader.ts'
 import type { RegistryRuntimeStore } from './runtime-store.ts'
 import type { RegistryTenantRuntimeRouter } from './tenant-runtime-router.ts'
@@ -26,6 +29,10 @@ export interface RegistrySaasImportQueueConfig {
   readonly maxAuthorizationResponseBytes: number
   /** Maximum UTF-8 JSON bytes of the delivery object before the WSS frame envelope is added. */
   readonly maxDeliveryBytes: number
+  /** Maximum UTF-8 JSON bytes of the embedded exact-scope raw-key grant. */
+  readonly maxGrantBytes: number
+  /** Maximum historical keys released for one authorized import. */
+  readonly maxTrustedKeys: number
   /** Maximum target-side WSS processing time before the connection is failed and work remains queued. */
   readonly deliveryTimeoutMs: number
 }
@@ -127,25 +134,31 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
 
   private constructor(private readonly domain: Domain<ReturnType<typeof specification>>,
     private readonly organizationId: OrganizationId, private readonly store: RegistryRuntimeStore,
-    private readonly reader: RegistryDisclosureReader, private readonly config: RegistrySaasImportQueueConfig) {
+    private readonly reader: RegistryDisclosureReader, private readonly keyProvider: RegistryDisclosureKeyProvider,
+    private readonly config: RegistrySaasImportQueueConfig) {
     this.table = domain.table('imports')
   }
 
   /** Open and validate every retained queue item before making the tenant runtime available. */
   static async open(facility: DomainFacility, organizationId: OrganizationId, store: RegistryRuntimeStore,
-    reader: RegistryDisclosureReader, config: RegistrySaasImportQueueConfig,
+    reader: RegistryDisclosureReader, keyProvider: RegistryDisclosureKeyProvider, config: RegistrySaasImportQueueConfig,
     storage?: RegistryIngestStorageScope): Promise<RegistrySaasImportQueue> {
     const resolved = Object.freeze(structuredClone(config))
     requirePositive(resolved.maxOperations)
     requirePositive(resolved.maxRecordBytes)
     requirePositive(resolved.maxAuthorizationResponseBytes)
     requirePositive(resolved.maxDeliveryBytes)
+    requirePositive(resolved.maxGrantBytes)
+    requirePositive(resolved.maxTrustedKeys)
     requirePositive(resolved.deliveryTimeoutMs)
+    if (resolved.maxGrantBytes > resolved.maxDeliveryBytes) {
+      throw new Error('Registry SaaS import key grant exceeds the delivery bound')
+    }
     let domain: Domain<ReturnType<typeof specification>>
     try { domain = await facility.open(specification(storage, resolved.maxRecordBytes)) } catch {
       throw new Error('Registry SaaS import queue is unavailable')
     }
-    const owner = new RegistrySaasImportQueue(domain, organizationId, store, reader, resolved)
+    const owner = new RegistrySaasImportQueue(domain, organizationId, store, reader, keyProvider, resolved)
     if (owner.table.size > resolved.maxOperations
       || [...owner.table.entries()].some(([key, record]) => key !== record.operationId
         || record.organizationId !== organizationId)) {
@@ -260,6 +273,28 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
             await this.fail(record)
             return null
           }
+          const scope: DisclosureDataKeyGrantScope = Object.freeze({
+            organizationId: snapshot.prefix.checkpoint.organizationId,
+            instanceId: snapshot.prefix.checkpoint.instanceId,
+            conversationId: snapshot.prefix.conversationId,
+            disclosureId: snapshot.prefix.checkpoint.disclosureId,
+          })
+          let keyGrant: RegistryImportKeyGrant
+          try {
+            const issued = await this.keyProvider.issueAuthorizedGrant(scope,
+              this.config.maxTrustedKeys, this.config.maxGrantBytes, signal)
+            signal.throwIfAborted()
+            keyGrant = decodeRegistryImportKeyGrant(issued, scope,
+              this.config.maxTrustedKeys, this.config.maxGrantBytes)
+          } catch {
+            signal.throwIfAborted()
+            await this.fail(record)
+            return null
+          }
+          if (byteLength(keyGrant) > this.config.maxGrantBytes) {
+            await this.fail(record)
+            return null
+          }
           const delivery = {
             operationId: record.operationId,
             targetInstanceId: brandString<DshInstanceId>(record.targetInstanceId),
@@ -268,6 +303,7 @@ export class RegistrySaasImportQueue implements RegistryDisclosureOperations, Re
             sourceInstanceId: brandString<DshInstanceId>(record.sourceInstanceId),
             checkpointHash: brandString<DisclosureHash>(record.checkpointHash),
             prefix: snapshot.prefix,
+            keyGrant,
             source: { instanceName: record.sourceInstanceId,
               conversationTitle: String(snapshot.prefix.conversationId) },
           } satisfies RegistryImportDelivery

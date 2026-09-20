@@ -190,6 +190,11 @@ function operationFixtures() {
   })
   const deliveredReceipt = mailboxReceipt('delivered', 2)
   const questionDelivery = { binding, receipt: deliveredReceipt, question, prefix, source }
+  const keyGrant = {
+    version: 1,
+    scope: { organizationId, instanceId: sourceInstanceId, conversationId, disclosureId },
+    keys: [{ keyId: 'compatibility-data-key', material: Buffer.alloc(32, 4).toString('base64url') }],
+  }
   const importDelivery = {
     operationId: 'compatibility-operation',
     targetInstanceId,
@@ -198,6 +203,7 @@ function operationFixtures() {
     sourceInstanceId,
     checkpointHash: checkpoint.checkpointHash,
     prefix,
+    keyGrant,
     source,
   }
   return {
@@ -326,6 +332,9 @@ const codecProbe = specifier => String.raw`
     || decoded[6].delivery === null
     || decoded[6].delivery.operationId !== 'compatibility-operation'
     || decoded[6].delivery.targetInstanceId !== 'compatibility-target'
+    || decoded[6].delivery.keyGrant.scope.conversationId !== 'compatibility-conversation'
+    || decoded[6].delivery.keyGrant.keys.length !== 1
+    || decoded[6].delivery.keyGrant.keys[0].material !== ${JSON.stringify(Buffer.alloc(32, 4).toString('base64url'))}
     || decoded[7].type !== 'import-released'
     || decoded[7].authorizationRequestId !== 7
     || decoded[8].type !== 'question-dispatch'

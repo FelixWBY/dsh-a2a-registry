@@ -156,6 +156,13 @@ test('tenant routing stays isolated and an idle LRU tenant reopens from durable 
     const retained = exported(restored.find(item => item.keyId === firstKey.keyId).key)
     try { assert.deepEqual(retained, Buffer.alloc(32, 0x75)) } finally { retained.fill(0) }
 
+    const grant = await provider.issueAuthorizedGrant(firstScope, 2, 4 * 1024, signal())
+    assert.deepEqual(grant.scope, firstScope)
+    assert.deepEqual(grant.keys.map(item => item.keyId), [firstKey.keyId, firstHistoricalKey.keyId])
+    assert.deepEqual(grant.keys.map(item => Buffer.from(item.material, 'base64url').byteLength), [32, 32])
+    await rejectsCode(() => provider.issueAuthorizedGrant(firstScope, 1, 4 * 1024, signal()), 'limit')
+    await rejectsCode(() => provider.issueAuthorizedGrant(firstScope, 2, 1, signal()), 'limit')
+
     await rejectsCode(() => provider.publishDataKey(firstScope,
       dataKey(firstScope, 'data-key:foreign-scope', 0x77, secondScope), signal()), 'scope-mismatch')
     const second = await provider.readDataKeys(secondScope, 1, signal())

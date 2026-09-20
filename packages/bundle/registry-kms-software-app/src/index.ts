@@ -2,8 +2,9 @@
 import { createSecretKey, type KeyObject } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {
-  DisclosureDataKey, DisclosureDataKeyGrantScope,
+import {
+  encodeDisclosureDataKeyGrant,
+  type DisclosureDataKey, type DisclosureDataKeyGrantScope,
 } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
 import {
   openSoftwareLocalDisclosureKeyStore,
@@ -12,7 +13,9 @@ import {
   type SoftwareLocalDisclosureKeyStore,
 } from '@deepseek-ai/dsh-a2a-registry-kms-software'
 import {
+  decodeRegistryImportKeyGrant,
   RegistryDisclosureKeyProvider,
+  type RegistryImportKeyGrant,
   type RegistryDisclosureKeyReceipt,
 } from '@deepseek-ai/dsh-registry-app/src/disclosure-key-provider.ts'
 import { credentialRef, type ResolvedCredential } from '@deepseek-ai/dsh-credentials'
@@ -119,6 +122,27 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
     maxKeys: number, signal: AbortSignal): Promise<readonly DisclosureDataKey[]> {
     return this.withStore(scope.organizationId, signal,
       store => store.readDataKeys(scope, maxKeys, signal))
+  }
+
+  async issueAuthorizedGrant(scope: DisclosureDataKeyGrantScope,
+    maxKeys: number, maxBytes: number, signal: AbortSignal): Promise<RegistryImportKeyGrant> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new SoftwareLocalKmsError('invalid-input')
+    const keys = await this.readDataKeys(scope, maxKeys, signal)
+    assertSignal(signal)
+    if (keys.length === 0) throw new SoftwareLocalKmsError('not-found')
+    if (keys.length > maxKeys) throw new SoftwareLocalKmsError('limit')
+    let payload: unknown
+    try {
+      const encoded = encodeDisclosureDataKeyGrant('registry-app', scope, keys)
+      if (encoded.record.kind !== 'grant') throw new Error('invalid grant')
+      payload = encoded.record.payload
+    } catch { throw new SoftwareLocalKmsError('invalid-storage') }
+    const serialized = JSON.stringify(payload)
+    if (typeof serialized !== 'string') throw new SoftwareLocalKmsError('invalid-storage')
+    if (Buffer.byteLength(serialized, 'utf8') > maxBytes) throw new SoftwareLocalKmsError('limit')
+    try { return decodeRegistryImportKeyGrant(payload, scope, maxKeys, maxBytes) } catch {
+      throw new SoftwareLocalKmsError('invalid-storage')
+    }
   }
 
   checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],

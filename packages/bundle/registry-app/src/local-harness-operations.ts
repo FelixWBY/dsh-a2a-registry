@@ -20,6 +20,7 @@ import { LocalHarnessDisclosureRegistration, LocalHarnessDisclosureRegistrationC
   type LocalHarnessDisclosureRegistrationConfig } from './local-harness-disclosure-registration.ts'
 import { LocalHarnessDisclosureRefresh, LocalHarnessDisclosureRefreshConfigSchema,
   type LocalHarnessDisclosureRefreshConfig } from './local-harness-disclosure-refresh.ts'
+import { readRegistryDisclosureDataKeyGrant } from './local-harness-disclosure-content.ts'
 import type { RegistryImportBroker } from './import-broker.ts'
 import type { RegistryDisclosureReader } from './reader.ts'
 import type { RegistryTransportObservation } from './transport-observation.ts'
@@ -252,9 +253,10 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
     try { domain = await facility.open(specification(resolved.maxRecordBytes)) } catch {
       throw new Error('Registry Local Harness import ledger is unavailable')
     }
-    if (resolved.importTransport === 'registry-sync' && (resolved.question === undefined || reader === undefined)) {
+    if (resolved.importTransport === 'registry-sync'
+      && (resolved.question === undefined || resolved.registration === undefined || reader === undefined)) {
       await domain.close()
-      throw new Error('Registry Sync imports require the configured local question identity and Registry reader')
+      throw new Error('Registry Sync imports require local question, registration and Registry reader configuration')
     }
     const owner = new LocalHarnessOperations(domain, credentials, secretRef, base, resolved, reader)
     if ([...owner.table.entries()].some(([, record]) => record.targetInstanceId !== resolved.targetInstanceId)) {
@@ -353,8 +355,11 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
     return this.run(async () => {
       if (this.config.importTransport !== 'registry-sync') throw new RegistryIngestError('not-found')
       const identity = this.config.question
+      const registration = this.config.registration
       const reader = this.reader
-      if (identity === undefined || reader === undefined) throw new RegistryIngestError('not-found')
+      if (identity === undefined || registration === undefined || reader === undefined) {
+        throw new RegistryIngestError('not-found')
+      }
       this.assertImportTarget(target)
       signal.throwIfAborted()
       const record = [...this.table.entries()].map(([, candidate]) => candidate)
@@ -389,6 +394,16 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
               { ...record, status: 'failed', updatedAt: Date.now() })
             return false
           }
+          let keyGrant: RegistryImportDelivery['keyGrant']
+          try {
+            keyGrant = await readRegistryDisclosureDataKeyGrant(this.credentials, snapshot.prefix,
+              registration.crypto.maxTrustedKeys, this.config.maxRequestBytes, signal)
+          } catch {
+            signal.throwIfAborted()
+            await this.put(brandString<RegistryImportOperationId>(record.operationId),
+              { ...record, status: 'failed', updatedAt: Date.now() })
+            return false
+          }
           const delivery: RegistryImportDelivery = {
             operationId: record.operationId,
             targetInstanceId: brandString<DshInstanceId>(record.targetInstanceId),
@@ -397,8 +412,14 @@ export class LocalHarnessOperations implements RegistryDisclosureOperations, Reg
             sourceInstanceId: brandString<DshInstanceId>(record.sourceInstanceId),
             checkpointHash: brandString<DisclosureHash>(record.checkpointHash),
             prefix: snapshot.prefix,
+            keyGrant,
             source: { instanceName: record.sourceInstanceId,
               conversationTitle: String(snapshot.prefix.conversationId) },
+          }
+          if (byteLength(delivery) > this.config.maxRequestBytes) {
+            await this.put(brandString<RegistryImportOperationId>(record.operationId),
+              { ...record, status: 'failed', updatedAt: Date.now() })
+            return false
           }
           const outcome = await receive(delivery)
           signal.throwIfAborted()

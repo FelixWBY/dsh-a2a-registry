@@ -3,6 +3,10 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import type {
   DisclosureDataKey, DisclosureDataKeyGrantScope, DisclosureDataKeyId,
 } from '@deepseek-ai/dsh-a2a-disclosure-crypto'
+import type { RegistryImportKeyGrant } from '@deepseek-ai/dsh-a2a-registry-sync'
+
+export type { RegistryImportKeyGrant } from '@deepseek-ai/dsh-a2a-registry-sync'
+export { decodeRegistryImportKeyGrant } from '@deepseek-ai/dsh-a2a-registry-sync'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -54,6 +58,10 @@ export abstract class RegistryDisclosureKeyProvider extends Service {
   /** Release at most `maxKeys` authenticated keys only to Registry-owned content projection. */
   abstract readDataKeys(scope: DisclosureDataKeyGrantScope,
     maxKeys: number, signal: AbortSignal): Promise<readonly DisclosureDataKey[]>
+
+  /** Explicitly export one bounded raw-key grant after the caller has held exact import authorization. */
+  abstract issueAuthorizedGrant(scope: DisclosureDataKeyGrantScope,
+    maxKeys: number, maxBytes: number, signal: AbortSignal): Promise<RegistryImportKeyGrant>
 
   /** Verify one authenticated organization's retained hierarchy without exposing material. */
   abstract checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],

@@ -8,6 +8,7 @@ import { RegistryTenancyError } from './tenancy.ts'
 import { openRegistryTenantRuntime, type RegistryIngestRuntimeConfig,
   type RegistryTenantRuntime } from './ingest-runtime.ts'
 import { RegistryOperationalAlertExporter } from './operational-alerts.ts'
+import type { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 
 /** Account and organization control plane plus isolated data-plane runtime selection. */
 export interface RegistryTenantRuntimeRouter {
@@ -53,7 +54,8 @@ export class DefaultRegistryTenantRuntimeRouter implements RegistryTenantRuntime
   constructor(private readonly ctx: Context, readonly tenancy: RegistryTenancyStore,
     private readonly template: RegistryIngestRuntimeConfig,
     private readonly legacyOrganizationId: OrganizationId,
-    private readonly maxActiveOrganizations: number) {
+    private readonly maxActiveOrganizations: number,
+    private readonly keyProvider: RegistryDisclosureKeyProvider) {
     this.alerts = template.alerts === undefined ? undefined : new RegistryOperationalAlertExporter(ctx, template.alerts)
   }
 
@@ -140,6 +142,7 @@ export class DefaultRegistryTenantRuntimeRouter implements RegistryTenantRuntime
             domainName: physicalDomainName(organizationId, this.legacyOrganizationId),
             tenantId: organizationId,
           },
+          keyProvider: this.keyProvider,
           ...(this.alerts === undefined ? {} : { alerts: this.alerts }),
         }),
         references: 1,

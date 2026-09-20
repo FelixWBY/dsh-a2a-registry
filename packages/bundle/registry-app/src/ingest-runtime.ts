@@ -23,6 +23,7 @@ import { RegistryOperationalAlertExporter, RegistryOperationalAlertsConfigSchema
   type RegistryOperationalAlertsConfig, type RegistryOperationalRateLimitScope } from './operational-alerts.ts'
 import { RegistrySaasImportQueue, type RegistrySaasImportQueueConfig } from './saas-import-queue.ts'
 import { RegistrySaasQuestionMailbox, type RegistrySaasQuestionMailboxConfig } from './saas-question-mailbox.ts'
+import type { RegistryDisclosureKeyProvider } from './disclosure-key-provider.ts'
 
 const IMPORT_DELIVERY_ENVELOPE_BYTES = 1024
 const QUESTION_DELIVERY_ENVELOPE_BYTES = 1024
@@ -80,6 +81,7 @@ const schema: z<RegistryIngestRuntimeConfig> = z.object({
   maintenance: z.union([MaintenanceSchema]), sync: z.union([SyncConfig]),
   imports: z.union([z.object({ maxOperations: positive(), maxRecordBytes: positive(),
     maxAuthorizationResponseBytes: positive(), maxDeliveryBytes: positive(),
+    maxGrantBytes: positive(), maxTrustedKeys: positive(),
     deliveryTimeoutMs: positive() }).required()]),
   questions: z.union([z.object({
     mailboxKeyEnv: z.string().role('credential-ref').required(),
@@ -116,6 +118,9 @@ export const Config: z<RegistryIngestRuntimeConfig> = z.transform(schema, (value
   if (value.imports !== undefined && value.sync !== undefined
     && value.imports.maxDeliveryBytes > value.sync.maxFrameBytes - IMPORT_DELIVERY_ENVELOPE_BYTES) {
     throw new z.ValidationError('Registry tenant import delivery exceeds the sync frame bound', {})
+  }
+  if (value.imports !== undefined && value.imports.maxGrantBytes > value.imports.maxDeliveryBytes) {
+    throw new z.ValidationError('Registry tenant import key grant exceeds the delivery bound', {})
   }
   if (value.questions !== undefined
     && (value.directory === undefined || value.bindings === undefined || value.sync === undefined)) {
@@ -203,6 +208,8 @@ export interface RegistryTenantRuntime {
 
 export interface RegistryTenantRuntimeOpenOptions {
   readonly storage?: RegistryIngestStorageScope
+  /** Exact-scope key owner required by the tenant import queue. */
+  readonly keyProvider?: RegistryDisclosureKeyProvider
   /** A multi-tenant router owns one shared exporter instead of opening the same outbox per organization. */
   readonly alerts?: RegistryOperationalAlertExporter
 }
@@ -344,9 +351,11 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
       },
     })
   if (options.imports !== undefined) {
-    if (options.directory === undefined || options.bindings === undefined || options.sync === undefined) {
+    const keyProvider = openOptions.keyProvider
+    if (options.directory === undefined || options.bindings === undefined || options.sync === undefined
+      || keyProvider === undefined) {
       await close().catch(() => undefined)
-      throw new Error('Registry SaaS imports require directory, bindings and sync')
+      throw new Error('Registry SaaS imports require directory, bindings, sync and a disclosure key provider')
     }
     if (options.imports.maxDeliveryBytes > options.sync.maxFrameBytes - IMPORT_DELIVERY_ENVELOPE_BYTES) {
       await close().catch(() => undefined)
@@ -354,7 +363,7 @@ export async function openRegistryTenantRuntime(ctx: Context, config: RegistryIn
     }
     try {
       imports = await RegistrySaasImportQueue.open(ctx.storageDomain, options.organizationId, store, reader,
-        options.imports, openOptions.storage)
+        keyProvider, options.imports, openOptions.storage)
     } catch (error) {
       await close().catch(() => undefined)
       throw error
@@ -413,7 +422,9 @@ export async function apply(ctx: Context, config: RegistryIngestRuntimeConfig): 
     if (provider === undefined) throw new Error('Registry sync requires registryProducerAuthenticator')
     sync = { config: options.sync, provider }
   }
-  const runtime = await openRegistryTenantRuntime(ctx, options)
+  const runtime = await openRegistryTenantRuntime(ctx, options, {
+    keyProvider: ctx.get('registryDisclosureKeyProvider'),
+  })
   let stopSync: (() => Promise<void>) | undefined
   if (sync !== undefined) stopSync = installRegistrySync(ctx, sync.config, sync.provider, runtime.store, runtime.signal)
   ctx.effect(() => async () => {
