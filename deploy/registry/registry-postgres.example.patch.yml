@@ -24,6 +24,10 @@
       config:
         singleInstance: true
         rootKeyId: !!js process.env.DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID
+        # Optional previous slot. Leave both previous variables unset outside a
+        # bounded recovery/rotation window; retained organizations select by
+        # their durable rootKeyId while new organizations always use rootKeyId.
+        previousRootKeyId: !!js process.env.DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID
         domainNamePrefix: a2a_registry_disclosure_keys
         maxDataKeysPerOrganization: 100000
         maxPendingOperationsPerOrganization: 64

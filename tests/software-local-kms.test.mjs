@@ -55,10 +55,11 @@ async function runtime(root) {
   }
 }
 
-async function openStore(ctx, organizationId, key, lifecycle, domainNamePrefix = 'software_local_kms') {
+async function openStore(ctx, organizationId, key, lifecycle, domainNamePrefix = 'software_local_kms', previousRootKey) {
   return openSoftwareLocalDisclosureKeyStore(ctx.storageDomain, {
     organizationId,
     rootKey: key,
+    ...(previousRootKey === undefined ? {} : { previousRootKey }),
     storage: { domainNamePrefix, tenantId: organizationId },
     limits,
     signal: lifecycle.signal,
@@ -114,6 +115,51 @@ test('software-local hierarchy persists only wrapped keys and survives a clean r
     assert.equal(retained[0].keyId, published.keyId)
     assert.deepEqual(exported(retained[0].key), Buffer.alloc(32, 0x22))
     await restarted.close()
+  } finally {
+    if (ctx !== undefined) await ctx.fiber.dispose()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('dual-slot roots read retained owners by durable id while new organizations use active', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'registry-software-kms-root-slots-'))
+  const retainedOrganization = 'organization-retained'
+  const newOrganization = 'organization-new'
+  const retainedScope = scope(retainedOrganization)
+  const previous = rootKey(0x18, 'root-key:previous')
+  const active = rootKey(0x19, 'root-key:active')
+  let ctx
+  try {
+    ctx = await runtime(home)
+    const original = await openStore(ctx, retainedOrganization, previous, new AbortController())
+    await original.publishDataKey(retainedScope, dataKey(retainedScope, 'data-key:retained', 0x20), operationSignal())
+    const before = await original.verifyRetainedKeys(operationSignal())
+    assert.equal(before.rootKeyId, previous.keyId)
+    assert.equal(before.dataKeyCount, 1)
+    assert.match(before.metadataSha256, /^sha256:[0-9a-f]{64}$/u)
+    await original.close()
+
+    const retained = await openStore(ctx, retainedOrganization, active, new AbortController(),
+      'software_local_kms', previous)
+    const verified = await retained.verifyRetainedKeys(operationSignal())
+    assert.deepEqual(verified, before)
+    await retained.close()
+
+    const created = await openStore(ctx, newOrganization, active, new AbortController(),
+      'software_local_kms', previous)
+    const createdVerification = await created.verifyRetainedKeys(operationSignal())
+    assert.equal(createdVerification.rootKeyId, active.keyId)
+    assert.equal(createdVerification.dataKeyCount, 0)
+    await created.close()
+
+    const newOwnerDocument = JSON.parse(await readFile(
+      domainPath(home, 'software_local_kms', newOrganization), 'utf8'))
+    assert.equal(newOwnerDocument.tables.owner.owner.rootKeyId, active.keyId)
+
+    await rejectsCode(() => openStore(ctx, retainedOrganization, active,
+      new AbortController()), 'root-key-unavailable')
+    await rejectsCode(() => openStore(ctx, 'organization-duplicate-slots', active,
+      new AbortController(), 'software_local_kms', rootKey(0x21, active.keyId)), 'invalid-root-key')
   } finally {
     if (ctx !== undefined) await ctx.fiber.dispose()
     await rm(home, { recursive: true, force: true })
@@ -215,6 +261,7 @@ test('bounded exact-scope reads validate maxKeys and reject before any DEK unwra
         tag: `${firstTag === 'A' ? 'B' : 'A'}${record.wrappedDataKey.tag.slice(1)}`,
       }),
     }))
+    await rejectsCode(() => store.verifyRetainedKeys(operationSignal()), 'authentication-failed')
     await rejectsCode(() => store.readDataKeys(grantScope, 1, operationSignal()), 'limit')
     await rejectsCode(() => store.readDataKeys(grantScope, 2, operationSignal()), 'authentication-failed')
     await store.close()

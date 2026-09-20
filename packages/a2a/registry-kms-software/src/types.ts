@@ -35,7 +35,10 @@ export interface SoftwareLocalRootKey {
 /** Explicit storage and admission bounds; the PostgreSQL backend enforces tenantId through RLS. */
 export interface SoftwareLocalDisclosureKeyStoreOptions {
   readonly organizationId: DisclosureDataKeyGrantScope['organizationId']
+  /** Active root key used for every newly bootstrapped organization. */
   readonly rootKey: SoftwareLocalRootKey
+  /** Optional immediately previous root key retained only while existing organizations still reference it. */
+  readonly previousRootKey?: SoftwareLocalRootKey
   readonly storage: {
     /** Stable base name; the provider appends an organization hash so active tenants never share a physical domain. */
     readonly domainNamePrefix: string
@@ -53,6 +56,20 @@ export interface SoftwareLocalDisclosureKeyReceipt {
   readonly scope: DisclosureDataKeyGrantScope
   readonly keyId: DisclosureDataKeyId
   readonly assurance: 'software-local'
+}
+
+/**
+ * Secret-free result of authenticating one organization's complete retained hierarchy.
+ * `metadataSha256` covers every sorted DEK identity and exact scope, but never ciphertext or key material.
+ */
+export interface SoftwareLocalDisclosureKeyVerification {
+  readonly version: 1
+  readonly assurance: 'software-local'
+  readonly organizationId: DisclosureDataKeyGrantScope['organizationId']
+  readonly rootKeyId: string
+  readonly organizationKeyId: string
+  readonly dataKeyCount: number
+  readonly metadataSha256: `sha256:${string}`
 }
 
 /** Content-free failures safe to return across an authenticated adapter boundary. */

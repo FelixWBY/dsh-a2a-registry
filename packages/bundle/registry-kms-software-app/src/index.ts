@@ -11,6 +11,7 @@ import {
   SOFTWARE_LOCAL_KEY_PROTECTION,
   SoftwareLocalKmsError,
   type SoftwareLocalDisclosureKeyStore,
+  type SoftwareLocalDisclosureKeyVerification,
 } from '@deepseek-ai/dsh-a2a-registry-kms-software'
 import {
   decodeRegistryImportKeyGrant,
@@ -23,11 +24,14 @@ import type { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 
 /** The only environment entry allowed to carry the software root-key material. */
 export const DISCLOSURE_ROOT_KEY_ENV = 'DSH_REGISTRY_DISCLOSURE_ROOT_KEY'
+/** Optional immediately previous root-key material; unused outside an explicit recovery/rotation window. */
+export const DISCLOSURE_PREVIOUS_ROOT_KEY_ENV = 'DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY'
 
 /** Loader configuration. `singleInstance` is an explicit acknowledgement, not a deployment default. */
 export interface Config {
   readonly singleInstance: true
   readonly rootKeyId: string
+  readonly previousRootKeyId?: string
   readonly domainNamePrefix: string
   readonly maxDataKeysPerOrganization: number
   readonly maxPendingOperationsPerOrganization: number
@@ -39,13 +43,20 @@ const identifier = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/
 const domainPrefix = /^[a-z][a-z0-9_]{0,62}$/
 
 /** Strict loader schema; software-local mode cannot start without the single-writer acknowledgement. */
-export const Config: z<Config> = z.object({
+const configSchema: z<Config> = z.object({
   singleInstance: z.const(true).required(),
   rootKeyId: z.string().pattern(identifier).required(),
+  previousRootKeyId: z.string().pattern(identifier),
   domainNamePrefix: z.string().pattern(domainPrefix).default('a2a_registry_disclosure_keys'),
   maxDataKeysPerOrganization: positive().default(10_000),
   maxPendingOperationsPerOrganization: positive().default(64),
   maxActiveOrganizations: positive().max(10_000).default(256),
+})
+export const Config: z<Config> = z.transform(configSchema, (value) => {
+  if (value.previousRootKeyId !== undefined && value.previousRootKeyId === value.rootKeyId) {
+    throw new z.ValidationError('Registry disclosure root-key slots must use distinct key identifiers', {})
+  }
+  return value
 })
 
 /** Private Cordis plugin name; deployments select this concrete provider explicitly. */
@@ -78,14 +89,15 @@ function assertSignal(signal: AbortSignal): void {
  * Decode one already-resolved secret as exactly one canonical unpadded base64url AES-256 key.
  * The returned KeyObject owns its OpenSSL copy; the temporary JavaScript Buffer is always zeroed.
  */
-export function parseDisclosureRootKey(encoded: string): KeyObject {
+export function parseDisclosureRootKey(encoded: string,
+  environmentName = DISCLOSURE_ROOT_KEY_ENV): KeyObject {
   if (typeof encoded !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(encoded)) {
-    throw new Error(`${DISCLOSURE_ROOT_KEY_ENV} must contain one canonical unpadded base64url 256-bit key`)
+    throw new Error(`${environmentName} must contain one canonical unpadded base64url 256-bit key`)
   }
   const material = Buffer.from(encoded, 'base64url')
   try {
     if (material.byteLength !== 32 || material.toString('base64url') !== encoded) {
-      throw new Error(`${DISCLOSURE_ROOT_KEY_ENV} must contain one canonical unpadded base64url 256-bit key`)
+      throw new Error(`${environmentName} must contain one canonical unpadded base64url 256-bit key`)
     }
     return createSecretKey(material)
   } finally {
@@ -105,11 +117,16 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
   private accessSequence = 0
   private closing: Promise<void> | undefined
   private rootKey: KeyObject | undefined
+  private previousRootKey: KeyObject | undefined
 
   constructor(ctx: Context, private readonly facility: DomainFacility,
-    private readonly config: Config, rootKey: KeyObject) {
+    private readonly config: Config, rootKey: KeyObject, previousRootKey?: KeyObject) {
     super(ctx)
+    if ((config.previousRootKeyId === undefined) !== (previousRootKey === undefined)) {
+      throw new SoftwareLocalKmsError('invalid-root-key')
+    }
     this.rootKey = rootKey
+    this.previousRootKey = previousRootKey
   }
 
   publishDataKey(scope: DisclosureDataKeyGrantScope, dataKey: DisclosureDataKey,
@@ -148,6 +165,12 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
   checkReadiness(organizationId: DisclosureDataKeyGrantScope['organizationId'],
     signal: AbortSignal): Promise<boolean> {
     return this.withStore(organizationId, signal, store => store.checkReadiness(signal))
+  }
+
+  /** Authenticate one organization's complete retained hierarchy and return only recovery-safe metadata. */
+  verifyRetainedKeys(organizationId: DisclosureDataKeyGrantScope['organizationId'],
+    signal: AbortSignal): Promise<SoftwareLocalDisclosureKeyVerification> {
+    return this.withStore(organizationId, signal, store => store.verifyRetainedKeys(signal))
   }
 
   /** Stop admission, drain every borrowed store, close all domains, then release the root-key handle. */
@@ -189,10 +212,14 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
       if (this.closing !== undefined) throw closed()
       const rootKey = this.rootKey
       if (rootKey === undefined) throw closed()
+      const previousRootKey = this.previousRootKey
       const created: StoreEntry = {
         pending: openSoftwareLocalDisclosureKeyStore(this.facility, {
           organizationId,
           rootKey: { keyId: this.config.rootKeyId, key: rootKey },
+          ...(this.config.previousRootKeyId === undefined || previousRootKey === undefined ? {} : {
+            previousRootKey: { keyId: this.config.previousRootKeyId, key: previousRootKey },
+          }),
           storage: { domainNamePrefix: this.config.domainNamePrefix, tenantId: organizationId },
           limits: {
             maxDataKeys: this.config.maxDataKeysPerOrganization,
@@ -259,6 +286,7 @@ export class SoftwareLocalRegistryDisclosureKeyProvider extends RegistryDisclosu
       result => result.status === 'fulfilled' ? [result.value.close()] : [],
     ))
     this.rootKey = undefined
+    this.previousRootKey = undefined
     if (outcomes.some(outcome => outcome.status === 'rejected')) {
       throw new SoftwareLocalKmsError('storage-failed')
     }
@@ -282,7 +310,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error(`${DISCLOSURE_ROOT_KEY_ENV} must resolve from the inherited process environment`)
   }
   const rootKey = parseDisclosureRootKey(resolved.value)
+  let previousResolved: ResolvedCredential | undefined
+  try {
+    previousResolved = await ctx.credentials.resolve(credentialRef(DISCLOSURE_PREVIOUS_ROOT_KEY_ENV))
+  } catch {
+    if (options.previousRootKeyId !== undefined) {
+      throw new Error(`${DISCLOSURE_PREVIOUS_ROOT_KEY_ENV} must resolve from the inherited process environment`)
+    }
+  }
+  if (options.previousRootKeyId === undefined && previousResolved !== undefined) {
+    throw new Error(`${DISCLOSURE_PREVIOUS_ROOT_KEY_ENV} requires DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID`)
+  }
+  if (options.previousRootKeyId !== undefined
+    && (previousResolved === undefined || previousResolved.source !== 'env')) {
+    throw new Error(`${DISCLOSURE_PREVIOUS_ROOT_KEY_ENV} must resolve from the inherited process environment`)
+  }
+  if (previousResolved !== undefined && previousResolved.value === resolved.value) {
+    throw new Error(`${DISCLOSURE_PREVIOUS_ROOT_KEY_ENV} must be independent from ${DISCLOSURE_ROOT_KEY_ENV}`)
+  }
+  const previousRootKey = previousResolved === undefined ? undefined
+    : parseDisclosureRootKey(previousResolved.value, DISCLOSURE_PREVIOUS_ROOT_KEY_ENV)
   const provider = new SoftwareLocalRegistryDisclosureKeyProvider(ctx, ctx.storageDomain,
-    Object.freeze({ ...options }), rootKey)
+    Object.freeze({ ...options }), rootKey, previousRootKey)
   ctx.effect(() => async () => { await provider.close() }, 'registry-kms-software-app: provider lifecycle')
 }

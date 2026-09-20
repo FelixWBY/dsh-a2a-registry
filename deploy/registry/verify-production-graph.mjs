@@ -228,6 +228,10 @@ export function productionGraphIssues(composedEntries, composeWarnings = []) {
       'process.env.DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID')) {
       issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY}.rootKeyId must use DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID`)
     }
+    if (!isExactExpression(providerConfig?.previousRootKeyId,
+      'process.env.DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID')) {
+      issues.push(`${DISCLOSURE_KEY_PROVIDER_ENTRY}.previousRootKeyId must use DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID`)
+    }
   }
   const disclosureBridge = requiredRecord(runtimeConfig?.productionDisclosureBridge,
     'registry-runtime.productionDisclosureBridge', issues)

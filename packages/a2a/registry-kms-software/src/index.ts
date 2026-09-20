@@ -19,7 +19,7 @@ import { requireAes256Key, unwrapKey, wrapKey } from './crypto.ts'
 import {
   SOFTWARE_LOCAL_KEY_PROTECTION, SoftwareLocalKmsError,
   type SoftwareLocalDisclosureKeyReceipt, type SoftwareLocalDisclosureKeyStoreOptions,
-  type SoftwareLocalWrappedKey,
+  type SoftwareLocalDisclosureKeyVerification, type SoftwareLocalRootKey, type SoftwareLocalWrappedKey,
 } from './types.ts'
 
 export * from './types.ts'
@@ -196,8 +196,11 @@ async function bootstrapOwner(domain: StoreDomain, options: SoftwareLocalDisclos
   requireKms(retained !== undefined || owners.size === 0, 'invalid-storage')
   requireKms(retained !== undefined || dataKeys.size === 0, 'invalid-storage')
   if (retained !== undefined) {
-    requireKms(retained.rootKeyId === options.rootKey.keyId, 'root-key-unavailable')
-    const material = unwrapKey(options.rootKey.key, retained.wrappedOrganizationKey, organizationKeyAad(retained))
+    const selectedRootKey = retained.rootKeyId === options.rootKey.keyId
+      ? options.rootKey
+      : retained.rootKeyId === options.previousRootKey?.keyId ? options.previousRootKey : undefined
+    requireKms(selectedRootKey !== undefined, 'root-key-unavailable')
+    const material = unwrapKey(selectedRootKey.key, retained.wrappedOrganizationKey, organizationKeyAad(retained))
     try { return { owner: retained, organizationKey: createAesKey(material) } }
     finally { material.fill(0) }
   }
@@ -241,6 +244,13 @@ export async function openSoftwareLocalDisclosureKeyStore(
   const rootKeyId = identifier(options.rootKey.keyId, 'invalid-root-key')
   const rootKey = options.rootKey.key
   requireAes256Key(rootKey, 'invalid-root-key')
+  let previousRootKey: SoftwareLocalRootKey | undefined
+  if (options.previousRootKey !== undefined) {
+    const previousRootKeyId = identifier(options.previousRootKey.keyId, 'invalid-root-key')
+    requireKms(previousRootKeyId !== rootKeyId, 'invalid-root-key')
+    requireAes256Key(options.previousRootKey.key, 'invalid-root-key')
+    previousRootKey = Object.freeze({ keyId: previousRootKeyId, key: options.previousRootKey.key })
+  }
   requireKms(options.storage.tenantId === organizationId, 'scope-mismatch')
   softwareLocalDisclosureKeyDomainName(options.storage.domainNamePrefix, organizationId)
   const maxDataKeys = positiveInteger(options.limits.maxDataKeys)
@@ -250,6 +260,7 @@ export async function openSoftwareLocalDisclosureKeyStore(
   const resolved: SoftwareLocalDisclosureKeyStoreOptions = Object.freeze({
     organizationId,
     rootKey: Object.freeze({ keyId: rootKeyId, key: rootKey }),
+    ...(previousRootKey === undefined ? {} : { previousRootKey }),
     storage: Object.freeze({ domainNamePrefix: options.storage.domainNamePrefix,
       tenantId: options.storage.tenantId }),
     limits: Object.freeze({ maxDataKeys, maxPendingOperations }),
@@ -395,12 +406,17 @@ export class SoftwareLocalDisclosureKeyStore {
   /** Reauthenticate every cached wrapped DEK; readiness never claims hardware protection. */
   checkReadiness(signal: AbortSignal): Promise<boolean> {
     return this.run(signal, () => {
-      for (const [, record] of this.domain.table('data_keys').entries()) {
-        const material = unwrapKey(this.requireOrganizationKey(), record.wrappedDataKey, dataKeyAad(record))
-        material.fill(0)
-      }
+      this.verifyRetainedHierarchy()
       return true
     })
+  }
+
+  /**
+   * Authenticate every retained DEK and return a deterministic metadata-only recovery receipt.
+   * The receipt contains neither wrapped values nor key material and is safe for an offline verification report.
+   */
+  verifyRetainedKeys(signal: AbortSignal): Promise<SoftwareLocalDisclosureKeyVerification> {
+    return this.run(signal, () => this.verifyRetainedHierarchy())
   }
 
   /** Abort admission, drain already-started operations, and release the tenant domain. */
@@ -420,6 +436,38 @@ export class SoftwareLocalDisclosureKeyStore {
     this.assertLive()
     requireKms(this.organizationKey !== undefined, 'closed')
     return this.organizationKey
+  }
+
+  private verifyRetainedHierarchy(): SoftwareLocalDisclosureKeyVerification {
+    const records = [...this.domain.table('data_keys').entries()]
+      .sort((left, right) => left[0].localeCompare(right[0]))
+    requireKms(records.length <= this.limits.maxDataKeys, 'invalid-storage')
+    const digest = createHash('sha256')
+    digest.update(JSON.stringify([
+      'dsh-registry-software-kms-verification', FORMAT_VERSION, this.organizationId,
+      this.owner.rootKeyId, this.owner.organizationKeyId,
+    ]), 'utf8')
+    for (const [key, record] of records) {
+      requireKms(record.organizationKeyId === this.owner.organizationKeyId
+        && record.scope.organizationId === this.organizationId
+        && key === dataKeyRecordKey(record.scope, record.keyId), 'invalid-storage')
+      const material = unwrapKey(this.requireOrganizationKey(), record.wrappedDataKey, dataKeyAad(record))
+      material.fill(0)
+      digest.update('\n', 'utf8')
+      digest.update(JSON.stringify([
+        record.keyId, record.scope.organizationId, record.scope.instanceId,
+        record.scope.conversationId, record.scope.disclosureId,
+      ]), 'utf8')
+    }
+    return Object.freeze({
+      version: FORMAT_VERSION,
+      assurance: 'software-local',
+      organizationId: this.organizationId,
+      rootKeyId: this.owner.rootKeyId,
+      organizationKeyId: this.owner.organizationKeyId,
+      dataKeyCount: records.length,
+      metadataSha256: `sha256:${digest.digest('hex')}`,
+    })
   }
 
   private assertLive(signal?: AbortSignal): void {

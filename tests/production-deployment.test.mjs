@@ -158,6 +158,31 @@ test('production Registry preflight requires canonical disclosure root-key input
   assert.equal(rejectedReusedKey.status, 1)
   assert.match(rejectedReusedKey.stderr,
     /DSH_REGISTRY_DISCLOSURE_ROOT_KEY must be independent from DSH_REGISTRY_MAILBOX_KEY/u)
+
+  const pairedPrevious = {
+    ...productionEnvironment(),
+    DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID: 'registry-root:v0',
+    DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY: Buffer.alloc(32, 9).toString('base64url'),
+  }
+  assert.equal(preflight(pairedPrevious).status, 0)
+
+  const missingPreviousMaterial = { ...productionEnvironment(),
+    DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID: 'registry-root:v0' }
+  const rejectedMissingPreviousMaterial = preflight(missingPreviousMaterial)
+  assert.equal(rejectedMissingPreviousMaterial.status, 1)
+  assert.match(rejectedMissingPreviousMaterial.stderr, /must be set together/u)
+
+  const duplicatePreviousId = { ...pairedPrevious,
+    DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID: pairedPrevious.DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID }
+  const rejectedDuplicatePreviousId = preflight(duplicatePreviousId)
+  assert.equal(rejectedDuplicatePreviousId.status, 1)
+  assert.match(rejectedDuplicatePreviousId.stderr, /identifiers must be different/u)
+
+  const reusedPreviousMaterial = { ...pairedPrevious,
+    DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY: pairedPrevious.DSH_REGISTRY_DISCLOSURE_ROOT_KEY }
+  const rejectedReusedPreviousMaterial = preflight(reusedPreviousMaterial)
+  assert.equal(rejectedReusedPreviousMaterial.status, 1)
+  assert.match(rejectedReusedPreviousMaterial.stderr, /must be independent from active and mailbox root keys/u)
 })
 
 test('production Harness preflight pins the disclosure bridge to the exact public HTTPS endpoint', () => {

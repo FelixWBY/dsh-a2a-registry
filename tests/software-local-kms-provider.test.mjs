@@ -69,11 +69,12 @@ async function runtime(root) {
   }
 }
 
-function provideCredential(ctx, resolved) {
+function provideCredential(ctx, resolved, previousResolved) {
   ctx.provide('credentials', Object.freeze({
     async resolve(ref) {
-      assert.equal(ref, providerPlugin.DISCLOSURE_ROOT_KEY_ENV)
-      return resolved
+      if (ref === providerPlugin.DISCLOSURE_ROOT_KEY_ENV) return resolved
+      assert.equal(ref, providerPlugin.DISCLOSURE_PREVIOUS_ROOT_KEY_ENV)
+      return previousResolved
     },
   }))
 }
@@ -86,6 +87,8 @@ async function rejectsCode(action, code) {
 test('loader configuration and the fixed root-key environment fail closed', () => {
   assert.throws(() => providerPlugin.Config({ singleInstance: false, rootKeyId: 'root-key:v1' }))
   assert.throws(() => providerPlugin.Config({ singleInstance: true, rootKeyId: 'has spaces' }))
+  assert.throws(() => providerPlugin.Config({ singleInstance: true, rootKeyId: 'root-key:v1',
+    previousRootKeyId: 'root-key:v1' }))
   assert.throws(() => providerPlugin.parseDisclosureRootKey(''))
   assert.throws(() => providerPlugin.parseDisclosureRootKey(Buffer.alloc(32, 0x72).toString('base64')))
 
@@ -93,6 +96,66 @@ test('loader configuration and the fixed root-key environment fail closed', () =
   const imported = providerPlugin.parseDisclosureRootKey(material.toString('base64url'))
   const retained = exported(imported)
   try { assert.deepEqual(retained, material) } finally { retained.fill(0); material.fill(0) }
+})
+
+test('the loader admits at most one distinct environment-only previous root', async (t) => {
+  const active = { value: Buffer.alloc(32, 0x78).toString('base64url'), source: 'env' }
+  const previous = { value: Buffer.alloc(32, 0x79).toString('base64url'), source: 'env' }
+  await t.test('legacy single-root tolerates a missing optional credential error', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'registry-kms-provider-legacy-single-root-'))
+    const ctx = await runtime(home)
+    try {
+      ctx.provide('credentials', Object.freeze({
+        async resolve(ref) {
+          if (ref === providerPlugin.DISCLOSURE_ROOT_KEY_ENV) return active
+          assert.equal(ref, providerPlugin.DISCLOSURE_PREVIOUS_ROOT_KEY_ENV)
+          throw new Error('credential is absent')
+        },
+      }))
+      await ctx.plugin(providerPlugin, config()).await()
+      assert.equal(await ctx.registryDisclosureKeyProvider.checkReadiness(
+        'organization-legacy-single-root', signal()), true)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  for (const [label, selectedConfig, selectedPrevious, expected] of [
+    ['missing material', config({ previousRootKeyId: 'root-key:previous' }), undefined,
+      /must resolve from the inherited process environment/u],
+    ['non-environment material', config({ previousRootKeyId: 'root-key:previous' }),
+      { ...previous, source: 'file' }, /must resolve from the inherited process environment/u],
+    ['orphan material', config(), previous, /requires DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID/u],
+    ['reused material', config({ previousRootKeyId: 'root-key:previous' }), active,
+      /must be independent/u],
+  ]) await t.test(label, async () => {
+    const home = await mkdtemp(join(tmpdir(), `registry-kms-provider-previous-${label.replaceAll(' ', '-')}-`))
+    const ctx = await runtime(home)
+    try {
+      provideCredential(ctx, active, selectedPrevious)
+      await assert.rejects(ctx.plugin(providerPlugin, selectedConfig).await(), expected)
+      assert.equal(ctx.get('registryDisclosureKeyProvider'), undefined)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  await t.test('valid previous slot', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'registry-kms-provider-previous-valid-'))
+    const ctx = await runtime(home)
+    try {
+      provideCredential(ctx, active, previous)
+      await ctx.plugin(providerPlugin, config({ previousRootKeyId: 'root-key:previous' })).await()
+      const verified = await ctx.registryDisclosureKeyProvider.verifyRetainedKeys('organization-previous', signal())
+      assert.equal(verified.rootKeyId, 'root-key:v1')
+      assert.equal(verified.dataKeyCount, 0)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
 })
 
 test('the loader rejects missing and file-layer root keys', async (t) => {
@@ -162,6 +225,12 @@ test('tenant routing stays isolated and an idle LRU tenant reopens from durable 
     assert.deepEqual(grant.keys.map(item => Buffer.from(item.material, 'base64url').byteLength), [32, 32])
     await rejectsCode(() => provider.issueAuthorizedGrant(firstScope, 1, 4 * 1024, signal()), 'limit')
     await rejectsCode(() => provider.issueAuthorizedGrant(firstScope, 2, 1, signal()), 'limit')
+
+    const verification = await provider.verifyRetainedKeys(firstScope.organizationId, signal())
+    assert.equal(verification.organizationId, firstScope.organizationId)
+    assert.equal(verification.rootKeyId, 'root-key:v1')
+    assert.equal(verification.dataKeyCount, 2)
+    assert.match(verification.metadataSha256, /^sha256:[0-9a-f]{64}$/u)
 
     await rejectsCode(() => provider.publishDataKey(firstScope,
       dataKey(firstScope, 'data-key:foreign-scope', 0x77, secondScope), signal()), 'scope-mismatch')

@@ -55,7 +55,7 @@ node --import tsx/esm deploy/registry/verify-registry-device.mjs
 
 `registry` 范围是公网 SaaS 门禁：必须显式提供使用 `registry_app` 角色的 PostgreSQL URL 和 SaaS 初始化信息，单组织 SQLite 配置不能通过。公网验证还会从服务端状态接口确认实时 `registryTenantRouter` 已加载，不以浏览器缓存或单纯的 `standard` 部署标签代替。设备验证应在掌握设备凭据的 Harness 一侧执行，不能把设备私钥放入公网 Registry 服务环境。
 
-启用当前软件本地 disclosure KMS 时，Registry 环境还必须提供非秘密版本标识 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID` 和秘密管理注入的 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY`；后者必须是规范、无填充的 base64url 32 字节随机密钥，不能与邮箱根密钥复用。根密钥标识和材料必须与已有密文保持一致；这道静态门禁不等于 HSM、轮换或恢复验收。
+启用当前软件本地 disclosure KMS 时，Registry 环境还必须提供非秘密版本标识 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID` 和秘密管理注入的 `DSH_REGISTRY_DISCLOSURE_ROOT_KEY`；后者必须是规范、无填充的 base64url 32 字节随机密钥，不能与邮箱根密钥复用。默认仍是这个兼容的单根配置。仅在有界恢复／轮换窗口内，才同时设置 `DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID` 和 `DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY`；两个版本标识和三类根密钥材料必须互不相同。已有组织严格按持久 `rootKeyId` 选择 active 或 previous，新组织只用 active。software-local provider 已提供逐组织全量认证并返回不含密钥和密文的确定性元数据摘要；当前没有数据库轮换 CLI、跨组织枚举、组织 KEK 轮换、销毁或维护审计，因此 previous 不能被视为自动迁移机制，这些静态门禁也不等于 HSM 或恢复演练。
 
 设备验证会使用同一凭据完成两轮独立的 WSS 挑战、认证和心跳：第一轮主动断开，第二轮必须取得新的挑战并以同一设备公钥重新认证。它证明公网链路允许设备重连，但不代替 Harness 自身的持久离线队列、进程重启恢复和业务消费验收。
 

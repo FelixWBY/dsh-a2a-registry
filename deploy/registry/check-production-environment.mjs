@@ -247,6 +247,18 @@ if (checkRegistry) {
   if (disclosureRootKeyId.length > 0) {
     identifier('DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID', disclosureRootKeyId)
   }
+  const previousRootKeyIdPresent = (process.env.DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID?.trim().length ?? 0) > 0
+  const previousRootKeyPresent = (process.env.DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY?.trim().length ?? 0) > 0
+  if (previousRootKeyIdPresent !== previousRootKeyPresent) {
+    issue('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID and DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY must be set together')
+  }
+  if (previousRootKeyIdPresent) {
+    const previousRootKeyId = required('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID')
+    identifier('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID', previousRootKeyId)
+    if (previousRootKeyId === disclosureRootKeyId) {
+      issue('active and previous disclosure root-key identifiers must be different')
+    }
+  }
 }
 
 // The production Registry scope is the public multi-tenant SaaS contract. A
@@ -336,6 +348,16 @@ if (checkRegistry) {
   }
   if (mailboxKey.length > 0 && disclosureRootKey.length > 0 && mailboxKey === disclosureRootKey) {
     issue('DSH_REGISTRY_DISCLOSURE_ROOT_KEY must be independent from DSH_REGISTRY_MAILBOX_KEY')
+  }
+  const previousRootKey = process.env.DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY?.trim() ?? ''
+  if (previousRootKey.length > 0) {
+    required('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY', { secret: true, minimumBytes: 32 })
+    if (!canonicalBase64Url(previousRootKey, 32)) {
+      issue('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY must be canonical base64url 32-byte key material')
+    }
+    if (previousRootKey === disclosureRootKey || previousRootKey === mailboxKey) {
+      issue('DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY must be independent from active and mailbox root keys')
+    }
   }
 }
 if (checkHarness) {

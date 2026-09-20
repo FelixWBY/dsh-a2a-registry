@@ -133,6 +133,9 @@ test('installable production graph is closed and rejects unsafe deployment mutat
     ['disclosure key provider embedded root id', entries => {
       entry(entries, 'registry-disclosure-key-provider').config.rootKeyId = 'root-v1'
     }, /rootKeyId must use DSH_REGISTRY_DISCLOSURE_ROOT_KEY_ID/u],
+    ['disclosure key provider embedded previous root id', entries => {
+      entry(entries, 'registry-disclosure-key-provider').config.previousRootKeyId = 'root-v0'
+    }, /previousRootKeyId must use DSH_REGISTRY_DISCLOSURE_PREVIOUS_ROOT_KEY_ID/u],
     ['production bridge missing', entries => {
       delete entry(entries, 'registry-runtime').config.productionDisclosureBridge
     }, /registry-runtime\.productionDisclosureBridge must be configured/u],
