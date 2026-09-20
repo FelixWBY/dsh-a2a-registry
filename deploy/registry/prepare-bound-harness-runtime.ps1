@@ -389,7 +389,7 @@ $destinationParent = Resolve-ExistingDirectory $destinationParentPath 'Destinati
 Assert-NoUntrustedNamespaceReplacement $destinationParent 'DestinationRoot 父目录'
 Assert-PrivateAcl $destinationParent 'DestinationRoot 父目录' $true $true
 
-$stagingName = ".$([IO.Path]::GetFileName($DestinationRoot)).staging-$([Guid]::NewGuid().ToString('N'))"
+$stagingName = ".dshrt-$([Guid]::NewGuid().ToString('N'))"
 $stagingRoot = Join-Path $destinationParent $stagingName
 Assert-ChildPath $stagingRoot $destinationParent '临时目录'
 $sourceNodeHash = (Get-FileHash -LiteralPath $NodePath -Algorithm SHA256).Hash.ToLowerInvariant()
