@@ -20,6 +20,8 @@ param(
   [ValidateSet('ConnectionOnly', 'Production')]
   [string]$RuntimeMode = 'ConnectionOnly',
 
+  [string]$TrustedReleasePublicKey,
+
   [ValidateRange(1, 65535)]
   [int]$Port = 3080
 )
@@ -59,7 +61,73 @@ function Assert-OutsideDirectory([string]$Path, [string]$Directory, [string]$Lab
   $prefix = $Directory + [IO.Path]::DirectorySeparatorChar
   if ($Path.Equals($Directory, [StringComparison]::OrdinalIgnoreCase) -or
     $Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "$Label 不能放在 Harness 源码目录内。"
+    throw "$Label 不能放在运行包目录内。"
+  }
+}
+
+function Assert-ReleaseSignature(
+  [string]$RuntimeRoot,
+  [string]$ManifestPath,
+  [string]$PublicKeyPath
+) {
+  $signaturePath = Resolve-ExistingFile (Join-Path $RuntimeRoot 'runtime-signature.json') '运行包发行签名'
+  Assert-NoUnauthorizedWriteAcl $signaturePath '运行包发行签名' $false
+  if ((Get-Item -LiteralPath $signaturePath -Force).Length -gt 16KB) {
+    throw '运行包发行签名超过大小限制。'
+  }
+  try {
+    $record = [IO.File]::ReadAllText($signaturePath, [Text.UTF8Encoding]::new($false, $true)) |
+      ConvertFrom-Json -AsHashtable -ErrorAction Stop
+  } catch {
+    throw '运行包发行签名不是有效的严格 UTF-8 JSON。'
+  }
+  $expectedKeys = @('schemaVersion', 'algorithm', 'keyId', 'manifestSha256', 'signature')
+  if ($record.Count -ne $expectedKeys.Count -or
+    @($expectedKeys | Where-Object { -not $record.ContainsKey($_) }).Count -ne 0 -or
+    $record.schemaVersion -ne 1 -or [string]$record.algorithm -cne 'RSA-PSS-SHA256' -or
+    [string]$record.keyId -notmatch '^[0-9a-f]{64}$' -or
+    [string]$record.manifestSha256 -notmatch '^[0-9a-f]{64}$' -or
+    $record.signature -isnot [string] -or $record.signature.Length -gt 16384) {
+    throw '运行包发行签名格式无效。'
+  }
+  $manifestBytes = [IO.File]::ReadAllBytes($ManifestPath)
+  $manifestHash = [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData($manifestBytes)).ToLowerInvariant()
+  if ($manifestHash -cne [string]$record.manifestSha256) {
+    throw '运行包发行签名未绑定当前摘要清单。'
+  }
+  if ((Get-Item -LiteralPath $PublicKeyPath -Force).Length -gt 64KB) {
+    throw '受信任发行公钥超过大小限制。'
+  }
+  try {
+    $publicPem = [IO.File]::ReadAllText($PublicKeyPath, [Text.UTF8Encoding]::new($false, $true))
+  } catch {
+    throw '受信任发行公钥不是严格 UTF-8 PEM。'
+  }
+  if ($publicPem -notmatch '-----BEGIN PUBLIC KEY-----' -or $publicPem -match 'PRIVATE KEY') {
+    throw '受信任发行公钥必须是 SubjectPublicKeyInfo PEM，不能包含私钥。'
+  }
+  $rsa = [Security.Cryptography.RSA]::Create()
+  try {
+    $rsa.ImportFromPem($publicPem)
+    if ($rsa.KeySize -lt 3072) { throw '受信任发行 RSA 公钥至少需要 3072 位。' }
+    $publicKey = $rsa.ExportSubjectPublicKeyInfo()
+    $keyId = [Convert]::ToHexString(
+      [Security.Cryptography.SHA256]::HashData($publicKey)).ToLowerInvariant()
+    if ($keyId -cne [string]$record.keyId) { throw '运行包发行签名使用了非受信任公钥。' }
+    try { $signature = [Convert]::FromBase64String([string]$record.signature) } catch {
+      throw '运行包发行签名的 signature 不是规范 Base64。'
+    }
+    if ([Convert]::ToBase64String($signature) -cne [string]$record.signature -or
+      $signature.Length -ne ($rsa.KeySize / 8) -or
+      -not $rsa.VerifyData($manifestBytes, $signature,
+        [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pss)) {
+      throw '运行包发行签名验证失败。'
+    }
+    return $keyId
+  } finally {
+    $rsa.Dispose()
   }
 }
 
@@ -327,6 +395,7 @@ try {
   }
 
   const manifestRelative = normalize(relative(root, manifestPath)).toLowerCase()
+  const signatureRelative = 'runtime-signature.json'
   const actual = new Map()
   const pending = [root]
   while (pending.length > 0) {
@@ -339,7 +408,7 @@ try {
       } else if (entry.isFile()) {
         const selected = normalize(relative(root, fullPath))
         const key = selected.toLowerCase()
-        if (key === manifestRelative) continue
+        if (key === manifestRelative || key === signatureRelative) continue
         if (actual.has(key)) fail()
         actual.set(key, { path: selected, fullPath })
       } else {
@@ -407,7 +476,8 @@ try {
 function Assert-ProtectedRuntime(
   [string]$SelectedHarnessRoot,
   [string]$SelectedNodePath,
-  [string]$SelectedMode
+  [string]$SelectedMode,
+  [string]$SelectedReleasePublicKey
 ) {
   $launcherRoot = Resolve-ExistingDirectory $PSScriptRoot '启动器目录'
   $runtimeRoot = Resolve-ExistingDirectory (Split-Path -Parent $launcherRoot) '运行包根目录'
@@ -458,6 +528,14 @@ function Assert-ProtectedRuntime(
   }
   if ($manifestEntries.Count -eq 0) { throw '运行包摘要清单不能为空。' }
 
+  $verifiedReleaseKeyId = $null
+  if (-not [string]::IsNullOrWhiteSpace($SelectedReleasePublicKey)) {
+    Assert-OutsideDirectory $SelectedReleasePublicKey $runtimeRoot 'TrustedReleasePublicKey'
+    $verifiedReleaseKeyId = Assert-ReleaseSignature $runtimeRoot $manifestPath $SelectedReleasePublicKey
+  } elseif ($SelectedMode -eq 'Production') {
+    throw 'Production 启动必须提供包外受保护的 TrustedReleasePublicKey。'
+  }
+
   foreach ($requiredRelative in @(
       'harness/apps/cli/lib/bin.js',
       'node/node.exe',
@@ -489,13 +567,37 @@ function Assert-ProtectedRuntime(
     throw '运行包构建证据不是有效的严格 UTF-8 JSON。'
   }
   $nodeEvidenceMatch = [regex]::Match([string]$evidence.nodeVersion, '^([0-9]+)\.')
-  if ($evidence.schemaVersion -ne 2 -or $evidence.lifecycleScripts -ne $false -or
+  if ($evidence.schemaVersion -ne 3 -or $evidence.lifecycleScripts -ne $false -or
     $evidence.optionalDependenciesInstalled -ne $false -or
     [string]$evidence.credentialInputs -cne 'external-at-launch' -or
     [string]::IsNullOrWhiteSpace([string]$evidence.harnessVersion) -or
     -not $nodeEvidenceMatch.Success -or [int]$nodeEvidenceMatch.Groups[1].Value -lt 24 -or
     @($evidence.packages).Count -eq 0) {
     throw '运行包构建证据不满足无脚本、Node.js 24+ 和包来源要求。'
+  }
+  $releaseSignature = $evidence.releaseSignature
+  $missingReleaseSignatureKey = if ($releaseSignature -is [Collections.IDictionary]) {
+    @('required', 'algorithm', 'keyId') | Where-Object {
+      -not $releaseSignature.Contains($_)
+    } | Select-Object -First 1
+  } else {
+    'releaseSignature'
+  }
+  if ($releaseSignature -isnot [Collections.IDictionary] -or
+    $releaseSignature.Count -ne 3 -or
+    $null -ne $missingReleaseSignatureKey) {
+    throw '运行包构建证据缺少发行签名约束。'
+  }
+  if ($releaseSignature.required -eq $true) {
+    if ([string]$releaseSignature.algorithm -cne 'RSA-PSS-SHA256' -or
+      [string]$releaseSignature.keyId -notmatch '^[0-9a-f]{64}$' -or
+      [string]$releaseSignature.keyId -cne [string]$verifiedReleaseKeyId) {
+      throw '运行包构建证据与受信任发行签名不一致。'
+    }
+  } elseif ($releaseSignature.required -ne $false -or
+    $null -ne $releaseSignature.algorithm -or $null -ne $releaseSignature.keyId -or
+    $null -ne $verifiedReleaseKeyId) {
+    throw '未签名运行包的构建证据与启动参数不一致。'
   }
   $validatedModes = @($evidence.validatedModes)
   if (([string]$evidence.runtimeMode -cne 'ConnectionOnly' -and
@@ -516,7 +618,14 @@ $EnvFile = Resolve-ExistingFile $EnvFile 'EnvFile'
 $CaCertificate = Resolve-ExistingFile $CaCertificate 'CaCertificate'
 $DshHome = Resolve-ExistingDirectory $DshHome 'DshHome'
 $LogDirectory = Resolve-ExistingDirectory $LogDirectory 'LogDirectory'
-$runtimeEvidence = Assert-ProtectedRuntime $HarnessRoot $NodePath $RuntimeMode
+$resolvedTrustedReleasePublicKey = $null
+if (-not [string]::IsNullOrWhiteSpace($TrustedReleasePublicKey)) {
+  $resolvedTrustedReleasePublicKey = Resolve-ExistingFile $TrustedReleasePublicKey 'TrustedReleasePublicKey'
+  Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $resolvedTrustedReleasePublicKey) `
+    'TrustedReleasePublicKey 父目录'
+  Assert-NoUnauthorizedWriteAcl $resolvedTrustedReleasePublicKey 'TrustedReleasePublicKey' $false
+}
+$runtimeEvidence = Assert-ProtectedRuntime $HarnessRoot $NodePath $RuntimeMode $resolvedTrustedReleasePublicKey
 
 if (-not [IO.Path]::GetFileName($NodePath).Equals('node.exe', [StringComparison]::OrdinalIgnoreCase)) {
   throw 'NodePath 必须指向 node.exe。'

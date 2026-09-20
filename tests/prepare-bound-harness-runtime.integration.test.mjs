@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { createHash, generateKeyPairSync } from 'node:crypto'
+import { constants, createHash, generateKeyPairSync, sign } from 'node:crypto'
 import {
   cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
@@ -120,7 +120,8 @@ function writeHashManifest(root) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const fullPath = join(directory, entry.name)
       if (entry.isDirectory()) visit(fullPath)
-      else if (entry.isFile() && entry.name !== 'runtime-files.sha256') files.push(fullPath)
+      else if (entry.isFile()
+        && entry.name !== 'runtime-files.sha256' && entry.name !== 'runtime-signature.json') files.push(fullPath)
     }
   }
   visit(root)
@@ -130,6 +131,23 @@ function writeHashManifest(root) {
     return { relative, line: `${hash}  ${relative}` }
   }).sort((left, right) => left.relative.localeCompare(right.relative, 'en'))
   writeFileSync(join(root, 'runtime-files.sha256'), `${lines.map(item => item.line).join('\n')}\n`)
+}
+
+function writeReleaseSignature(root, privateKey, publicKey) {
+  const manifest = readFileSync(join(root, 'runtime-files.sha256'))
+  const publicDer = publicKey.export({ format: 'der', type: 'spki' })
+  const signature = sign('sha256', manifest, {
+    key: privateKey,
+    padding: constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: constants.RSA_PSS_SALTLEN_DIGEST,
+  })
+  writeFileSync(join(root, 'runtime-signature.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    algorithm: 'RSA-PSS-SHA256',
+    keyId: createHash('sha256').update(publicDer).digest('hex'),
+    manifestSha256: createHash('sha256').update(manifest).digest('hex'),
+    signature: signature.toString('base64'),
+  }, null, 2)}\n`)
 }
 
 test('Windows prepares one physical production runtime from reviewed release groups', {
@@ -165,6 +183,13 @@ test('Windows prepares one physical production runtime from reviewed release gro
   cpSync(process.execPath, join(trustedNodeRoot, 'node.exe'))
   cpSync(join(dirname(process.execPath), 'node_modules', 'npm'),
     join(trustedNodeRoot, 'node_modules', 'npm'), { recursive: true })
+  const releaseKeyPair = generateKeyPairSync('rsa', { modulusLength: 3072 })
+  const releasePrivateKeyPath = join(root, 'release-private.pem')
+  const releasePublicKeyPath = join(root, 'release-public.pem')
+  writeFileSync(releasePrivateKeyPath,
+    releaseKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' }))
+  writeFileSync(releasePublicKeyPath,
+    releaseKeyPair.publicKey.export({ format: 'pem', type: 'spki' }))
 
   const sources = join(root, 'sources')
   const outputs = [join(root, 'dsh'), join(root, 'vendor'), join(root, 'system-native')]
@@ -189,19 +214,22 @@ test('Windows prepares one physical production runtime from reviewed release gro
     PREPARER: join(builder, 'prepare-bound-harness-runtime.ps1'),
     TARBALL_0: outputs[0], TARBALL_1: outputs[1], TARBALL_2: outputs[2],
     PREPARER_NODE: join(trustedNodeRoot, 'node.exe'), PREPARER_DESTINATION: destination,
+    PREPARER_SIGNING_KEY: releasePrivateKeyPath,
   }
   run('pwsh.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
     '& $env:PREPARER -TarballDirectory @($env:TARBALL_0,$env:TARBALL_1,$env:TARBALL_2) '
       + '-NodePath $env:PREPARER_NODE -DestinationRoot $env:PREPARER_DESTINATION '
-      + '-RuntimeMode Production',
+      + '-RuntimeMode Production -ReleaseSigningPrivateKey $env:PREPARER_SIGNING_KEY',
   ], { cwd: root, env: environment })
 
   assert.equal(existsSync(join(destination, 'harness', 'apps', 'cli', 'lib', 'bin.js')), true)
   assert.equal(existsSync(join(destination, 'node', 'node.exe')), true)
   assert.equal(existsSync(join(destination, 'runtime-package-lock.json')), true)
   assert.equal(existsSync(join(destination, 'runtime-files.sha256')), true)
+  assert.equal(existsSync(join(destination, 'runtime-signature.json')), true)
   const evidence = JSON.parse(readFileSync(join(destination, 'runtime-build.json'), 'utf8'))
+  assert.equal(evidence.schemaVersion, 3)
   assert.equal(evidence.harnessVersion, '0.1.2-rc.1')
   assert.equal(evidence.lifecycleScripts, false)
   assert.equal(evidence.optionalDependenciesInstalled, false)
@@ -209,6 +237,9 @@ test('Windows prepares one physical production runtime from reviewed release gro
   assert.equal(evidence.runtimeMode, 'Production')
   assert.deepEqual(evidence.validatedModes, ['ConnectionOnly', 'Production'])
   assert.deepEqual(evidence.registryDeepseekDependencies, [])
+  assert.equal(evidence.releaseSignature.required, true)
+  assert.equal(evidence.releaseSignature.algorithm, 'RSA-PSS-SHA256')
+  assert.match(evidence.releaseSignature.keyId, /^[0-9a-f]{64}$/u)
   const aclResult = run('pwsh.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
     '@($env:RUNTIME_HARNESS,$env:RUNTIME_NODE,$env:RUNTIME_LAUNCHER) | '
@@ -237,6 +268,7 @@ test('Windows prepares one physical production runtime from reviewed release gro
     join(launchRuntime, 'harness'), join(launchRuntime, 'node'), join(launchRuntime, 'launcher'),
   ]) protectDirectory(path)
   writeHashManifest(launchRuntime)
+  writeReleaseSignature(launchRuntime, releaseKeyPair.privateKey, releaseKeyPair.publicKey)
 
   const privateRoot = join(root, 'private')
   mkdirSync(privateRoot)
@@ -273,7 +305,7 @@ test('Windows prepares one physical production runtime from reviewed release gro
     '$listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); '
       + '$listener.Start(); $listener.LocalEndpoint.Port; $listener.Stop()',
   ]).stdout.trim())
-  const launched = spawnSync('pwsh.exe', [
+  const launcherArguments = [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
     join(launchRuntime, 'launcher', 'start-bound-harness.ps1'),
     '-HarnessRoot', join(launchRuntime, 'harness'),
@@ -283,8 +315,24 @@ test('Windows prepares one physical production runtime from reviewed release gro
     '-DshHome', dshHome,
     '-LogDirectory', logDirectory,
     '-RuntimeMode', 'Production',
+    '-TrustedReleasePublicKey', releasePublicKeyPath,
     '-Port', String(port),
-  ], {
+  ]
+  const signaturePath = join(launchRuntime, 'runtime-signature.json')
+  const validSignature = readFileSync(signaturePath, 'utf8')
+  const tamperedSignature = JSON.parse(validSignature)
+  tamperedSignature.signature = `${tamperedSignature.signature[0] === 'A' ? 'B' : 'A'}${tamperedSignature.signature.slice(1)}`
+  writeFileSync(signaturePath, `${JSON.stringify(tamperedSignature, null, 2)}\n`)
+  const rejected = spawnSync('pwsh.exe', launcherArguments, {
+    env: Object.fromEntries(Object.entries(process.env)
+      .filter(([name]) => name !== 'NODE_OPTIONS' && name !== 'NODE_PATH')),
+    encoding: 'utf8', windowsHide: true, timeout: 30_000,
+  })
+  assert.equal(rejected.error, undefined)
+  assert.notEqual(rejected.status, 0)
+  writeFileSync(signaturePath, validSignature)
+
+  const launched = spawnSync('pwsh.exe', launcherArguments, {
     env: Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => name !== 'NODE_OPTIONS' && name !== 'NODE_PATH')),
     stdio: 'ignore',

@@ -11,7 +11,9 @@ param(
   [ValidateSet('ConnectionOnly', 'Production')]
   [string]$RuntimeMode = 'ConnectionOnly',
 
-  [string]$NpmRegistry = 'https://registry.npmjs.org/'
+  [string]$NpmRegistry = 'https://registry.npmjs.org/',
+
+  [string]$ReleaseSigningPrivateKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +94,29 @@ function Read-StrictUtf8Lines([string]$Path, [string]$Label) {
     return [IO.File]::ReadAllLines($Path, [Text.UTF8Encoding]::new($false, $true))
   } catch {
     throw "$Label 不是严格 UTF-8 文本。"
+  }
+}
+
+function Open-ReleaseSigningKey([string]$Path) {
+  if ((Get-Item -LiteralPath $Path -Force).Length -gt 64KB) {
+    throw '发行签名私钥超过大小限制。'
+  }
+  try {
+    $pem = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
+  } catch {
+    throw '发行签名私钥不是严格 UTF-8 PEM。'
+  }
+  $rsa = [Security.Cryptography.RSA]::Create()
+  try {
+    $rsa.ImportFromPem($pem)
+    if ($rsa.KeySize -lt 3072) { throw '发行签名 RSA 私钥至少需要 3072 位。' }
+    $publicKey = $rsa.ExportSubjectPublicKeyInfo()
+    $keyId = [Convert]::ToHexString(
+      [Security.Cryptography.SHA256]::HashData($publicKey)).ToLowerInvariant()
+    return [PSCustomObject]@{ Rsa = $rsa; KeyId = $keyId }
+  } catch {
+    $rsa.Dispose()
+    throw
   }
 }
 
@@ -331,6 +356,15 @@ $nodeVersion = @(& $NodePath -p 'process.versions.node' 2>$null)
 if ($LASTEXITCODE -ne 0 -or $nodeVersion.Count -ne 1 -or
   [int]$nodeVersion[0].Split('.')[0] -lt 24) {
   throw '需要可执行的 Node.js 24 或更高版本。'
+}
+
+$resolvedReleaseSigningPrivateKey = $null
+if (-not [string]::IsNullOrWhiteSpace($ReleaseSigningPrivateKey)) {
+  $resolvedReleaseSigningPrivateKey = Resolve-ExistingFile $ReleaseSigningPrivateKey '发行签名私钥'
+  Assert-NoUntrustedNamespaceReplacement (Split-Path -Parent $resolvedReleaseSigningPrivateKey) '发行签名私钥父目录'
+  Assert-NoUnauthorizedWriteAcl $resolvedReleaseSigningPrivateKey '发行签名私钥' $false
+} elseif ($RuntimeMode -eq 'Production') {
+  throw 'Production 运行包必须提供受保护的 ReleaseSigningPrivateKey。'
 }
 
 try {
@@ -778,9 +812,14 @@ try {
   }
   Remove-StagingDirectory $probeHome.FullName $stagingRoot 'probe-home'
 
+  $releaseSigningKey = if ($null -eq $resolvedReleaseSigningPrivateKey) {
+    $null
+  } else {
+    Open-ReleaseSigningKey $resolvedReleaseSigningPrivateKey
+  }
   $evidencePath = Join-Path $stagingRoot 'runtime-build.json'
   $evidence = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     harnessVersion = $harnessVersion
     nodeVersion = $nodeVersion[0]
     runtimeMode = $RuntimeMode
@@ -797,6 +836,11 @@ try {
         required = $requiredRegistryDeepseekVersions.ContainsKey($_)
       }
     })
+    releaseSignature = [ordered]@{
+      required = ($RuntimeMode -eq 'Production')
+      algorithm = if ($null -eq $releaseSigningKey) { $null } else { 'RSA-PSS-SHA256' }
+      keyId = if ($null -eq $releaseSigningKey) { $null } else { $releaseSigningKey.KeyId }
+    }
   }
   [IO.File]::WriteAllText($evidencePath, (($evidence | ConvertTo-Json -Depth 6) + "`n"),
     [Text.UTF8Encoding]::new($false))
@@ -819,6 +863,29 @@ try {
   Assert-NoUnauthorizedWriteAcl (Join-Path $nodeRoot.FullName 'node.exe') 'Node.js' $false
   $hashManifest = Join-Path $stagingRoot 'runtime-files.sha256'
   Write-HashManifest $stagingRoot $hashManifest
+  if ($null -ne $releaseSigningKey) {
+    try {
+      $manifestBytes = [IO.File]::ReadAllBytes($hashManifest)
+      $signature = $releaseSigningKey.Rsa.SignData(
+        $manifestBytes,
+        [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pss)
+      $signatureRecord = [ordered]@{
+        schemaVersion = 1
+        algorithm = 'RSA-PSS-SHA256'
+        keyId = $releaseSigningKey.KeyId
+        manifestSha256 = [Convert]::ToHexString(
+          [Security.Cryptography.SHA256]::HashData($manifestBytes)).ToLowerInvariant()
+        signature = [Convert]::ToBase64String($signature)
+      }
+      $signaturePath = Join-Path $stagingRoot 'runtime-signature.json'
+      [IO.File]::WriteAllText($signaturePath,
+        (($signatureRecord | ConvertTo-Json -Depth 3) + "`n"), [Text.UTF8Encoding]::new($false))
+      Assert-NoUnauthorizedWriteAcl $signaturePath '运行包发行签名' $false
+    } finally {
+      $releaseSigningKey.Rsa.Dispose()
+    }
+  }
 
   $moveAttempt = 0
   while ($true) {

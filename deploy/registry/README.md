@@ -86,7 +86,7 @@ npm run verify:harness-compatibility -- `
 
 检查器不读取或要求设备 token、设备私钥及 enrollment 文件，子进程环境只包含 Node 运行所需的系统变量和公开占位值；任一源码、构建产物、CLI、schema 或 overlay 缺失／漂移都不得启动真实接入。若开发 checkout 新增依赖后的 pnpm 链接尚未刷新，检查器只会对 Web 包已经声明为 `workspace:`、包名一致且真实 `lib` 入口存在的固定发布依赖使用临时解析回退，正常解析始终优先，临时目录在结束时删除；这不构成 packed-install 验收。它会执行目标 checkout，因此只能指向可信目录，也不应从带生产秘密的交互 shell 运行。固定伪签名和静态状态分支只验证 v1 codec 与配置兼容，不证明 WSS 挑战已由真实设备私钥签署，也不把完成与失败样本解释成同一次真实请求的状态轨迹；该检查仍不代替真实 WSS 认证、Registry Presence、披露密钥分发、模型执行和离线恢复验收。v1 导入帧只携带稳定操作标识，目标 Harness 仍须以 `targetInstanceId + operationId` 确定本地 Session，Registry 会独立核对完成回执中的 Session 标识。
 
-Windows 本地验收不能直接从普通开发 checkout 启动。先把已审查、干净提交的 Harness 按官方发布边界构建并打成 dsh、vendor 和 system native tarball，再用 `prepare-bound-harness-runtime.ps1` 在仓库外生成一个受保护、版本化的实体运行包。准备器只接受三组受保护输入，三个目录都必须由 `publish-order.txt` 精确覆盖；system native 目录必须包含 `@deepseek-ai/node-addon-system`，并且只能包含该包及其平台包。所有输入包必须属于 `@deepseek-ai`，dsh 发布族必须同版本。源包先逐字节复制到受保护 staging 并核对复制前后摘要，npm 只读取该副本；安装后的 lockfile 会固定外部依赖版本与 integrity。实际落盘的依赖树只允许输入 tarball 本身，以及这些受保护 tarball 以精确版本直接声明、并从指定 HTTPS npm registry 下载的 DeepSeek 依赖；未声明或使用版本范围的 DeepSeek 包一律拒绝。省略的跨平台 optional 包仍可出现在 lockfile 中，但不得落盘。准备器固定使用 `--ignore-scripts --omit=optional` 做 hoisted 安装，不复制 pnpm link farm，也不允许第三方生命周期脚本以当前账号执行；外部第三方依赖仍从指定 HTTPS npm registry 获取。默认 `ConnectionOnly` 保持旧行为；显式使用 `-RuntimeMode Production` 时，准备器会在同一无秘密隔离环境中先验证 connection-only，再用公开占位 ID、URL 和临时路径验证完整 publication／import／question overlay。两种模式都不会读取 token、私钥或模型密钥，也不会把凭据写入运行包。准备器会实体复制 CLI 到启动器要求的 `apps/cli/lib/bin.js`，复制 Node.js 24+ 和两层 overlay，执行 `--version` 与所选模式的 `--dump-config` 烟测，递归拒绝 junction／符号链接，并分别关闭运行包、Harness、Node 和启动器信任根的 ACL 继承，再生成包含已验收模式、禁用生命周期脚本、秘密外部注入约束、tarball 来源、获准的 Registry DeepSeek 依赖和逐文件 SHA-256 的构建证据。整个结果先写同盘随机 staging，再通过目标必须不存在的目录重命名发布；失败只清理本次 staging。
+Windows 本地验收不能直接从普通开发 checkout 启动。先把已审查、干净提交的 Harness 按官方发布边界构建并打成 dsh、vendor 和 system native tarball，再用 `prepare-bound-harness-runtime.ps1` 在仓库外生成一个受保护、版本化的实体运行包。准备器只接受三组受保护输入，三个目录都必须由 `publish-order.txt` 精确覆盖；system native 目录必须包含 `@deepseek-ai/node-addon-system`，并且只能包含该包及其平台包。所有输入包必须属于 `@deepseek-ai`，dsh 发布族必须同版本。源包先逐字节复制到受保护 staging 并核对复制前后摘要，npm 只读取该副本；安装后的 lockfile 会固定外部依赖版本与 integrity。实际落盘的依赖树只允许输入 tarball 本身，以及这些受保护 tarball 以精确版本直接声明、并从指定 HTTPS npm registry 下载的 DeepSeek 依赖；未声明或使用版本范围的 DeepSeek 包一律拒绝。省略的跨平台 optional 包仍可出现在 lockfile 中，但不得落盘。准备器固定使用 `--ignore-scripts --omit=optional` 做 hoisted 安装，不复制 pnpm link farm，也不允许第三方生命周期脚本以当前账号执行；外部第三方依赖仍从指定 HTTPS npm registry 获取。默认 `ConnectionOnly` 保持旧行为；显式使用 `-RuntimeMode Production` 时，准备器会在同一无秘密隔离环境中先验证 connection-only，再用公开占位 ID、URL 和临时路径验证完整 publication／import／question overlay。两种模式都不会读取 token、设备私钥或模型密钥，也不会把这些凭据写入运行包。Production 另要求包外受保护的 RSA 3072 位以上发行私钥；准备器只在最终摘要清单上生成 RSA-PSS-SHA256 签名，不复制或回显私钥。准备器会实体复制 CLI 到启动器要求的 `apps/cli/lib/bin.js`，复制 Node.js 24+ 和两层 overlay，执行 `--version` 与所选模式的 `--dump-config` 烟测，递归拒绝 junction／符号链接，并分别关闭运行包、Harness、Node 和启动器信任根的 ACL 继承，再生成包含已验收模式、禁用生命周期脚本、秘密外部注入约束、tarball 来源、获准的 Registry DeepSeek 依赖、逐文件 SHA-256 和发行签名约束的构建证据。整个结果先写同盘短随机 staging，再通过目标必须不存在的目录重命名发布；失败只清理本次 staging。
 
 正式 tarball 必须来自干净且受保护的工作树，输出目录也必须预先放在只允许构建账号、`SYSTEM` 和管理员写入的固定盘命名空间内。准备器脚本及其同目录路径门禁本身是启动前信任根，必须先由发布流程核对受审查提交或发行摘要并保护该目录；脚本不能在自身已经被替换后完成可信的自证。`build:official` 会把当前提交写进构建产物，但不会替你拒绝未提交源码；因此当前存在脏改动的 checkout 只能做本地候选验证，不能标作生产发布。发布链与官方工作流保持一致：
 
@@ -103,7 +103,7 @@ pnpm run release:verify-packed-install --family dsh `
   --from "$packRoot/npm" --from "$packRoot/npm-vendor" --from "$packRoot/npm-system"
 ```
 
-在一个全新的固定盘父目录中准备版本化运行包。父目录与最终内容只允许当前服务账号、`SYSTEM` 和本机管理员写入；下例先创建父目录，再让准备器原子发布子目录。典型实体运行树连同 Node 24 约占 270–390 MiB，这是本地复制与 npm 安装，不是 Docker 镜像下载；第三方依赖的首次网络下载量另计。
+在一个全新的固定盘父目录中准备版本化运行包。父目录与最终内容只允许当前服务账号、`SYSTEM` 和本机管理员写入；下例先创建父目录，再让准备器原子发布子目录。发行私钥只存在于专用构建账号的包外受保护目录；对应 SubjectPublicKeyInfo 公钥通过独立受保护通道交付最终服务账号。典型实体运行树连同 Node 24 约占 350–450 MiB，这是本地复制与 npm 安装，不是 Docker 镜像下载；第三方依赖的首次网络下载量另计。
 
 ```powershell
 $runtimeParent = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh-runtime'
@@ -116,17 +116,19 @@ New-Item -ItemType Directory -Path $runtimeParent | Out-Null
 if ($LASTEXITCODE -ne 0) { throw '无法限制运行目录 ACL。' }
 
 $runtimeRoot = Join-Path $runtimeParent 'bound-0.1.2-rc.1-reviewed'
+$releasePrivateKey = 'C:\trusted-build-secrets\harness-release-rsa-private.pem'
 Remove-Item Env:NODE_OPTIONS, Env:NODE_PATH -ErrorAction SilentlyContinue
 & 'C:\trusted-build\dsh-a2a-registry\deploy\registry\prepare-bound-harness-runtime.ps1' `
   -TarballDirectory @("$packRoot\npm", "$packRoot\npm-vendor", "$packRoot\npm-system") `
   -NodePath 'C:\path\to\node.exe' `
   -DestinationRoot $runtimeRoot `
-  -RuntimeMode Production
+  -RuntimeMode Production `
+  -ReleaseSigningPrivateKey $releasePrivateKey
 ```
 
 上述 Production 产物必须在真实设备切换前由 `start-bound-harness.ps1 -RuntimeMode Production` 完成本机 Web 启动验收。它证明正式 tarball 的实体依赖闭包、完整 Registry overlay 和受保护文件边界可用，但不声称 Agent／PTY／本机持久化所需的原生 optional 产物可用。若后续功能需要 `node-pty`、`koffi` 等安装产物，必须另做“无秘密构建账号生成并签名 → 最终服务账号只物化和复核”的两阶段交付，再实跑相应功能；当前准备器没有开启生命周期脚本的开关，也不得在已经保存设备密钥的服务账号中执行第三方安装脚本。
 
-Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和两层 overlay 一起放进受保护目录。启动前会复核运行包、Harness、Node 和 launcher 四个信任根的受保护 ACL，单独检查关键执行／配置文件 ACL，递归拒绝重解析点，并逐文件验证 `runtime-files.sha256`、构建证据、Node 精确版本和 CLI 精确版本；`HarnessRoot`／`NodePath` 只能指向当前运行包的固定位置。默认 `ConnectionOnly` 严格接受旧版五项或新版六项设备变量并固定选择连接专用 overlay；`Production` 必须严格包含六项设备变量、`DSH_REGISTRY_DISCLOSURE_BRIDGE_URL`、`DSH_DISCLOSURE_STATE_PATH` 和 `DEEPSEEK_API_KEY`，并且运行包构建证据已经记录完整模式合成通过。Production 的 state 路径、环境文件、CA、真实 `DSH_HOME` 和日志都必须位于运行包外的私有 ACL 目录；启动器只从该文件向子进程注入，不把值写回包或回显。两种模式都会验证 token、组织与 Ed25519 PKCS8 私钥；存在 `dshb1` 时还会验证它与 `dsh1` 属于同一组织和绑定且 secret 相互独立。启动器只绑定 `127.0.0.1`，端口默认是 3080，也可用 `-Port` 选择独立空闲端口；它不会停止或替换占用端口的进程。它拒绝带 `NODE_OPTIONS` 或 `NODE_PATH` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式配置；其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
+Windows 本地验收在 `export-env` 后从该运行包内的 `start-bound-harness.ps1` 启动。不要从 Registry 开发 checkout 运行这个启动器，因为它必须先加载同目录的路径门禁；准备器已把启动器、门禁和两层 overlay 一起放进受保护目录。启动前会复核运行包、Harness、Node 和 launcher 四个信任根的受保护 ACL，单独检查关键执行／配置文件 ACL，递归拒绝重解析点，并先用包外受保护的发行公钥验证 `runtime-files.sha256` 的 RSA-PSS-SHA256 签名，再逐文件验证摘要、构建证据、Node 精确版本和 CLI 精确版本；`HarnessRoot`／`NodePath` 只能指向当前运行包的固定位置，发行公钥不得位于运行包内。默认 `ConnectionOnly` 严格接受旧版五项或新版六项设备变量并固定选择连接专用 overlay；`Production` 必须提供发行公钥，严格包含六项设备变量、`DSH_REGISTRY_DISCLOSURE_BRIDGE_URL`、`DSH_DISCLOSURE_STATE_PATH` 和 `DEEPSEEK_API_KEY`，并且运行包构建证据已经记录完整模式合成验收和相同签名 key id。Production 的 state 路径、环境文件、CA、真实 `DSH_HOME` 和日志都必须位于运行包外的私有 ACL 目录；启动器只从该文件向子进程注入，不把值写回包或回显。两种模式都会验证 token、组织与 Ed25519 PKCS8 私钥；存在 `dshb1` 时还会验证它与 `dsh1` 属于同一组织和绑定且 secret 相互独立。启动器只绑定 `127.0.0.1`，端口默认是 3080，也可用 `-Port` 选择独立空闲端口；它不会停止或替换占用端口的进程。它拒绝带 `NODE_OPTIONS` 或 `NODE_PATH` 的调用，Node 子进程只继承 Windows 运行所需的白名单环境变量和显式配置；其他环境中的 `DSH_*` 不会传入。TLS 必须通过 `NODE_EXTRA_CA_CERTS` 信任明确指定的 PEM CA，不能设置 `NODE_TLS_REJECT_UNAUTHORIZED=0` 或改用明文 WebSocket。
 
 先在真实 Harness 服务账号下创建三个私有目录，并在写入 enrollment 状态／环境文件前关闭继承。启动器会再次检查目录与环境文件的实际 ACL：Allow 条目只可属于当前账号、`SYSTEM` 或本机管理员，私有目录本身必须已关闭继承。日志可能包含一次性 Web 启动 URL，也按凭据处理。以下示例只授权当前账号与 `SYSTEM`；如确需管理员恢复权限，可另外授予 `*S-1-5-32-544`：
 
@@ -142,11 +144,11 @@ foreach ($directory in @($privateRoot, $dshHome, $logDir)) {
 }
 ```
 
-受保护运行包与 `.dsh-private` 必须是两个独立目录；运行包不读取、复制或创建 enrollment、设备密钥、CA、真实 `DSH_HOME` 或日志。Node.js、Harness、启动器、overlay 与 CA 证书都是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录和 CA 父目录还必须关闭 ACL 继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此只在未占用的新版本目录发布，并以准备器和启动器的 ACL 检查结果为准。
+受保护运行包与 `.dsh-private` 必须是两个独立目录；运行包不读取、复制或创建 enrollment、设备密钥、发行私钥、CA、真实 `DSH_HOME` 或日志。Node.js、Harness、启动器、overlay、发行公钥与 CA 证书都是凭据信任边界。它们的所有者必须是当前服务账号、`SYSTEM` 或本机管理员，且不能向其他账号授予写入、修改、删除或更改 ACL 的权限；HarnessRoot、启动器目录、发行公钥父目录和 CA 父目录还必须关闭 ACL 继承。不支持 UNC、映射盘、可移动介质、卷根或任何穿过 junction／符号链接的路径。对已存在的目录，`/grant:r` 不会自动移除其他账号早已存在的显式 Allow，因此只在未占用的新版本目录发布，并以准备器和启动器的 ACL 检查结果为准。
 
 Production 的 Windows 环境文件是在新绑定导出的六行后追加 `DSH_REGISTRY_DISCLOSURE_BRIDGE_URL`、`DSH_DISCLOSURE_STATE_PATH` 和 `DEEPSEEK_API_KEY`，总计恰好九行；不要加入注释、空值、`DSH_HOME`、`REGISTRY_DOMAIN` 或其他变量。同步与 bridge 地址必须是同一公网主机、无显式端口的固定 `/a2a/v1/sync` WSS 和 `/a2a/v1/disclosure-publication` HTTPS 路径；本机 3183 等开发联调仍从开发 checkout 运行，不走这个 Production 保护启动器。state 目录必须预先创建并像 home／logs 一样关闭 ACL 继承。`DEEPSEEK_API_KEY` 只由主机秘密管理写入这个包外文件，不应出现在 PowerShell 命令历史、构建账号环境、运行包或聊天记录中。
 
-确认线协议检查通过、运行包的 `runtime-files.sha256` 已保存、所选端口空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行。下例使用 3180，避免影响已运行在 3080 的 Harness：
+确认线协议检查通过、运行包的 `runtime-files.sha256` 与 `runtime-signature.json` 已保存、包外发行公钥已按受保护通道交付且所选端口空闲后启动。所有路径必须是绝对路径；不要把环境文件内容复制进命令行。下例使用 3180，避免影响已运行在 3080 的 Harness：
 
 ```powershell
 pwsh -NoProfile -File "$runtimeRoot\launcher\start-bound-harness.ps1" `
@@ -157,6 +159,7 @@ pwsh -NoProfile -File "$runtimeRoot\launcher\start-bound-harness.ps1" `
   -DshHome 'C:\dsh-private\home' `
   -LogDirectory 'C:\dsh-private\logs' `
   -RuntimeMode Production `
+  -TrustedReleasePublicKey 'C:\dsh-private\harness-release-rsa-public.pem' `
   -Port 3180
 ```
 
